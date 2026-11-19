@@ -1,7 +1,28 @@
 [project]
 name = "adrenalin"
 version = "0.1.0"
-description = "Add your description here"
+description = "Competitor-analysis tools for marketing teams"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "requests",
+    "pycountry",
+    "Pillow",
+    "pytesseract",
+    "ocrmac; sys_platform == 'darwin'",
+]
+
+[build-system]
+requires = ["uv_build>=0.9"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest"]
+
+[project.scripts]
+adrenalin = "adrenalin.cli:main"
+
+[tool.pytest.ini_options]
+addopts = "-m 'not live' --import-mode=importlib"
+markers = ["live: hits real Google endpoints"]
+testpaths = ["tests"]
