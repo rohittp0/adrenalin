@@ -134,6 +134,8 @@ def _ts(v: dict) -> datetime:
 
 
 def _parse_creative(c: dict) -> ListedCreative:
+    if not isinstance(c["2"], str) or not c["2"]:
+        raise ValueError("creative id must be a non-empty string")
     return ListedCreative(
         creative_id=c["2"],
         advertiser_name=c.get("12") or "",
@@ -154,7 +156,7 @@ def parse_search_page(data: dict) -> SearchPage:
     for c in items:
         try:
             creatives.append(_parse_creative(c))
-        except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
+        except (KeyError, TypeError, ValueError, AttributeError, OverflowError, OSError):
             skipped += 1
     cursor = data.get("2")
     return SearchPage(
@@ -175,7 +177,10 @@ def _preview_key(p: Preview) -> tuple:
 
 
 def parse_detail(data: dict) -> list[Preview]:
-    raw = (data.get("1") or {}).get("5") or []
+    inner = data.get("1")
+    if not isinstance(inner, dict) or not isinstance(inner.get("5"), list):
+        raise ValueError("detail response has no variations list")
+    raw = inner["5"]
     out: list[Preview] = []
     seen: set = set()
     for obj in raw:
@@ -242,7 +247,7 @@ class TransparencyClient:
 
     def advertiser_name(self, query: Query) -> str | None:
         unfiltered = Query(query.advertiser_id, None, None, None)
-        for q in (query, unfiltered):
+        for q in (query,) if query == unfiltered else (query, unfiltered):
             for c in self.search(q, page_size=1).creatives:
                 if c.advertiser_name:
                     return c.advertiser_name

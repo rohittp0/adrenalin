@@ -151,3 +151,29 @@ def test_advertiser_name_falls_back_to_unfiltered_query():
 def test_advertiser_name_none_when_both_empty():
     s = FakeSession([{"1": []}])
     assert TransparencyClient(s).advertiser_name(Query("AR1", 2356, None, None)) is None
+
+
+def test_parse_search_page_skips_out_of_range_epoch():
+    d = _load("search_page.json")
+    d["1"][0]["6"] = {"1": "99999999999999999", "2": 0}
+    p = parse_search_page(d)
+    assert p.skipped == 1 and len(p.creatives) == 39
+
+
+@pytest.mark.parametrize("bad", ["", 5, None])
+def test_parse_search_page_skips_non_string_creative_id(bad):
+    d = _load("search_page.json")
+    d["1"][0]["2"] = bad
+    assert parse_search_page(d).skipped == 1
+
+
+@pytest.mark.parametrize("bad", [{}, {"1": "x"}, {"1": {"5": "x"}}, {"1": {}}])
+def test_parse_detail_raises_value_error_on_bad_shape(bad):
+    with pytest.raises(ValueError):
+        parse_detail(bad)
+
+
+def test_advertiser_name_unfiltered_query_makes_one_request():
+    s = FakeSession([{"1": []}])
+    assert TransparencyClient(s).advertiser_name(Query("AR1", None, None, None)) is None
+    assert len(s.calls) == 1
