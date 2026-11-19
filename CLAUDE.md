@@ -4,37 +4,42 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Adrenalin is a set of competitor-analysis tools for marketing teams. It is one CLI that dispatches to sub-tools:
-
-```
-adrenalin <tool_name> [args...]
-```
-
-The repo is currently a bare `uv` scaffold (`main.py` prints a greeting, no dependencies, no tests). The architecture below is the intended design. Follow it when adding the first tools.
-
-## Architecture
-
-There are three layers:
-
-1. **Wrapper / CLI entry point.** It parses `adrenalin <tool_name>`, finds the matching tool and passes the remaining args to it. It holds no tool-specific logic, so adding a tool should never mean editing a hard-coded list in several places.
-2. **Tools.** Each tool is a self-contained unit with its own args and output. A tool can call other existing tools programmatically, so every tool needs a callable Python API, not just a CLI path. Tools should not shell out to `adrenalin`.
-3. **Common utilities.** This is shared code such as HTTP and scraping helpers, config, output formatting and caching.
-
-**Refactor into common aggressively.** When a second tool needs logic that already exists inside another tool, move it into the common layer instead of duplicating it. Check the common layer before writing a new helper inside a tool.
+Adrenalin is a set of competitor-analysis tools for marketing teams: one CLI, `adrenalin <tool_name> [args...]`, that dispatches to sub-tools. The only tool so far is `ads-transparency` (Google Ads Transparency creatives and ad copy to CSV). Domain terms (Advertiser, Creative, Variation, Preview, Shown period) are defined in `CONTEXT.md`; use them. Decisions that should not be undone ("don't simplify this into a sequential loop", "plain HTTP, not a browser") are in `docs/adr/`.
 
 ## Commands
 
-The project uses `uv` with Python 3.13 (see `.python-version`).
+Python 3.13, managed with `uv`.
 
 ```bash
-uv sync                    # install deps
-uv run main.py             # run the current entry point
-uv add <pkg>               # add a runtime dependency
-uv add --dev <pkg>         # add a dev dependency (e.g. pytest, ruff)
+uv sync                                          # install deps
+uv run adrenalin <tool> [args...]                # run a tool, e.g. uv run adrenalin ads-transparency AR0475... --region IN --days 7
+uv run pytest                                    # offline tests (live tests are deselected by default)
+uv run pytest tests/tools/ads_transparency/test_copy.py::test_name   # one test
+uv run pytest -m live -v -s                      # live tests: real requests to Google, slow, may be blocked
+uv add <pkg> / uv add --dev <pkg>                # add a runtime / dev dependency
 ```
 
-There is no `[project.scripts]` entry, test suite or linter configured yet. When you add them, update this section with the real commands, including how to run a single test.
+No linter is configured. OCR needs `tesseract` on non-macOS (macOS uses Apple Vision via `ocrmac`, with Tesseract as fallback).
 
-## Notes
+The existing virtualenv is at `venv/`, not uv's default `.venv/`. `uv run` and `uv sync` use `.venv/` unless `UV_PROJECT_ENVIRONMENT=venv` is set.
 
-- The existing virtualenv is at `venv/`, not uv's default `.venv/`. `uv run` and `uv sync` will create and use `.venv/` unless `UV_PROJECT_ENVIRONMENT=venv` is set.
+## Architecture
+
+Code lives in `src/adrenalin/` in three layers:
+
+1. **`cli.py`** discovers tools by scanning `adrenalin.tools.*` packages for a module-level `TOOL` (a `common.tool.Tool`: name, help, `add_arguments`, `run`). It holds no tool-specific logic and has no hard-coded tool list.
+2. **`tools/<name>/`** are self-contained tools. A new tool must expose `TOOL` in its package `__init__.py` and a callable Python API in `api.py` (the CLI is a thin wrapper over it), so other tools can call it programmatically. Tools never shell out to `adrenalin`.
+3. **`common/`** is shared code:
+   - `http.py`: `PacedSession` (per-host pacing, proxies), `Cooldown` (block state shared across runs in `out/.cache/cooldown.sqlite3`), `Blocked`.
+   - `pipeline.py`: `Pipeline` and the SQLite-backed `WorkQueue` for staged, resumable, backpressured runs (see ADR 0001).
+   - `ocr/`: `recognize()` with Apple Vision, Tesseract and Codex (vision LLM) backends.
+   - `cache.py`: `ExtractionCache` of extraction results.
+   - `output.py`: `entity_dir`, `cache_dir`, `write_csv_atomic`, slugs.
+   - `geo.py`: region (ISO code or `anywhere`) to Google geo ID.
+   - `tool.py`: the `Tool` dataclass.
+
+**Refactor shared logic into `common/` aggressively.** When a second tool needs logic that already exists inside another tool, move it into `common/` instead of duplicating it. Check `common/` before writing a new helper inside a tool.
+
+`ads-transparency` stages (`tools/ads_transparency/`): `rpc.py` (Google's internal RPCs over plain HTTP), `stages.py` (List, Fetch, Extract, Export), `copy.py` (parse `content.js` Previews), `api.py` (`scrape()`, `ScrapeOptions`, CSV columns).
+
+Output goes to `out/<tool>/<entity>/runs/<run>/` (git-ignored).
