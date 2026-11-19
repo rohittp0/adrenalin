@@ -170,3 +170,58 @@ def test_concurrency_runs_workers_in_parallel(tmp_path):
     assert result.failed == {}
     assert len(q.items("A", "done")) == 2
     q.close()
+
+
+def test_requeue_resets_attempts(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {})
+    q.claim("A")
+    q.fail("A", "1", "x")
+    q.requeue("A", ["1"])
+    q.claim("A")
+    q.fail("A", "1", "x")
+    q.close()
+    q = WorkQueue(tmp_path / "q.sqlite3", max_attempts=2)  # attempts==1 after requeue+claim
+    assert q.items("A", "pending") and not q.items("A", "failed")
+    q.close()
+
+
+def test_pipeline_rejects_bad_config(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    with pytest.raises(ValueError):
+        Pipeline(q, [Stage("A", lambda i, qu: None), Stage("A", lambda i, qu: None)])
+    with pytest.raises(ValueError):
+        Pipeline(q, [Stage("A", lambda i, qu: None, throttle_on=("Z",))])
+    q.close()
+
+
+def test_stage_loop_crash_is_recorded(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {})
+    real = q.claim
+    calls = []
+
+    def flaky(stage):
+        if stage == "A" and not calls:
+            calls.append(1)
+            raise RuntimeError("db gone")
+        return real(stage)
+
+    q.claim = flaky
+    result = _run(q, [Stage("A", lambda i, qu: None), Stage("B", lambda i, qu: None)])
+    assert len(result.errors) == 1 and "db gone" in result.errors[0]
+    q.close()
+
+
+def test_blocked_downstream_does_not_hang_throttled_upstream(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(10):
+        q.put("A", str(i), {})
+
+    def b(item, queue):
+        raise Blocked("h", 1.0)
+
+    result = _run(q, [Stage("A", lambda i, qu: qu.put("B", i.key, {}) and None,
+                            throttle_on=("B",), max_ahead=1), Stage("B", b)])
+    assert result.blocked is not None
+    assert q.backlog("A") == 0

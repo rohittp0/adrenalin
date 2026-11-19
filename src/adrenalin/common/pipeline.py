@@ -96,7 +96,8 @@ class WorkQueue:
     def requeue(self, stage: str, keys: Iterable[str]) -> None:
         with self._lock, self._db:
             self._db.executemany(
-                "UPDATE items SET status='pending', result=NULL, error=NULL WHERE stage=? AND key=?",
+                "UPDATE items SET status='pending', result=NULL, error=NULL, attempts=0 "
+                "WHERE stage=? AND key=?",
                 [(stage, k) for k in keys])
 
     def backlog(self, *stages: str) -> int:
@@ -143,12 +144,21 @@ class Stage:
 @dataclass
 class RunResult:
     blocked: Blocked | None = None
+    # all failed items in the queue, including ones exhausted in earlier runs
     failed: dict[str, int] = field(default_factory=dict)
+    errors: list[str] = field(default_factory=list)
 
 
 class Pipeline:
     def __init__(self, queue: WorkQueue, stages: Sequence[Stage], *, poll: float = 0.2,
                  log: Callable[[str], None] = print_to_stderr):
+        names = [s.name for s in stages]
+        if len(set(names)) != len(names):
+            raise ValueError(f"stage names must be unique: {names}")
+        for s in stages:
+            unknown = [n for n in s.throttle_on if n not in names]
+            if unknown:
+                raise ValueError(f"stage {s.name!r} throttles on unknown stage(s) {unknown}")
         self.queue, self.stages, self.poll, self.log = queue, list(stages), poll, log
 
     def run(self) -> RunResult:
@@ -195,6 +205,12 @@ class Pipeline:
         def runner(stage: Stage) -> None:
             try:
                 loop(stage)
+            except Exception as exc:  # noqa: BLE001 - infrastructure failure, not a worker failure
+                msg = f"{stage.name}: stage loop crashed: {type(exc).__name__}: {exc}"
+                self.log(msg)
+                with state_lock:
+                    result.errors.append(msg)
+                stopped[stage.name].set()
             finally:
                 with live_lock:
                     live[stage.name] -= 1
