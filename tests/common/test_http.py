@@ -141,3 +141,53 @@ def test_derive_shares_cooldown_and_transport_but_fails_fast(tmp_path):
     assert len(e.calls) == 2 and e.sleeps == []
     assert e.calls[0][2]["proxies"]["https"] == "p1"
     fast.close()
+
+
+def _checker_env(tmp_path, outcomes):
+    """A HostChecker whose transport answers per host: an int status, or an exception to raise."""
+    from adrenalin.common.cache import ExtractionCache
+    from adrenalin.common.http import HostChecker
+
+    calls = []
+
+    def transport(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        out = outcomes[url.split("/")[2]]
+        if isinstance(out, BaseException):
+            raise out
+        return out if isinstance(out, requests.Response) else resp(out, url=url)
+
+    cache = ExtractionCache(tmp_path / "x.sqlite3")
+    session = PacedSession(Cooldown(tmp_path / "cd.sqlite"), {}, transport=transport, sleep=lambda s: None,
+                           max_retries=0)
+    return HostChecker(session, cache), cache, session, calls
+
+
+def test_host_checker_any_response_means_the_host_exists(tmp_path):
+    from adrenalin.common.http import HostChecker
+
+    outcomes = {"flights70.com": 200, "forbidden.com": 403, "broken.com": 503,
+                "flights7o.com": requests.ConnectionError("Name or service not known"),
+                "slow.com": requests.Timeout("timed out"), "badtls.com": requests.exceptions.SSLError("bad cert")}
+    check, cache, session, calls = _checker_env(tmp_path, outcomes)
+    try:
+        assert [check(h) for h in outcomes] == [True, True, True, False, False, False]
+        method, url, kw = calls[0]
+        assert (method, url) == ("GET", "https://flights70.com/")
+        assert kw["timeout"] == 5 and kw["stream"] is True and kw["allow_redirects"] is True
+        # one request per host per run, whatever the verdict
+        assert check("FLIGHTS70.com") and not check("flights7o.com") and len(calls) == len(outcomes)
+        # positive verdicts persist across runs; negative ones are re-checked (a network outage is temporary)
+        again = HostChecker(session, cache)
+        assert again("flights70.com") and not again("flights7o.com")
+        assert [u for _, u, _ in calls[len(outcomes):]] == ["https://flights7o.com/"]
+    finally:
+        cache.close()
+
+
+def test_host_checker_counts_a_block_page_as_existing(tmp_path):
+    check, cache, _, calls = _checker_env(tmp_path, {"google.com": resp(302, headers={"Location": SORRY})})
+    try:
+        assert check("google.com") and len(calls) == 1
+    finally:
+        cache.close()

@@ -106,6 +106,8 @@ class StageContext:
     today: Callable[[], date] = date.today
     # oEmbed must never wait or back off: a fail-fast session sharing the cooldown (defaults to `session`)
     oembed: PacedSession | None = None
+    # verifies domains read by OCR (None: no network check)
+    host_exists: Callable[[str], bool] | None = None
 
 
 class AdsStages:
@@ -263,6 +265,7 @@ class AdsStages:
             copy = extract_image(
                 ctx.entity / pl["image_file"], image_name(p), pl.get("format", ""),
                 cache=ctx.cache, codex=ctx.codex, force_vision=ctx.vision, ocr=ctx.ocr, warn=self.warn,
+                host_exists=ctx.host_exists,
             )
         return {**copy.to_dict(), "video_title": title, "preview_kind": p.kind if p else ""}
 

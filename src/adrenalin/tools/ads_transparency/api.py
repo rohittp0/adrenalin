@@ -12,7 +12,7 @@ from typing import Literal
 
 from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.geo import region_to_geo_id
-from adrenalin.common.http import Cooldown, PacedSession
+from adrenalin.common.http import Cooldown, HostChecker, PacedSession
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
@@ -223,7 +223,8 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
     own_session = session is None
     if own_session:
         session = make_session(options.out, options.proxies, options.wait_on_block)
-    # oEmbed is optional: it must never wait out a block or back off, whatever --wait-on-block says.
+    # oEmbed and the OCR domain check are optional: they must never wait out a block or back off,
+    # whatever --wait-on-block says.
     oembed = session.derive(wait_on_block=False, max_retries=0)
     cache: ExtractionCache | None = None
     q: WorkQueue | None = None
@@ -242,7 +243,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
 
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
                            codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=log,
-                           oembed=oembed)
+                           oembed=oembed, host_exists=HostChecker(oembed, cache))
         stages = AdsStages(ctx).stages(options.stage)
         rr = Pipeline(q, stages, poll=poll, log=log).run() if stages else RunResult()
 

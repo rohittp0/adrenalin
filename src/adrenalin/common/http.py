@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import random
 import sqlite3
@@ -12,6 +13,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+
+from adrenalin.common.cache import ExtractionCache
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -206,3 +209,48 @@ class PacedSession:
 
     def close(self) -> None:
         self._session.close()
+
+
+class HostChecker:
+    """Whether a host name exists, from one `GET https://<host>/`: any HTTP response (any status, or a
+    block page) means yes; a DNS, connection, TLS or timeout error means no. Use a fail-fast session
+    (`derive(wait_on_block=False, max_retries=0)`). Each host is requested once per checker; hosts that
+    exist are also remembered in `cache` across runs. Hosts that don't are not, since a network outage
+    would otherwise mark real hosts as missing for good."""
+
+    def __init__(self, session: PacedSession, cache: ExtractionCache | None = None, timeout: float = 5.0):
+        self._s = session
+        self._cache = cache
+        self._timeout = timeout
+        self._known: dict[str, bool] = {}
+        self._host_locks: dict[str, threading.Lock] = {}
+        self._lock = threading.Lock()
+
+    def __call__(self, host: str) -> bool:
+        host = host.strip().strip(".").lower()
+        with self._lock:
+            lock = self._host_locks.setdefault(host, threading.Lock())
+        with lock:  # concurrent extract workers asking for one host make one request
+            if host not in self._known:
+                self._known[host] = self._check(host)
+            return self._known[host]
+
+    def _check(self, host: str) -> bool:
+        key = f"domain:{host}"
+        if self._cache is not None and self._cache.get(key, "domain") is not None:
+            return True
+        exists = self._request(host)
+        if exists and self._cache is not None:
+            self._cache.put(key, "domain", "", {"exists": True})
+        return exists
+
+    def _request(self, host: str) -> bool:
+        try:
+            resp = self._s.get(f"https://{host}/", timeout=self._timeout, allow_redirects=True, stream=True)
+        except Blocked:
+            return True
+        except (requests.RequestException, ValueError):
+            return False
+        with contextlib.suppress(Exception):
+            resp.close()  # the body is never read
+        return True

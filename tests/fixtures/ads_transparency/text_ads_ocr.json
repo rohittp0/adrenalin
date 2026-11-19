@@ -1,0 +1,58 @@
+{
+ "text_ad_5464025061462758635.png": {"method": "apple_vision", "lines": [
+   {"text": "flights70.com", "confidence": 1.0, "box": [0.1079, -0.0049, 0.2508, 0.1071]},
+   {"text": "www.flights70.com/", "confidence": 1.0, "box": [0.1149, 0.122, 0.3046, 0.0732]},
+   {"text": "Book flights from Delhi - Get closer", "confidence": 1.0, "box": [-0.0, 0.3049, 0.9828, 0.128]},
+   {"text": "to Delhi", "confidence": 1.0, "box": [0.0, 0.4756, 0.2213, 0.1037]},
+   {"text": "With our flight comparison tool, you get the best deals", "confidence": 1.0, "box": [0.0, 0.6951, 0.9569, 0.0915]},
+   {"text": "from 100+ travel websites", "confidence": 1.0, "box": [0.0, 0.8171, 0.4598, 0.0732]}
+ ]},
+ "text_ad_11321256415929196548.png": {"method": "apple_vision", "lines": [
+   {"text": "Hotels70", "confidence": 1.0, "box": [0.1098, 0.0026, 0.154, 0.0335]},
+   {"text": "H", "confidence": 1.0, "box": [0.0192, 0.0149, 0.044, 0.0387]},
+   {"text": "Huskiro", "confidence": 0.3, "box": [0.0137, 0.0565, 0.0495, 0.0149]},
+   {"text": "www.hotels70.com/", "confidence": 0.3, "box": [0.1071, 0.0595, 0.294, 0.0327]},
+   {"text": "Hotels in Bergen op Zoom from €29 -", "confidence": 1.0, "box": [0.0, 0.1458, 0.9121, 0.0595]},
+   {"text": "Hotels from €29", "confidence": 1.0, "box": [0.0, 0.2232, 0.3901, 0.0476]},
+   {"text": "Book last-minute hotels from €29,", "confidence": 1.0, "box": [0.0, 0.3274, 0.5769, 0.0446]},
+   {"text": "with flexible cancellation options.", "confidence": 1.0, "box": [-0.0, 0.3869, 0.5604, 0.0417]},
+   {"text": "Discover hotels from €29/night with", "confidence": 1.0, "box": [0.0, 0.4464, 0.5989, 0.0417]},
+   {"text": "no hidden fees. Quick and secure", "confidence": 1.0, "box": [0.0, 0.506, 0.5742, 0.0387]},
+   {"text": "booking. Book Now. Great Offers. ...", "confidence": 1.0, "box": [-0.0, 0.5655, 0.6209, 0.0417]},
+   {"text": "Book Cheap Hotels fror", "confidence": 1.0, "box": [0.5989, 0.6935, 0.3984, 0.0446]},
+   {"text": "Hotels in Bergen op Zoom", "confidence": 1.0, "box": [0.044, 0.6964, 0.4451, 0.0417]},
+   {"text": "• Up to 70% off on all Hotel Booking", "confidence": 1.0, "box": [-0.0, 0.875, 0.7802, 0.0565]}
+ ]},
+ "text_ad_5232610464116262506.png": {"method": "apple_vision", "lines": [
+   {"text": "www.marineradar.com/", "confidence": 1.0, "box": [0.0977, 0.0682, 0.3764, 0.0909]},
+   {"text": "Track This Ship Live", "confidence": 1.0, "box": [0.0, 0.3485, 0.5718, 0.1591]},
+   {"text": "See where this ship is now: live position, speed, course", "confidence": 1.0, "box": [0.0, 0.6212, 0.9856, 0.1061]},
+   {"text": "and destination.", "confidence": 1.0, "box": [-0.0, 0.7727, 0.2874, 0.0985]}
+ ]},
+ "text_ad_7828145789531681851.png": {"method": "apple_vision", "lines": [
+   {"text": "marineradar.com", "confidence": 1.0, "box": [0.092, 0.0022, 0.3276, 0.0263]},
+   {"text": "www.marineradar.com/", "confidence": 1.0, "box": [0.1121, 0.0416, 0.3621, 0.0263]},
+   {"text": "Live Ship Map - Track Any Ship by", "confidence": 1.0, "box": [0.0, 0.1094, 0.9655, 0.0481]},
+   {"text": "Name", "confidence": 1.0, "box": [-0.0006, 0.169, 0.1708, 0.0406]},
+   {"text": "Out of coastal range? 1 satellite credit fetches its latest", "confidence": 1.0, "box": [-0.0, 0.2495, 0.977, 0.0306]},
+   {"text": "mid-ocean position.", "confidence": 1.0, "box": [-0.0, 0.2932, 0.3506, 0.0306]},
+   {"text": "Live Ship Map", "confidence": 1.0, "box": [-0.0, 0.4551, 0.3305, 0.0372]},
+   {"text": "Live Vessel Position", "confidence": 1.0, "box": [0.0, 0.5711, 0.4626, 0.0328]},
+   {"text": ">", "confidence": 1.0, "box": [0.9483, 0.6827, 0.046, 0.046]},
+   {"text": "Container Tracking", "confidence": 1.0, "box": [0.0, 0.6849, 0.4368, 0.0416]},
+   {"text": "Ports Directory", "confidence": 1.0, "box": [-0.0004, 0.799, 0.3456, 0.0453]},
+   {"text": ">", "confidence": 1.0, "box": [0.9511, 0.8009, 0.0402, 0.0416]},
+   {"text": ">", "confidence": 1.0, "box": [0.9511, 0.9147, 0.0402, 0.0438]},
+   {"text": "Get the App", "confidence": 1.0, "box": [-0.0013, 0.9166, 0.276, 0.0438]}
+ ]},
+ "simgad_text.png": {"method": "apple_vision", "lines": [
+   {"text": "flights70.com", "confidence": 1.0, "box": [0.112, 0.004, 0.2415, 0.0704]},
+   {"text": "www.tlights/0.com/", "confidence": 1.0, "box": [0.1121, 0.098, 0.3075, 0.0588]},
+   {"text": "Book Cheap Flight Tickets - Find", "confidence": 1.0, "box": [0.0, 0.2451, 0.9138, 0.1029]},
+   {"text": "Cheapest Flight Tickets", "confidence": 1.0, "box": [0.0, 0.3824, 0.658, 0.1078]},
+   {"text": "Why waste hours checking different airline websites?", "confidence": 1.0, "box": [0.0, 0.5532, 0.9458, 0.0792]},
+   {"text": "With our flight comparison tool, you get the best deals", "confidence": 1.0, "box": [0.0, 0.6569, 0.9569, 0.0686]},
+   {"text": "from 100+ travel websites. Search Flights. Affordable", "confidence": 1.0, "box": [0.0, 0.7549, 0.9425, 0.0686]},
+   {"text": "Rates.", "confidence": 1.0, "box": [-0.0001, 0.8571, 0.1181, 0.0604]}
+ ]}
+}

@@ -64,6 +64,8 @@ class FakeGoogle:
         self.fail_simgad = 0
         self.oembed_status = 200
         self.oembed_reply = None
+        self.hosts = []
+        self.missing_hosts = set()
         self.lock = threading.Lock()
 
     def __call__(self, method, url, params=None, data=None, **kw):
@@ -94,6 +96,12 @@ class FakeGoogle:
                 if self.oembed_status != 200:
                     return response(self.oembed_status, b"Unauthorized", url=url)
                 return response(body=OEMBED, headers={"Content-Type": "application/json"}, url=url)
+            if method == "GET" and url.endswith("/") and url.count("/") == 3:
+                host = url.split("/")[2]  # domain check of an OCR-read host
+                self.hosts.append(host)
+                if host in self.missing_hosts:
+                    raise requests.ConnectionError(f"Failed to resolve '{host}'")
+                return response(404, b"", url=url)
         raise AssertionError(f"unexpected request {method} {url}")
 
 
@@ -116,7 +124,7 @@ def fake_ocr(path):
         OcrLine("Lascade", 0.95, (0.05, 0.05, 0.3, 0.05)),
         OcrLine("www.lascade.com", 0.95, (0.05, 0.12, 0.4, 0.05)),
         OcrLine("Big Bold Headline", 0.95, (0.05, 0.2, 0.8, 0.1)),
-        OcrLine("A smaller description line.", 0.95, (0.05, 0.35, 0.8, 0.05)),
+        OcrLine("A smaller description line.", 0.95, (0.05, 0.35, 0.45, 0.05)),
     ]
     return OcrResult(lines, "apple_vision")
 
@@ -242,6 +250,24 @@ def test_open_window_relist_walks_every_page(tmp_path):
         assert q.get_meta("list_done") == date.today().isoformat()
     finally:
         q.close()
+
+
+def test_ocr_domains_checked_once_per_host(tmp_path):
+    fake = FakeGoogle()
+    rows = read_rows(run_scrape(tmp_path, fake))
+    texts = [r for r in rows if r["image_file"] and r["format"] == "text"]
+    assert texts and {(r["website"], r["extraction_method"]) for r in texts} == {("lascade.com", "apple_vision")}
+    assert fake.hosts == ["lascade.com"]  # content.js rows are never checked
+    read_rows(run_scrape(tmp_path, fake))
+    assert fake.hosts == ["lascade.com"]  # an existing host is remembered across runs
+
+
+def test_unresolvable_ocr_domain_sends_row_to_codex(tmp_path):
+    fake = FakeGoogle()
+    fake.missing_hosts = {"lascade.com"}
+    texts = [r for r in read_rows(run_scrape(tmp_path, fake)) if r["image_file"] and r["format"] == "text"]
+    assert texts and {r["extraction_method"] for r in texts} == {"codex"}
+    assert fake.hosts == ["lascade.com"]
 
 
 def test_rerun_with_vision_requeues_ocr_rows(tmp_path):

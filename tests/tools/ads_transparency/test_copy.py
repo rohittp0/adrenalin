@@ -20,6 +20,7 @@ from adrenalin.tools.ads_transparency.copy import (
 FIX = Path(__file__).parents[2] / "fixtures" / "ads_transparency"
 _DETAIL = json.loads((FIX / "creative_detail_video.json").read_text(encoding="utf-8"))
 OVERLAY_URL = _DETAIL["1"]["5"][1]["1"]["4"]
+_RECORDED = json.loads((FIX / "text_ads_ocr.json").read_text(encoding="utf-8"))
 
 
 def test_website_from():
@@ -82,18 +83,11 @@ def _line(text, y, h, conf=1.0):
 
 
 def _text_ad_result(conf=1.0):
-    return OcrResult(
-        [
-            _line("flights70.com", 0.0, 0.05, conf),
-            _line("www.flights70.com/", 0.1, 0.04, conf),
-            _line("Book Cheap Flight Tickets -", 0.2, 0.08, conf),
-            _line("Find Cheapest Flight Tickets", 0.3, 0.08, conf),
-            _line("Why waste hours checking", 0.4, 0.05, conf),
-            _line("different airline websites?", 0.5, 0.05, conf),
-            _line("Search Flights.", 0.6, 0.05, conf),
-        ],
-        "apple_vision",
-    )
+    """simgad_text.png as Apple Vision reads it, with the display URL read correctly."""
+    d = _RECORDED["simgad_text.png"]
+    lines = [OcrLine(l["text"], conf, tuple(l["box"])) for l in d["lines"]]
+    lines[1].text = "www.flights70.com/"
+    return OcrResult(lines, "apple_vision")
 
 
 def test_parse_text_ad_ocr_synthetic():
@@ -322,5 +316,176 @@ def test_codex_non_dict_treated_as_error(tmp_path):
         c = extract_image(tmp_path / "x.png", "f4", "text", cache=cache, codex=FakeCodex(result=["bad"]),
                           force_vision=True, ocr=lambda p: _text_ad_result(), warn=warnings.append)
         assert c.method == "apple_vision" and len(warnings) == 1 and not c.vision_pending
+    finally:
+        cache.close()
+
+
+# -- OCR layout of Text ads, on recorded Apple Vision output of live Lascade ads -----------------
+
+def _recorded(name):
+    d = _RECORDED[name]
+    return OcrResult([OcrLine(l["text"], l["confidence"], tuple(l["box"])) for l in d["lines"]], d["method"])
+
+
+_TEXT_ADS = {
+    # wrapped headline "... Get closer" / "to Delhi" must not spill into the description
+    "text_ad_5464025061462758635.png": dict(
+        brand="flights70.com", display_url="www.flights70.com/", website="flights70.com",
+        headline="Book flights from Delhi - Get closer to Delhi",
+        description="With our flight comparison tool, you get the best deals from 100+ travel websites",
+        sitelinks=[]),
+    # logo glyphs "H" / "Huskiro" between brand and URL, URL read at confidence 0.3, pills and a callout
+    "text_ad_11321256415929196548.png": dict(
+        brand="Hotels70", display_url="www.hotels70.com/", website="hotels70.com",
+        headline="Hotels in Bergen op Zoom from €29 - Hotels from €29",
+        description="Book last-minute hotels from €29, with flexible cancellation options. Discover hotels from "
+                    "€29/night with no hidden fees. Quick and secure booking. Book Now. Great Offers. ...",
+        sitelinks=["Hotels in Bergen op Zoom", "Book Cheap Hotels fror", "Up to 70% off on all Hotel Booking"]),
+    # no brand line above the URL
+    "text_ad_5232610464116262506.png": dict(
+        brand="", display_url="www.marineradar.com/", website="marineradar.com",
+        headline="Track This Ship Live",
+        description="See where this ship is now: live position, speed, course and destination.",
+        sitelinks=[]),
+    # headline's second line only 1.17x the median line height; list sitelinks with ">" chevrons
+    "text_ad_7828145789531681851.png": dict(
+        brand="marineradar.com", display_url="www.marineradar.com/", website="marineradar.com",
+        headline="Live Ship Map - Track Any Ship by Name",
+        description="Out of coastal range? 1 satellite credit fetches its latest mid-ocean position.",
+        sitelinks=["Live Ship Map", "Live Vessel Position", "Container Tracking", "Ports Directory", "Get the App"]),
+}
+
+
+def _fields(c):
+    return {k: getattr(c, k) for k in ("brand", "display_url", "website", "headline", "description", "sitelinks")}
+
+
+@pytest.mark.parametrize("name", list(_TEXT_ADS))
+def test_parse_text_ad_ocr_live_layouts(name):
+    r = _recorded(name)
+    c = parse_text_ad_ocr(r)
+    assert _fields(c) == _TEXT_ADS[name]
+    assert c.method == "apple_vision" and c.confidence == r.confidence and not needs_vision(r, c)
+
+
+@pytest.mark.parametrize("name", list(_TEXT_ADS))
+def test_parse_text_ad_real_ocr_matches_recording(name):
+    from adrenalin.common.ocr import recognize
+    try:
+        r = recognize(FIX / name)
+    except OcrUnavailable:
+        pytest.skip("no OCR engine")
+    if r.method != "apple_vision":
+        pytest.skip("expected values are for Apple Vision")
+    want = _TEXT_ADS[name]
+    c = parse_text_ad_ocr(r)
+    assert (c.brand, c.website, c.headline) == (want["brand"], want["website"], want["headline"])
+
+
+def test_misread_url_host_without_dot_goes_to_codex_and_is_never_emitted():
+    # simgad_text.png: Apple Vision reads www.flights70.com/ as "www.tlights/0.com/" at confidence 1.0
+    r = _recorded("simgad_text.png")
+    assert r.lines[1].text == "www.tlights/0.com/" and r.confidence == 1.0
+    c = parse_text_ad_ocr(r)
+    assert (c.brand, c.display_url, c.website) == ("flights70.com", "", "flights70.com")  # brand domain wins
+    assert c.headline == "Book Cheap Flight Tickets - Find Cheapest Flight Tickets"
+    assert c.description.endswith("Search Flights. Affordable Rates.")
+    assert c.confidence <= 0.5 and needs_vision(r, c)
+
+
+def _ad(brand, url):
+    return OcrResult([
+        OcrLine(brand, 1.0, (0.11, 0.0, 0.2, 0.08)),
+        OcrLine(url, 1.0, (0.11, 0.1, 0.3, 0.06)),
+        OcrLine("Cheap Flights on Flights70 - Save", 1.0, (0.0, 0.22, 0.95, 0.09)),
+        OcrLine("Upto 70% on flight ticket", 1.0, (0.0, 0.34, 0.7, 0.1)),
+        OcrLine("Flights70 helps travellers make", 1.0, (0.0, 0.5, 0.55, 0.06)),
+        OcrLine("smarter flight booking decisions.", 1.0, (0.0, 0.59, 0.58, 0.06)),
+    ], "apple_vision")
+
+
+def test_misread_url_without_brand_domain_blanks_website():
+    r = _ad("Flights70", "www.flights/0.com/")
+    c = parse_text_ad_ocr(r)
+    assert (c.brand, c.display_url, c.website) == ("Flights70", "", "")
+    assert c.headline == "Cheap Flights on Flights70 - Save Upto 70% on flight ticket"
+    assert c.description == "Flights70 helps travellers make smarter flight booking decisions."
+    assert needs_vision(r, c)
+
+
+def test_brand_domain_disagreeing_with_url_prefers_brand_and_asks_codex():
+    r = _ad("flights70.com", "www.fiights70.com/")
+    c = parse_text_ad_ocr(r)
+    assert (c.display_url, c.website) == ("www.fiights70.com/", "flights70.com")
+    assert needs_vision(r, c)
+    sub = parse_text_ad_ocr(_ad("flights70.com", "app.flights70.com/"))
+    assert (sub.website, sub.confidence) == ("app.flights70.com", 1.0)
+
+
+def test_text_ad_wrapped_hyphenated_word_is_rejoined():
+    r = _ad("Rent80", "app.rent80.com/")
+    r.lines[4] = OcrLine("Rent a car stress-", 1.0, (0.0, 0.5, 0.3, 0.06))
+    r.lines[5] = OcrLine("free with Rent80.", 1.0, (0.0, 0.59, 0.28, 0.06))
+    assert parse_text_ad_ocr(r).description == "Rent a car stress-free with Rent80."
+
+
+def test_text_ad_layout_mismatch_falls_back_without_inventing_cta(tmp_path):
+    r = OcrResult([OcrLine("flights70.com", 1.0, (0.11, 0.0, 0.2, 0.08)),
+                   OcrLine("www.flights70.com/", 1.0, (0.11, 0.1, 0.3, 0.06)),
+                   OcrLine("Book now", 1.0, (0.0, 0.3, 0.1, 0.05))], "apple_vision")
+    assert parse_text_ad_ocr(r) is None
+    cache = _cache(tmp_path)
+    try:
+        c = extract_image(tmp_path / "x.png", "m1", "text", cache=cache, codex=None, force_vision=False,
+                          ocr=lambda p: r, warn=lambda m: None)
+        assert (c.brand, c.display_url, c.cta) == ("flights70.com", "www.flights70.com/", "")
+    finally:
+        cache.close()
+
+
+class FakeHosts:
+    def __init__(self, missing=()):
+        self.missing, self.calls = set(missing), []
+
+    def __call__(self, host):
+        self.calls.append(host)
+        return host not in self.missing
+
+
+def test_unresolvable_ocr_host_falls_back_to_brand_domain_and_codex(tmp_path):
+    cache, hosts = _cache(tmp_path), FakeHosts({"flights7o.com"})
+    try:
+        r = _ad("flights70.com", "www.flights7O.com/")
+        c = extract_image(tmp_path / "x.png", "h1", "text", cache=cache, codex=None, force_vision=False,
+                          ocr=lambda p: r, warn=lambda m: None, host_exists=hosts)
+        assert (c.display_url, c.website, c.method) == ("", "flights70.com", "apple_vision")
+        assert c.confidence <= 0.5 and "flights7o.com" in hosts.calls
+        codex = FakeCodex({"brand": "Flights70", "display_url": "www.flights70.com/", "confidence": 0.9})
+        c = extract_image(tmp_path / "x.png", "h2", "text", cache=cache, codex=codex, force_vision=False,
+                          ocr=lambda p: r, warn=lambda m: None, host_exists=hosts)
+        assert (c.method, c.website) == ("codex", "flights70.com")
+    finally:
+        cache.close()
+
+
+def test_unresolvable_host_without_brand_domain_blanks_website(tmp_path):
+    cache, hosts = _cache(tmp_path), FakeHosts({"flights7o.com"})
+    try:
+        c = extract_image(tmp_path / "x.png", "h3", "text", cache=cache, codex=None, force_vision=False,
+                          ocr=lambda p: _ad("Flights70", "www.flights7O.com/"), warn=lambda m: None,
+                          host_exists=hosts)
+        assert (c.display_url, c.website) == ("", "") and c.confidence <= 0.5
+    finally:
+        cache.close()
+
+
+def test_resolvable_host_keeps_ocr_copy(tmp_path):
+    cache, hosts = _cache(tmp_path), FakeHosts()
+    try:
+        c = extract_image(tmp_path / "x.png", "h4", "text", cache=cache, codex=FakeCodex(exc=AssertionError()),
+                          force_vision=False, ocr=lambda p: _ad("Flights70", "www.flights70.com/"),
+                          warn=lambda m: None, host_exists=hosts)
+        assert (c.display_url, c.website, c.confidence) == ("www.flights70.com/", "flights70.com", 1.0)
+        assert hosts.calls == ["flights70.com"]
     finally:
         cache.close()

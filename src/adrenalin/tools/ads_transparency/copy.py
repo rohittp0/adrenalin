@@ -6,8 +6,8 @@ import dataclasses
 import gzip
 import html
 import re
-import statistics
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -63,9 +63,8 @@ def website_from(display_url: str) -> str:
     s = display_url.strip()
     s = re.sub(r"^[a-z][a-z0-9+.-]*://", "", s, flags=re.I)
     host = re.split(r"[/?#]", s, maxsplit=1)[0]
-    if host.lower().startswith("www."):
-        host = host[4:]
-    return host
+    host = host.lower()
+    return host[4:] if host.startswith("www.") else host
 
 
 def _decode_escapes(js: str) -> str:
@@ -123,7 +122,7 @@ def parse_content_js(js: str) -> AdCopy | None:
         if len(strings) >= 3 and not (c.headline or c.brand or c.description):
             c.brand = strings[0]
             rest = strings[1:]
-            if _is_url(rest[0]):
+            if _url_like(rest[0]):
                 c.display_url = rest[0]
                 rest = rest[1:]
             if rest:
@@ -193,34 +192,135 @@ def parse_overlay_param(content_js_url: str) -> AdCopy | None:
     )
 
 
-def _is_url(text: str) -> bool:
+# Text-ad layout (Google's mobile search-ad render, about 700 px wide). Measured on live Apple Vision output:
+# headline text is 0.025-0.043 image widths per character, description and sitelinks 0.014-0.020 (callouts and
+# list sitelinks up to 0.025, but they follow the description). Gaps inside a block are at most 0.73 line
+# heights, gaps before sitelinks at least 1.5. Logo glyphs ("H", "RENT", "80") end left of x = 0.07, while
+# brand and URL lines start at x >= 0.09 and body lines at x = 0.
+_HEADLINE_CHAR_WIDTH = 0.022
+_BLOCK_GAP = 1.1
+_LOGO_EDGE = 0.09
+MIN_CONFIDENCE = 0.6
+_DOUBTFUL = 0.5  # confidence given to OCR copy whose domain looks misread, so it goes to Codex
+
+
+def _url_like(text: str) -> bool:
+    """Shaped like a URL, possibly misread: `www.tlights/0.com/` still marks the URL line."""
     return bool(_URL_RE.match(text.replace(" ", "")))
 
 
-def parse_text_ad_ocr(r: OcrResult) -> AdCopy | None:
-    lines = r.lines
-    if len(lines) < 3 or not _is_url(lines[1].text):
-        return None
-    median = statistics.median(l.box[3] for l in lines)
-    i = 2
-    headline: list[str] = []
-    while i < len(lines) and lines[i].box[3] >= 1.2 * median:
-        headline.append(lines[i].text)
+def _domain(text: str) -> str:
+    """The host of a well-formed URL or domain (its host has a dot once `www.` is removed), else ""."""
+    host = website_from(text.replace(" ", "")) if _url_like(text) else ""
+    return host if "." in host else ""
+
+
+def _same_site(a: str, b: str) -> bool:
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def _doubt(c: AdCopy) -> None:
+    c.confidence = _DOUBTFUL if c.confidence is None else min(c.confidence, _DOUBTFUL)
+
+
+def _rows(lines: list[OcrLine]) -> list[list[OcrLine]]:
+    """Group lines into visual rows (side-by-side sitelink pills, a sitelink and its ">"), each sorted by x."""
+    rows: list[list[OcrLine]] = []
+    for l in lines:
+        mid = l.box[1] + l.box[3] / 2
+        first = rows[-1][0] if rows else None
+        if first is not None and first.box[1] <= mid <= first.box[1] + first.box[3]:
+            rows[-1].append(l)
+        else:
+            rows.append([l])
+    return [sorted(r, key=lambda l: l.box[0]) for r in rows]
+
+
+def _gap(a: list[OcrLine], b: list[OcrLine]) -> float:
+    """Vertical gap between two rows, in line heights of the smaller one."""
+    bottom = max(l.box[1] + l.box[3] for l in a)
+    height = min(min(l.box[3] for l in a), min(l.box[3] for l in b))
+    return (min(l.box[1] for l in b) - bottom) / height if height > 0 else 0.0
+
+
+def _headline_font(row: list[OcrLine]) -> bool:
+    text = row[0].text.strip()
+    return len(row) == 1 and bool(text) and row[0].box[2] / len(text) >= _HEADLINE_CHAR_WIDTH
+
+
+def _block(rows: list[list[OcrLine]], start: int, more) -> int:
+    """End index of the block of single-line rows from `start` whose gaps stay small and `more` holds."""
+    i = start
+    while (i < len(rows) and len(rows[i]) == 1 and more(rows[i])
+           and (i == start or _gap(rows[i - 1], rows[i]) <= _BLOCK_GAP)):
         i += 1
-    if not headline:
+    return i
+
+
+def _join(rows: list[list[OcrLine]]) -> str:
+    out = ""
+    for row in rows:
+        t = row[0].text.strip()
+        if re.search(r"[^\W\d_]-$", out) and t[:1].islower():
+            out += t  # "stress-" + "free"
+        else:
+            out = f"{out} {t}" if out else t
+    return out
+
+
+def _sitelink(text: str) -> str:
+    t = text.strip().lstrip("•·").strip()
+    # ">" chevrons and slivers of pills cut off at the image edge ("Ca") are not sitelinks
+    return t if sum(ch.isalpha() for ch in t) >= 3 else ""
+
+
+def parse_text_ad_ocr(r: OcrResult) -> AdCopy | None:
+    """Brand, display URL, headline, description and sitelinks of a Text-format image, or None when the
+    lines don't follow that layout. A display URL that looks misread is never emitted and lowers the confidence."""
+    lines = [l for l in r.lines if l.text.strip()]
+    n = len(lines)
+    # The URL is the last URL-like line of the header: the brand line above it may be a domain too.
+    u = next((i for i in range(min(n, 5))
+              if _url_like(lines[i].text) and not (i + 1 < n and _url_like(lines[i + 1].text))), None)
+    if u is None:
         return None
-    display_url = lines[1].text.replace(" ", "")
-    return AdCopy(
-        brand=lines[0].text, display_url=display_url, website=website_from(display_url),
-        headline=" ".join(headline), description=" ".join(l.text for l in lines[i:]),
-        full_text=r.text, method=r.method, confidence=r.confidence,
+    url = lines[u]
+    header_bottom = url.box[1] + url.box[3]
+
+    def logo(l: OcrLine) -> bool:
+        return l.box[0] + l.box[2] < _LOGO_EDGE and l.box[1] < header_bottom
+
+    above = [l for l in lines[:u] if not logo(l)]
+    brand = above[-1].text.strip() if above else ""
+    rows = _rows([l for l in lines[u + 1:] if not logo(l)])
+    h = _block(rows, 0, _headline_font)
+    d = _block(rows, h, lambda row: True)
+    if h == 0 or d == h:
+        return None
+
+    shown = url.text.replace(" ", "")
+    host, brand_host = website_from(shown), _domain(brand)
+    if "." not in host:  # e.g. "www.tlights/0.com/"
+        display_url, website = "", brand_host
+    elif brand_host and not _same_site(host, brand_host):
+        display_url, website = shown, brand_host
+    else:
+        display_url, website = shown, host
+    c = AdCopy(
+        brand=brand, display_url=display_url, website=website, headline=_join(rows[:h]),
+        description=_join(rows[h:d]), full_text=r.text, method=r.method, confidence=r.confidence,
+        sitelinks=[t for row in rows[d:] for l in row if (t := _sitelink(l.text))],
     )
+    if display_url != shown or website != host:
+        _doubt(c)
+    return c
 
 
 def parse_image_ad_ocr(r: OcrResult) -> AdCopy:
     top = [l for l in r.lines if l.box[1] < 0.12]
     brand = top[0].text if top else ""
-    display_url = next((l.text.replace(" ", "") for l in top if _is_url(l.text)), "")
+    urls = [l.text.replace(" ", "") for l in top if _domain(l.text)]
+    display_url = urls[-1] if urls else ""  # the brand line above the URL can be a domain too
     short = [l.text for l in r.lines if len(l.text.split()) <= 3 and re.search(r"[^\W\d_]", l.text)]
     cta = next((t for t in reversed(short) if t.lower() in _CTA_LOWER), short[-1] if short else "")
     return AdCopy(
@@ -229,8 +329,25 @@ def parse_image_ad_ocr(r: OcrResult) -> AdCopy:
     )
 
 
+def verify_hosts(c: AdCopy, host_exists) -> None:
+    """Check OCR-read domains on the network: one that doesn't resolve was misread. It is dropped (the
+    website falls back to the brand line's domain when that one resolves) and the copy goes to Codex."""
+    bad: set[str] = set()
+    url_host = website_from(c.display_url)
+    if url_host and not host_exists(url_host):
+        bad.add(url_host)
+        c.display_url = ""
+    if c.website and (c.website in bad or (c.website != url_host and not host_exists(c.website))):
+        bad.add(c.website)
+        brand_host = _domain(c.brand)
+        c.website = brand_host if brand_host and brand_host not in bad and host_exists(brand_host) else ""
+    if bad:
+        _doubt(c)
+
+
 def needs_vision(r: OcrResult, copy: AdCopy | None) -> bool:
-    return not r.lines or r.confidence < 0.6 or copy is None
+    return (not r.lines or r.confidence < MIN_CONFIDENCE or copy is None
+            or (copy.confidence is not None and copy.confidence < MIN_CONFIDENCE))
 
 
 VISION_SCHEMA = {
@@ -278,8 +395,10 @@ def _vision_copy(d: dict, model: str) -> AdCopy:
 
 def extract_image(
     path: Path, image_id: str, fmt: str, *, cache: ExtractionCache, codex: CodexRunner | None,
-    force_vision: bool, ocr=recognize, warn=log,
+    force_vision: bool, ocr=recognize, warn=log, host_exists: Callable[[str], bool] | None = None,
 ) -> AdCopy:
+    """Copy of a `simgad` image: OCR + layout rules, Codex when OCR fails or with `force_vision`.
+    `host_exists` (optional, network) verifies the domains OCR read."""
     is_text = str(fmt).lower() in ("text", "1")
     r: OcrResult | None = None
     ocr_failed = False
@@ -296,7 +415,10 @@ def extract_image(
     def ocr_copy(res: OcrResult | None) -> AdCopy | None:
         if res is None:
             return None
-        return parse_text_ad_ocr(res) if is_text else parse_image_ad_ocr(res)
+        c = parse_text_ad_ocr(res) if is_text else parse_image_ad_ocr(res)
+        if c is not None and host_exists is not None:
+            verify_hosts(c, host_exists)
+        return c
 
     if not force_vision:
         try:
@@ -335,6 +457,10 @@ def extract_image(
 
     if copy is None and r is not None and r.lines:
         copy = parse_image_ad_ocr(r)  # best effort when the text layout did not match
+        if is_text:
+            copy.cta = ""  # a Text ad has no button; the last short line is a sitelink
+        if host_exists is not None:
+            verify_hosts(copy, host_exists)
     if copy is None:
         copy = AdCopy()
     copy.vision_pending = pending
