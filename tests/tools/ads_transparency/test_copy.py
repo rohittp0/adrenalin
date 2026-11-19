@@ -641,3 +641,14 @@ def test_content_js_with_images_but_no_copy_is_not_confident():
     assert c.has_copy and c.headline.startswith("eSIM for 190+ Countries") and c.confidence == 1.0
     assert c.image_urls == ["https://tpc.googlesyndication.com/simgad/12147114744176439645"]
     assert parse_content_preview("var x = 1;", "https://x.example/content.js") is None
+
+
+def test_vision_copy_tolerates_non_string_fields(tmp_path):
+    cache = _cache(tmp_path)
+    try:
+        c = extract_image(tmp_path / "x.png", "v3", "text", cache=cache, force_vision=True, ocr=_never,
+                          codex=FakeCodex({"brand": None, "cta": 3, "sitelinks": [None, "A"], "confidence": "x"}),
+                          warn=lambda m: None)
+        assert (c.brand, c.cta, c.sitelinks, c.confidence) == ("", "", ["A"], None)
+    finally:
+        cache.close()

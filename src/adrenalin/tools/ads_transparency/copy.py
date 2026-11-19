@@ -435,7 +435,7 @@ def _ocr_from_dict(d: dict) -> OcrResult:
 
 
 def _squash(text) -> str:
-    return " ".join(str(text).split())
+    return " ".join(text.split()) if isinstance(text, str) else ""
 
 
 def _vision_copy(d: dict, model: str) -> AdCopy:
