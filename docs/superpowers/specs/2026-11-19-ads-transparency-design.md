@@ -46,23 +46,26 @@ CSV columns, in order:
 - `variation` is 1-based. It is always 1 without `--variations`. Variations with an identical Preview (same `simgad` ID or same `content.js` URL) are collapsed into one, because Google often repeats the same render.
 - `landing_url` is the decoded `adurl=` from `content.js`, for example a Play Store link for app-install ads. It is empty for `simgad` ads.
 - `sitelinks` and `image_urls` are joined with ` | `.
+- Text cells starting with `=`, `+`, `-`, `@`, tab or CR get a leading `'` so spreadsheets don't run them as formulas.
 - `extraction_method` is one of `content_js`, `apple_vision`, `tesseract`, `codex` or empty. `extraction_confidence` is a number from 0 to 1. Codex confidence is self-reported.
 
 ## Where copy comes from
 
 | Preview | Source | Method |
 |---|---|---|
-| `content.js`, video / app install | YouTube ID from `ytimg.com/vi/<id>`, the markup strings (brand, description, CTA such as `Install`), `adurl=` → `landing_url`; `video_title` from YouTube oEmbed (any error → blank) | `content_js` |
+| `content.js`, video / app install | YouTube ID from `ytimg.com/vi/<id>`, the markup strings (brand, headline, description joined from wrapped fragments, CTA such as `Install`), `adurl=` → `landing_url`; `video_title` from YouTube oEmbed (any error → blank; a temporary one such as a timeout, 429 or 5xx is retried on the next run) | `content_js` |
 | `content.js`, image/Demand Gen | `google_template_data.adData`: `headline`, `body`, `advertiser`, `logo`, `squareImage`/`landscapeImage` | `content_js` |
 | `content.js`, text | Markup strings: brand, display URL, headline, description, sitelinks | `content_js` |
 | `simgad` image | OCR (Apple Vision on macOS, else Tesseract) + layout rules | `apple_vision` / `tesseract` |
 | `simgad`, OCR failed or `--vision` | `codex exec -m gpt-5.6-luna -c model_reasoning_effort=low -i <img> --output-schema`, stdin closed (it otherwise waits for input) | `codex` |
 
-- OCR fails when there is no text, the mean confidence is below 0.6, or a Text-format image doesn't match brand → display URL → headline → description.
-- Codex runs at most 2 calls at a time and 200 per run. Over the cap, the OCR result is kept and the run ends with a warning giving the skipped count.
+- OCR fails when there is no text, the mean confidence is below 0.6, or a Text-format image doesn't match brand → display URL → headline → description (→ sitelinks). The headline is told apart by its larger font (width per character), blocks by vertical gaps.
+- A display URL read by OCR is never emitted when it looks misread: its host has no dot (`www.tlights/0.com/`), it disagrees with a brand line that is itself a domain, or `GET https://<host>/` fails (DNS, connection, TLS or timeout error; any HTTP status counts as existing; once per host, on a fail-fast session, existing hosts cached). The website then falls back to the brand line's domain if that one resolves, and the image goes to Codex.
+- With no OCR engine and no Codex result, the image item fails (exit 1) and is retried on the next run; it is never stored as a blank row.
+- Codex runs at most 2 calls at a time and 200 per run. Over the cap, the OCR result is kept and the run ends with a warning giving the skipped count. If the `codex` binary is missing, Codex is not called again in that run. Codex returns sitelinks too; `cta` is button text only. Cached Codex results are keyed by model and schema version.
 - `content.js` parsing is additive: video ID, `adData`, markup strings and `adurl` are all collected, not first-match-wins.
 - The `overlay=` query parameter of a `content.js` URL is gzipped protobuf containing `headline`, `description` and `visurl`. Use it when the fetched script yields no copy.
-- If both find nothing, the row is left blank with a warning. No headless browser.
+- If both find nothing, the row is left blank with a warning (also when the script has images but no copy: `image_urls` are kept, confidence is blank). No headless browser.
 
 ## Run model
 

@@ -27,7 +27,7 @@ Google's rendering of a Variation: either a static image (`simgad`), whose copy 
 _Avoid_: Creative (when you mean its rendering), asset
 
 **Sitelink**:
-An extra link or callout shown under a Text ad, available only from `content.js` Previews.
+An extra link or callout shown under a Text ad: a link pill, a row of a link list, or a tagged callout line. Read from `content.js` Previews, or from a `simgad` image by OCR layout rules or Codex.
 
 **Days shown**:
 How many days Google reports a Creative as having run, taken directly from the listing.

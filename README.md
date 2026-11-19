@@ -4,7 +4,7 @@ Competitor-analysis tools for marketing teams, run as one CLI: `adrenalin <tool>
 
 ## ads-transparency
 
-Exports every creative an advertiser showed on [Google Ads Transparency](https://adstransparency.google.com) to a CSV: format, region, dates shown, landing page, headline, description, sitelinks, video title and the preview image. Copy comes from Google's `content.js` previews where possible and from OCR of the preview image otherwise (Apple Vision on macOS, Tesseract elsewhere, Codex for images OCR cannot read). Runs are paced to avoid blocks and can be resumed by rerunning the same command.
+Exports every creative an advertiser showed on [Google Ads Transparency](https://adstransparency.google.com) to a CSV: format, region, dates shown, landing page, headline, description, sitelinks, video title and the preview image. Copy comes from Google's `content.js` previews where possible and from OCR of the preview image otherwise (Apple Vision on macOS, Tesseract elsewhere, Codex for images OCR cannot read). Domains read by OCR are checked with one `GET https://<host>/` per host; a misread one is dropped and the image goes to Codex. Runs are paced to avoid blocks and can be resumed by rerunning the same command.
 
 ## Install
 
@@ -12,8 +12,10 @@ Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-brew install tesseract   # required on non-macOS (apt/dnf install tesseract-ocr on Linux); on macOS only a fallback to Apple Vision
+brew install tesseract   # Linux: apt/dnf install tesseract-ocr
 ```
+
+Tesseract is required on Linux and Windows. On macOS it is optional: Apple Vision is used, and Tesseract only if Apple Vision is unavailable. With no OCR engine, image previews can only be read by Codex; images neither can read fail and are retried on the next run.
 
 Codex (`codex` CLI) is optional; it is only called for images OCR fails on, or for all images with `--vision`.
 
@@ -26,7 +28,7 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | Flag | Meaning |
 |---|---|
 | `--region IN` | ISO country code or `anywhere` (default) |
-| `--days N` / `--start` / `--end` | Shown period (ads shown at any point in it) |
+| `--days N` / `--start` / `--end` | Shown period (ads shown at any point in it). `--days N` becomes concrete dates when you run it, so rerunning after midnight starts a new run folder (downloaded images and the extraction cache are reused) |
 | `--variations` | One row per variation, not just the first |
 | `--vision`, `--vision-limit N` | Send every image to Codex; cap Codex calls (default 200) |
 | `--wait-on-block` | Wait out a Google block instead of exiting |
@@ -34,7 +36,7 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `--proxy URL` | Proxy, repeatable to rotate |
 | `--out DIR` | Output root (default `out/`) |
 
-Exit code 2 means Google blocked the run; rerun later to continue. Run `uv run adrenalin ads-transparency --help` for everything.
+Exit codes: `0` done; `1` some items failed or the run hit an error (the CSV is still written; rerun to retry them); `2` Google blocked the run (rerun later to continue). Run `uv run adrenalin ads-transparency --help` for everything.
 
 ## Output
 

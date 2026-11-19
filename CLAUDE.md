@@ -30,16 +30,16 @@ Code lives in `src/adrenalin/` in three layers:
 1. **`cli.py`** discovers tools by scanning `adrenalin.tools.*` packages for a module-level `TOOL` (a `common.tool.Tool`: name, help, `add_arguments`, `run`). It holds no tool-specific logic and has no hard-coded tool list.
 2. **`tools/<name>/`** are self-contained tools. A new tool must expose `TOOL` in its package `__init__.py` and a callable Python API in `api.py` (the CLI is a thin wrapper over it), so other tools can call it programmatically. Tools never shell out to `adrenalin`.
 3. **`common/`** is shared code:
-   - `http.py`: `PacedSession` (per-host pacing, proxies), `Cooldown` (block state shared across runs in `out/.cache/cooldown.sqlite3`), `Blocked`.
+   - `http.py`: `PacedSession` (per-host pacing, proxies), `Cooldown` (block state shared across runs in `out/.cache/cooldown.sqlite3`), `Blocked`, `HostChecker` (does a host exist: one `GET https://<host>/`).
    - `pipeline.py`: `Pipeline` and the SQLite-backed `WorkQueue` for staged, resumable, backpressured runs (see ADR 0001).
-   - `ocr/`: `recognize()` with Apple Vision, Tesseract and Codex (vision LLM) backends.
-   - `cache.py`: `ExtractionCache` of extraction results.
-   - `output.py`: `entity_dir`, `cache_dir`, `write_csv_atomic`, slugs.
+   - `ocr/`: `recognize()` (Apple Vision on macOS, else Tesseract) and, separately, `CodexRunner` (the `codex` CLI as a vision model, with a per-run call cap and a breaker when the binary is missing). Which of them reads an image is decided by the tool (`ads_transparency/copy.py:extract_image`).
+   - `cache.py`: `ExtractionCache` of extraction results, shared by all runs; keys are namespaced (`simgad:<id>`, `domain:<host>`).
+   - `output.py`: `entity_dir`, `cache_dir`, `write_csv_atomic` (also defuses spreadsheet formulas), slugs.
    - `geo.py`: region (ISO code or `anywhere`) to Google geo ID.
    - `tool.py`: the `Tool` dataclass.
 
 **Refactor shared logic into `common/` aggressively.** When a second tool needs logic that already exists inside another tool, move it into `common/` instead of duplicating it. Check `common/` before writing a new helper inside a tool.
 
-`ads-transparency` stages (`tools/ads_transparency/`): `rpc.py` (Google's internal RPCs over plain HTTP), `stages.py` (List, Fetch, Extract, Export), `copy.py` (parse `content.js` Previews), `api.py` (`scrape()`, `ScrapeOptions`, CSV columns).
+`ads-transparency` (`tools/ads_transparency/`): `rpc.py` (Google's internal RPCs over plain HTTP), `stages.py` (the queue stages List, Detail, Fetch and Extract), `copy.py` (ad copy: `content.js` Previews, OCR layout rules for `simgad` images, the Codex fallback and the OCR domain check), `api.py` (`scrape()`, `ScrapeOptions`, and Export: CSV columns and rows).
 
 Output goes to `out/<tool>/<entity>/runs/<run>/` (git-ignored).
