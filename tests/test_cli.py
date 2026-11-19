@@ -19,8 +19,8 @@ def test_discovers_tool_modules_exposing_TOOL(tmp_path, monkeypatch):
     assert set(discover_tools(fake_tools)) == {"hello"}
 
 
-def test_real_package_without_TOOL_is_ignored():
-    assert discover_tools() == {}
+def test_real_package_discovers_ads_transparency():
+    assert "ads-transparency" in discover_tools()
 
 
 def _hello(code):

@@ -1,0 +1,256 @@
+"""Queue stages of an ads-transparency scrape: list, detail, fetch and extract (ADR 0001)."""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import tempfile
+import threading
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import date
+from pathlib import Path
+
+import requests
+
+from adrenalin.common.cache import ExtractionCache
+from adrenalin.common.http import Blocked, PacedSession
+from adrenalin.common.ocr import recognize
+from adrenalin.common.ocr.codex import CodexRunner
+from adrenalin.common.pipeline import Item, Stage, WorkQueue
+from adrenalin.tools.ads_transparency.copy import AdCopy, extract_image, parse_content_js, parse_overlay_param
+from adrenalin.tools.ads_transparency.rpc import (
+    ListedCreative,
+    PaginationLoop,
+    Preview,
+    Query,
+    TransparencyClient,
+)
+
+STAGE_NAMES = ("list", "detail", "fetch", "extract")
+OEMBED_URL = "https://www.youtube.com/oembed"
+MAX_CURSOR_RESTARTS = 3
+
+# (concurrency, throttle_on, max_ahead), from the plan's backpressure limits.
+_STAGE_CONFIG = {
+    "list": (1, ("detail", "fetch", "extract"), 200),
+    "detail": (1, ("fetch", "extract"), 50),
+    "fetch": (4, ("extract",), 50),
+    "extract": (2, (), 0),
+}
+
+
+def watch_url(video_id: str) -> str:
+    return f"https://www.youtube.com/watch?v={video_id}"
+
+
+def preview_to_dict(p: Preview | None) -> dict | None:
+    return None if p is None else {"kind": p.kind, "url": p.url, "width": p.width, "height": p.height}
+
+
+def preview_from_dict(d: dict | None) -> Preview | None:
+    if not d:
+        return None
+    return Preview(d["kind"], d["url"], d.get("width"), d.get("height"))
+
+
+def image_name(p: Preview) -> str:
+    return p.image_id or hashlib.sha1(p.url.encode()).hexdigest()[:20]
+
+
+def creative_fields(c: ListedCreative) -> dict:
+    return {
+        "creative_id": c.creative_id,
+        "format": c.format,
+        "first_shown": c.first_shown.date().isoformat(),
+        "last_shown": c.last_shown.date().isoformat(),
+        "days_shown": c.days_shown,
+    }
+
+
+def page_key(cursor: str | None) -> str:
+    return f"page:{cursor or ''}"
+
+
+@dataclass
+class StageContext:
+    client: TransparencyClient
+    session: PacedSession
+    query: Query
+    entity: Path
+    cache: ExtractionCache
+    codex: CodexRunner | None
+    variations: bool = False
+    vision: bool = False
+    ocr: Callable = recognize
+    log: Callable[[str], None] = print
+    today: Callable[[], date] = date.today
+
+
+class AdsStages:
+    def __init__(self, ctx: StageContext):
+        self.ctx = ctx
+        self._lock = threading.Lock()
+        self._oembed_warned = False
+        self._cursor_restarts = 0
+
+    def warn(self, message: str) -> None:
+        self.ctx.log(f"warning: {message}")
+
+    def stages(self, only: str | None = None) -> list[Stage]:
+        if only == "export":
+            names: tuple[str, ...] = ()
+        elif only == "list":
+            names = ("list", "detail")
+        elif only in ("fetch", "extract"):
+            names = (only,)
+        else:
+            names = STAGE_NAMES
+        names = tuple(n for n in names if n != "detail" or self.ctx.variations)
+        workers = {"list": self.list_page, "detail": self.detail, "fetch": self.fetch, "extract": self.extract}
+        out = []
+        for name in names:
+            concurrency, throttle_on, max_ahead = _STAGE_CONFIG[name]
+            out.append(Stage(name, workers[name], concurrency,
+                             tuple(t for t in throttle_on if t in names), max_ahead))
+        return out
+
+    # -- list ---------------------------------------------------------------
+
+    @staticmethod
+    def _put_page(q: WorkQueue, cursor: str | None) -> None:
+        key = page_key(cursor)
+        if not q.put("list", key, {"cursor": cursor or ""}):
+            q.requeue("list", [key])  # a relist or restart walks pages that are already done
+
+    def list_page(self, item: Item, q: WorkQueue) -> dict:
+        ctx = self.ctx
+        cursor = item.key.removeprefix("page:") or None
+        try:
+            page = ctx.client.search(ctx.query, cursor)
+        except ValueError as e:
+            if not cursor:
+                raise
+            with self._lock:
+                self._cursor_restarts += 1
+                restarts = self._cursor_restarts
+            if restarts > MAX_CURSOR_RESTARTS:
+                raise
+            ctx.log(f"list: cursor expired ({e}), restarting listing")
+            q.set_meta("seen_cursors", "[]")
+            self._put_page(q, None)
+            return {"restarted": True}
+
+        for c in page.creatives:
+            fields = creative_fields(c)
+            if ctx.variations:
+                q.put("detail", c.creative_id, {**fields, "preview": preview_to_dict(c.preview)},
+                      update_payload=True)
+            else:
+                q.put("fetch", f"{c.creative_id}#1",
+                      {**fields, "variation": 1, "preview": preview_to_dict(c.preview)}, update_payload=True)
+        if page.skipped:
+            self.warn(f"skipped {page.skipped} malformed creative(s) on {item.key}")
+
+        nxt = page.next_cursor
+        if nxt:
+            seen = json.loads(q.get_meta("seen_cursors") or "[]")
+            if nxt in seen:
+                raise PaginationLoop(f"cursor repeated: {nxt}")
+            seen.append(nxt)
+            q.set_meta("seen_cursors", json.dumps(seen))
+            self._put_page(q, nxt)
+        else:
+            q.set_meta("list_done", ctx.today().isoformat())
+        return {"creatives": len(page.creatives), "next_cursor": nxt}
+
+    # -- detail -------------------------------------------------------------
+
+    def detail(self, item: Item, q: WorkQueue) -> dict:
+        previews: list[Preview | None] = list(
+            self.ctx.client.variations(self.ctx.query.advertiser_id, item.key))
+        if not previews:
+            previews = [preview_from_dict(item.payload.get("preview"))]
+        fields = {k: v for k, v in item.payload.items() if k != "preview"}
+        for n, p in enumerate(previews, 1):
+            q.put("fetch", f"{item.key}#{n}", {**fields, "variation": n, "preview": preview_to_dict(p)})
+        return {"variations": len(previews)}
+
+    # -- fetch --------------------------------------------------------------
+
+    def _get_ok(self, url: str) -> requests.Response:
+        resp = self.ctx.session.get(url, allow_redirects=True)
+        if resp.status_code != 200:
+            raise requests.HTTPError(f"HTTP {resp.status_code} for {url}", response=resp)
+        return resp
+
+    def _download(self, url: str, path: Path) -> None:
+        resp = self._get_ok(url)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Unique temp name: several creatives can share one simgad image.
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".part")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(resp.content)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+
+    def fetch(self, item: Item, q: WorkQueue) -> dict:
+        p = preview_from_dict(item.payload.get("preview"))
+        result: dict = {}
+        extra: dict = {}
+        if p is not None and p.kind == "image":
+            rel = f"images/{image_name(p)}.png"
+            path = self.ctx.entity / rel
+            if not path.exists():
+                self._download(p.url, path)
+            result["image_file"] = rel
+        elif p is not None:
+            extra["js"] = self._get_ok(p.url).content.decode("utf-8", errors="replace")
+        q.put("extract", item.key, {**item.payload, **result, **extra}, update_payload=True)
+        return result
+
+    # -- extract ------------------------------------------------------------
+
+    def _video_title(self, video_id: str) -> str:
+        try:
+            resp = self.ctx.session.get(OEMBED_URL, params={"url": watch_url(video_id), "format": "json"},
+                                        allow_redirects=True)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, dict) and isinstance(data.get("title"), str):
+                    return data["title"]
+                problem = "no title in response"
+            else:
+                problem = f"HTTP {resp.status_code}"
+        except (Blocked, requests.RequestException, ValueError) as e:
+            problem = f"{type(e).__name__}: {e}"
+        with self._lock:
+            first, self._oembed_warned = not self._oembed_warned, True
+        if first:
+            self.warn(f"YouTube oEmbed failed ({problem}); video_title left blank")
+        return ""
+
+    def extract(self, item: Item, q: WorkQueue) -> dict:
+        ctx = self.ctx
+        pl = item.payload
+        p = preview_from_dict(pl.get("preview"))
+        title = ""
+        if p is None:
+            self.warn(f"no preview for {item.key}; copy left blank")
+            copy = AdCopy()
+        elif p.kind == "content_js":
+            copy = parse_content_js(pl.get("js", "")) or parse_overlay_param(p.url)
+            if copy is None:
+                self.warn(f"content.js not parsed for {item.key}; copy left blank")
+                copy = AdCopy()
+            if copy.video_id:
+                title = self._video_title(copy.video_id)
+        else:
+            copy = extract_image(
+                ctx.entity / pl["image_file"], image_name(p), pl.get("format", ""),
+                cache=ctx.cache, codex=ctx.codex, force_vision=ctx.vision, ocr=ctx.ocr, warn=self.warn,
+            )
+        return {**copy.to_dict(), "video_title": title}
