@@ -176,6 +176,15 @@ def _join(v) -> str:
     return " | ".join(v) if isinstance(v, list) else (v or "")
 
 
+def _lines(text: str | None) -> str:
+    """Multi-line text on one line, lines joined with ` | `, so every CSV row is one line in any viewer."""
+    return _join([ln.strip() for ln in (text or "").splitlines() if ln.strip()])
+
+
+def _one_line(v: object) -> object:
+    return " ".join(v.split()) if isinstance(v, str) and ("\n" in v or "\r" in v) else v
+
+
 def _blank(v) -> object:
     return "" if v is None else v
 
@@ -206,7 +215,7 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
             **{k: c.get(k, "") for k in ("website", "landing_url", "display_url", "brand", "headline",
                                          "description", "cta")},
             "sitelinks": _join(c.get("sitelinks")),
-            "full_text": c.get("full_text", ""),
+            "full_text": _lines(c.get("full_text")),
             "video_id": c.get("video_id", ""),
             "video_url": watch_url(c["video_id"]) if c.get("video_id") else "",
             "video_title": c.get("video_title", ""),
@@ -220,6 +229,7 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
             "extraction_model": c.get("model", ""),
             "extraction_confidence": "" if conf is None else round(float(conf), 3),
         })
+    rows = [{k: _one_line(v) for k, v in r.items()} for r in rows]
     rows.sort(key=lambda r: (r["creative_id"], int(r["variation"])))
     return rows
 

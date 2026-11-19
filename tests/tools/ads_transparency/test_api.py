@@ -192,6 +192,15 @@ def test_scrape_writes_one_row_per_creative(tmp_path):
     assert not list((tmp_path / ENT / "images").glob("*.part"))
 
 
+def test_every_row_is_one_line_with_full_text_lines_joined(tmp_path):
+    res = run_scrape(tmp_path, FakeGoogle())
+    rows = read_rows(res)
+    # viewers that split rows on line breaks (ignoring CSV quoting) must still see one row per line
+    assert len(res.csv_path.read_text(encoding="utf-8").splitlines()) == len(rows) + 1
+    i = next(r for r in rows if r["extraction_method"] == "apple_vision")
+    assert i["full_text"] == "Lascade | www.lascade.com | Big Bold Headline | A smaller description line."
+
+
 def test_scrape_variations_mode_one_row_per_variation(tmp_path):
     fake = FakeGoogle()
     res = run_scrape(tmp_path, fake, variations=True)

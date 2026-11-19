@@ -46,7 +46,7 @@ CSV columns, in order:
 - `transparency_url` = `https://adstransparency.google.com/advertiser/{AR}/creative/{CR}?region={region}`.
 - `variation` is 1-based. It is always 1 without `--variations`. Variations with an identical Preview (same `simgad` ID or same `content.js` URL) are collapsed into one, because Google often repeats the same render.
 - `landing_url` is the decoded `adurl=` from `content.js`, for example a Play Store link for app-install ads. It is empty for `simgad` ads.
-- `sitelinks` and `image_urls` are joined with ` | `.
+- `sitelinks` and `image_urls` are joined with ` | `, and so are the lines of `full_text`. No cell contains a line break, so each row is one line even in viewers that ignore CSV quoting.
 - Text cells starting with `=`, `+`, `-`, `@`, tab or CR get a leading `'` so spreadsheets don't run them as formulas.
 - `extraction_method` is one of `content_js`, `apple_vision`, `tesseract`, `codex` or empty. `extraction_confidence` is a number from 0 to 1. Codex confidence is self-reported.
 
