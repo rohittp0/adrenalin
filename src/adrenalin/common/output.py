@@ -18,7 +18,7 @@ def slugify(name: str) -> str:
 
 
 def entity_dir(out_root: Path, tool: str, entity_id: str, name: str) -> Path:
-    d = out_root / tool / slugify(name)
+    d = out_root / tool / (slugify(name) or slugify(entity_id))
     marker = d / "entity.json"
     if marker.exists():
         existing = json.loads(marker.read_text())

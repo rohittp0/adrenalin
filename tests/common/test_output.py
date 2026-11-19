@@ -48,3 +48,9 @@ def test_write_csv_atomic_keeps_old_file_when_rows_raise(tmp_path):
         write_csv_atomic(path, ["a"], rows())
     assert path.read_text() == "old"
     assert [p.name for p in tmp_path.iterdir()] == ["ads.csv"]
+
+
+def test_entity_dir_falls_back_to_id_slug_when_name_has_no_ascii(tmp_path):
+    d = entity_dir(tmp_path, "t", "AR123", "株式会社")
+    assert d == tmp_path / "t" / "ar123"
+    assert json.loads((d / "entity.json").read_text()) == {"id": "AR123", "name": "株式会社"}
