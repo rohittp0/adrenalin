@@ -125,13 +125,17 @@ def run_dir_name(options: ScrapeOptions) -> str:
 
 
 def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], None]) -> None:
-    if not q.put("list", "page:", {"cursor": ""}):
+    # Requeues only when the stage that redoes the work runs: a requeue clears the item's result,
+    # so e.g. `--stage export` must not blank copy it cannot re-extract.
+    if not q.put("list", "page:", {"cursor": ""}) and options.stage in (None, "list"):
         done = q.get_meta("list_done")
         if done and (options.end is None or options.end >= date.fromisoformat(done)):
             log("list: window still open, listing again from page 1")
             q.set_meta("list_done", "")  # an interrupted relist resumes instead of restarting
             q.set_meta("seen_cursors", "[]")
             q.requeue("list", ["page:"])
+    if options.stage not in (None, "extract"):
+        return
     stored = json.loads(q.get_meta("options") or "{}")
     if options.vision and not stored.get("vision"):
         keys = [i.key for i in q.items("extract", "done")

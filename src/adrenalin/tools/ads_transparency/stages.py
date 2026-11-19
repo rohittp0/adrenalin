@@ -136,7 +136,7 @@ class AdsStages:
                 restarts = self._cursor_restarts
             if restarts > MAX_CURSOR_RESTARTS:
                 raise
-            ctx.log(f"list: cursor expired ({e}), restarting listing")
+            ctx.log(f"list: cursor expired, restarting listing ({e})")
             q.set_meta("seen_cursors", "[]")
             self._put_page(q, None)
             return {"restarted": True}

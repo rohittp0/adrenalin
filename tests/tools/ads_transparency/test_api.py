@@ -385,3 +385,21 @@ def test_list_creatives_yields_every_page(tmp_path):
     fake = FakeGoogle(search=lambda req: p2 if req.get("4") == "CUR1" else p1)
     got = list(list_creatives(AR, session=make_session(tmp_path, fake)))
     assert len(got) == 40 and got[0].advertiser_name == "Lascade LLC"
+
+
+def test_stage_export_after_codex_limit_keeps_copy_and_pending(tmp_path):
+    fake = FakeGoogle()
+    first = read_rows(run_scrape(tmp_path, fake, codex_runner=codex(limit=1), vision=True))
+    run = FakeCodexRun()
+    assert read_rows(run_scrape(tmp_path, fake, codex_runner=codex(run=run), vision=True, stage="export")) == first
+    assert run.calls == 0
+    rows = read_rows(run_scrape(tmp_path, fake, codex_runner=codex(limit=5), vision=True))
+    assert sum(r["extraction_method"] == "codex" for r in rows if r["image_file"]) == 6
+
+
+def test_stage_export_with_vision_does_not_record_vision(tmp_path):
+    fake = FakeGoogle()
+    first = read_rows(run_scrape(tmp_path, fake))
+    assert read_rows(run_scrape(tmp_path, fake, vision=True, stage="export")) == first
+    rows = read_rows(run_scrape(tmp_path, fake, vision=True))
+    assert {r["extraction_method"] for r in rows if r["image_file"]} == {"codex"}
