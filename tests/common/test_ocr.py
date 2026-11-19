@@ -50,3 +50,8 @@ def test_engine_errors_other_than_unavailable_propagate(monkeypatch):
     monkeypatch.setattr(tesseract, "recognize", bad)
     with pytest.raises(ValueError, match="bad image"):
         recognize(FIX / "simgad_text.png")
+
+
+def test_missing_image_raises_file_not_found(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        recognize(tmp_path / "nonexistent.png")

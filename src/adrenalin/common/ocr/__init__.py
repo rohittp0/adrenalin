@@ -13,6 +13,8 @@ _NO_ENGINE = "No OCR engine: install tesseract (brew install tesseract / apt ins
 
 def recognize(path: Path) -> OcrResult:
     """Apple Vision on macOS when ocrmac imports, otherwise Tesseract."""
+    if not Path(path).exists():
+        raise FileNotFoundError(f"image not found: {path}")
     engines = []
     if sys.platform == "darwin":
         engines.append(apple_vision)
@@ -20,6 +22,6 @@ def recognize(path: Path) -> OcrResult:
     for engine in engines:
         try:
             return engine.recognize(Path(path))
-        except (ImportError, FileNotFoundError, tesseract.TesseractNotFound):
+        except (ImportError, tesseract.TesseractNotFound):
             continue  # engine unavailable: try the next one; other errors propagate
     raise OcrUnavailable(_NO_ENGINE)
