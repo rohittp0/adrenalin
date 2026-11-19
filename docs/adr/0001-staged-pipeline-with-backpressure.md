@@ -6,3 +6,5 @@ Scraping tools run as independent stages (List → Fetch → Extract → Export)
 
 - Do not "simplify" this into a sequential loop with a sleep: that reintroduces bursts and makes OCR wait on cooldowns.
 - The cooldown state is shared across runs (`out/.cache/cooldown.sqlite3`) because Google blocks the IP, not the run.
+- A blocked stage also stops every stage that throttles on it. Otherwise the upstream stage is no longer held back by a backlog that cannot drain, and races ahead into a block of its own. The first live run (Rio, 2026-11-19) did exactly that: the List stage was blocked about 85 s after the content.js host. Stages that don't wait on the blocked one keep going.
+- Downloads from hosts that are blocked separately get separate stages (Fetch for `simgad` images, Script for `content.js`), so a block on one host doesn't stop the other's downloads.

@@ -185,6 +185,23 @@ class Pipeline:
         result = RunResult()
         state_lock = threading.Lock()
         upstream = {s.name: [p.name for p in self.stages[:i]] for i, s in enumerate(self.stages)}
+        halted: set[str] = set()  # blocked stages and the stages stopped because they wait on one
+
+        def halt_producers(blocked: str) -> None:
+            """A blocked stage's backlog won't drain this run, so a stage throttled on it would wait forever,
+            and one that ignored it would race ahead of it. Stop both: they resume on the next run."""
+            with state_lock:
+                halted.add(blocked)
+                changed = True
+                while changed:
+                    changed = False
+                    for s in self.stages:
+                        waits_on = [t for t in s.throttle_on if t in halted]
+                        if s.name not in halted and waits_on:
+                            halted.add(s.name)
+                            stopped[s.name].set()
+                            self.log(f"{s.name}: stopping, it waits on blocked stage {waits_on[0]}")
+                            changed = True
 
         def throttled(stage: Stage) -> bool:
             live_targets = tuple(n for n in stage.throttle_on if not finished[n].is_set())
@@ -212,6 +229,7 @@ class Pipeline:
                             result.blocked = exc
                     self.log(f"{name}: blocked ({exc}); stopping stage")
                     stopped[name].set()
+                    halt_producers(name)
                     return
                 except Exception as exc:  # noqa: BLE001 - any worker error fails only its item
                     msg = f"{type(exc).__name__}: {exc}"

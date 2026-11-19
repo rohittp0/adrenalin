@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -26,9 +27,16 @@ DEFAULT_UA = (
 
 class Blocked(Exception):
     def __init__(self, host: str, until: float):
-        super().__init__(f"{host} blocked until {until}")
+        super().__init__(f"{host} blocked until {_clock_time(until)}")
         self.host = host
         self.until = until
+
+
+def _clock_time(ts: float) -> str:
+    try:
+        return f"{datetime.fromtimestamp(ts):%H:%M:%S}"
+    except (OverflowError, OSError, ValueError):
+        return str(ts)
 
 
 class Cooldown:
@@ -90,6 +98,17 @@ def is_block_response(resp: requests.Response, read_body: bool = True) -> bool:
     return False
 
 
+def describe_response(resp: requests.Response, read_body: bool = True) -> str:
+    """One line on what a response looked like, for logging why it was taken as a block."""
+    parts = [f"HTTP {resp.status_code}", resp.url or ""]
+    if loc := resp.headers.get("Location"):
+        parts.append(f"Location={loc}")
+    parts.append(resp.headers.get("Content-Type", "no content type"))
+    if read_body:
+        parts.append(f"body={resp.content[:200]!r}")
+    return " ".join(parts)
+
+
 class PacedSession:
     def __init__(
         self,
@@ -105,8 +124,10 @@ class PacedSession:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
         rng: Callable[[], float] = random.random,
+        log: Callable[[str], None] | None = None,
     ):
         self._cooldown = cooldown
+        self._log = log
         self._custom_transport = transport
         self._proxy_list = tuple(proxies)
         self._intervals = dict(intervals)
@@ -172,8 +193,10 @@ class PacedSession:
             resp = self._transport(method, url, **send)
 
             # stream=True callers (the host check) never download the body, so only the URL tells a block
-            if is_block_response(resp, read_body=not kwargs.get("stream")):
+            read_body = not kwargs.get("stream")
+            if is_block_response(resp, read_body=read_body):
                 until = self._block(host)
+                self._warn(f"{host} sent a block page ({describe_response(resp, read_body)})")
                 if self._wait_on_block and block_waits < self._max_retries:
                     block_waits += 1
                     continue
@@ -181,6 +204,7 @@ class PacedSession:
 
             if resp.status_code == 429:
                 if attempt >= self._max_retries:
+                    self._warn(f"{host} still rate-limits after {attempt} backoffs ({describe_response(resp)})")
                     raise Blocked(host, self._block(host))
                 backoff = min(60 * 2**attempt, 900)
                 try:
@@ -201,8 +225,12 @@ class PacedSession:
             wait_on_block=self._wait_on_block if wait_on_block is None else wait_on_block,
             max_retries=self._max_retries if max_retries is None else max_retries,
             block_seconds=self._block_seconds, transport=self._custom_transport,
-            sleep=self._sleep, clock=self._clock, rng=self._rng,
+            sleep=self._sleep, clock=self._clock, rng=self._rng, log=self._log,
         )
+
+    def _warn(self, message: str) -> None:
+        if self._log is not None:
+            self._log(f"warning: {message}")
 
     def get(self, url: str, **kwargs) -> requests.Response:
         return self.request("GET", url, **kwargs)

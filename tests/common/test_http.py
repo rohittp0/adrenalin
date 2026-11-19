@@ -251,3 +251,30 @@ def test_host_checker_tries_the_other_www_form_and_logs_misses_once(tmp_path):
         assert [u for _, u, _ in calls].count("https://gone.com/") == 1  # each name requested once per run
     finally:
         cache.close()
+
+
+def test_block_logs_what_the_response_looked_like(tmp_path):
+    logs = []
+    page = resp(200, b"<html>please solve the recaptcha</html>", url="https://cdn.com/x.js", ctype="text/html")
+    e = Env(tmp_path, [page], log=logs.append)
+    with pytest.raises(Blocked) as exc:
+        e.session.get("https://cdn.com/x.js")
+    assert len(logs) == 1 and logs[0].startswith("warning: cdn.com sent a block page")
+    assert "HTTP 200" in logs[0] and "text/html" in logs[0] and "recaptcha" in logs[0]
+    assert "cdn.com blocked until" in str(exc.value)
+
+
+def test_429_exhaustion_logs_the_last_response(tmp_path):
+    logs = []
+    e = Env(tmp_path, [resp(429)] * 4, log=logs.append)
+    with pytest.raises(Blocked):
+        e.session.get("https://a.com/x")
+    assert len(logs) == 1 and "rate-limits after 3 backoffs" in logs[0] and "HTTP 429" in logs[0]
+
+
+def test_derived_session_keeps_the_log(tmp_path):
+    logs = []
+    e = Env(tmp_path, [resp(302, headers={"Location": SORRY})], log=logs.append)
+    with pytest.raises(Blocked):
+        e.session.derive(max_retries=0).get("https://a.com/x")
+    assert "Location=" + SORRY in logs[0]

@@ -371,6 +371,27 @@ _TEXT_ADS = {
         headline="Live Ship Map - Track Any Ship by Name",
         description="Out of coastal range? 1 satellite credit fetches its latest mid-ocean position.",
         sitelinks=["Live Ship Map", "Live Vessel Position", "Container Tracking", "Ports Directory", "Get the App"]),
+    # Rio, 348 px render: "Sponsored" label above, logo text "70" ending right of x = 0.09, below the brand line
+    "text_ad_9688646368325413885.png": dict(
+        brand="Save 70", display_url="www.save70.com/", website="save70.com", headline="$49 Flights",
+        description="Cheapest Flight Deals? Last Minute Price Drops on Intl. & Domestic Airfare. Compare Today!",
+        sitelinks=[]),
+    # logo text "TRAVEL" level with the URL line
+    "text_ad_6017471862956656205.png": dict(
+        brand="Save70", display_url="www.save70.com/", website="save70.com", headline="70% Off - Cheap Car Rental",
+        description="2025 Car Rental Deals in <dynamically generated location> from $7.95/Day. "
+                    "Book Easily & Quickly Online!",
+        sitelinks=[]),
+    # German "Gesponsert" label and no brand line: the label is not the brand
+    "text_ad_6440410688637658213.png": dict(
+        brand="", display_url="www.cars-rentals.com/", website="cars-rentals.com", headline="70 Rabatt Mietwagen",
+        description="Vergleiche Mietwagen ab €7,95/Tag. Erspare bis 70% noch Heute. Schnelle Online-Buchung",
+        sitelinks=[]),
+    # logo and brand read as one garbled line ("→ neares com"): left blank rather than wrong
+    "text_ad_10954299470998847669.png": dict(
+        brand="", display_url="www.cheapfares.com/", website="cheapfares.com", headline="70% Off Flights From",
+        description="Cheapest Flight Deals? Last Minute Price Drops on Intl. & Domestic Airfare. Compare Today!",
+        sitelinks=[]),
 }
 
 

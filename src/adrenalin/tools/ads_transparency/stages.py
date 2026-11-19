@@ -27,15 +27,20 @@ from adrenalin.tools.ads_transparency.rpc import (
     TransparencyClient,
 )
 
-STAGE_NAMES = ("list", "detail", "fetch", "extract")
+# fetch downloads images; content.js Previews go on to `script`, which has its own (slower) host, so a
+# block there stops only script downloads.
+STAGE_NAMES = ("list", "detail", "fetch", "script", "extract")
 OEMBED_URL = "https://www.youtube.com/oembed"
 CONTENT_DIR = "content"
 
 # (concurrency, throttle_on, max_ahead), from the plan's backpressure limits.
+# A stage that throttles on a blocked stage stops with it (see Pipeline): list and detail stop when script is
+# blocked, while fetch, which doesn't wait on script, keeps downloading images.
 _STAGE_CONFIG = {
-    "list": (1, ("detail", "fetch", "extract"), 200),
-    "detail": (1, ("fetch", "extract"), 50),
-    "fetch": (4, ("extract",), 50),
+    "list": (1, ("detail", "fetch", "script", "extract"), 200),
+    "detail": (1, ("fetch", "script", "extract"), 50),
+    "fetch": (2, ("extract",), 50),
+    "script": (1, ("extract",), 50),
     "extract": (2, (), 0),
 }
 
@@ -132,12 +137,15 @@ class AdsStages:
             names: tuple[str, ...] = ()
         elif only == "list":
             names = ("list", "detail")
-        elif only in ("fetch", "extract"):
-            names = (only,)
+        elif only == "fetch":
+            names = ("fetch", "script")
+        elif only == "extract":
+            names = ("extract",)
         else:
             names = STAGE_NAMES
         names = tuple(n for n in names if n != "detail" or self.ctx.variations)
-        workers = {"list": self.list_page, "detail": self.detail, "fetch": self.fetch, "extract": self.extract}
+        workers = {"list": self.list_page, "detail": self.detail, "fetch": self.fetch, "script": self.script,
+                   "extract": self.extract}
         out = []
         for name in names:
             concurrency, throttle_on, max_ahead = _STAGE_CONFIG[name]
@@ -218,9 +226,10 @@ class AdsStages:
         return resp
 
     def fetch(self, item: Item, q: WorkQueue) -> dict:
+        """Every listed Variation passes through fetch (Export reads its rows from here). Images are downloaded;
+        content.js Previews are handed to the script stage."""
         p = preview_from_dict(item.payload.get("preview"))
         result: dict = {}
-        extra: dict = {}
         if p is not None and p.kind == "image":
             rel = f"images/{image_name(p)}.png"
             path = self.ctx.entity / rel
@@ -228,12 +237,18 @@ class AdsStages:
                 write_atomic(path, self._get_ok(p.url).content)
             result["image_file"] = rel
         elif p is not None:
-            # The script (often 150-450 KB) goes to a file, never into the queue database.
-            rel = content_file(item.key)
-            write_atomic(self.ctx.run / rel, self._get_ok(p.url).content)
-            extra["content_file"] = rel
-        q.put("extract", item.key, {**item.payload, **result, **extra}, update_payload=True)
+            q.put("script", item.key, item.payload, update_payload=True)
+            return result
+        q.put("extract", item.key, {**item.payload, **result}, update_payload=True)
         return result
+
+    def script(self, item: Item, q: WorkQueue) -> dict:
+        p = preview_from_dict(item.payload.get("preview"))
+        # The script (often 150-450 KB) goes to a file, never into the queue database.
+        rel = content_file(item.key)
+        write_atomic(self.ctx.run / rel, self._get_ok(p.url).content)
+        q.put("extract", item.key, {**item.payload, "content_file": rel}, update_payload=True)
+        return {}
 
     # -- extract ------------------------------------------------------------
 
@@ -265,14 +280,17 @@ class AdsStages:
         pl = item.payload
         p = preview_from_dict(pl.get("preview"))
         title, title_pending = "", False
+        unparsed = False
         if p is None:
             self.warn(f"no preview for {item.key}; copy left blank")
             copy = AdCopy()
         elif p.kind == "content_js":
             copy = parse_content_preview(self._read_js(pl, p), p.url)
             if copy is None:
-                self.warn(f"content.js not parsed for {item.key}; copy left blank")
+                kept = f" (kept at {self.ctx.run / pl['content_file']})" if pl.get("content_file") else ""
+                self.warn(f"content.js not parsed for {item.key}; copy left blank{kept}")
                 copy = AdCopy()
+                unparsed = True
             elif not copy.has_copy:
                 self.warn(f"no ad copy in content.js for {item.key}; brand, headline and description left blank")
             if copy.video_id:
@@ -284,7 +302,7 @@ class AdsStages:
                 host_exists=ctx.host_exists,
             )
         return {**copy.to_dict(), "video_title": title, "title_pending": title_pending,
-                "preview_kind": p.kind if p else ""}
+                "preview_kind": p.kind if p else "", "content_unparsed": unparsed}
 
     def retry_titles(self, q: WorkQueue) -> None:
         """Fetch the video titles that failed temporarily on an earlier run, from the stored video ID. Only the
@@ -308,6 +326,7 @@ class AdsStages:
         return data.decode("utf-8", errors="replace")
 
     def extract_done(self, item: Item, result: dict | None) -> None:
-        """After the extract item is marked done its content.js file is no longer needed."""
-        if rel := item.payload.get("content_file"):
+        """After the extract item is marked done its content.js file is no longer needed, unless it could not be
+        parsed: that one is kept for inspection."""
+        if (rel := item.payload.get("content_file")) and not (result or {}).get("content_unparsed"):
             (self.ctx.run / rel).unlink(missing_ok=True)

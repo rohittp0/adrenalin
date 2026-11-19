@@ -68,6 +68,8 @@ class FakeGoogle:
         self.hosts = []
         self.content_video = None
         self.missing_hosts = set()
+        self.block_content_js = False
+        self.content_override = None
         self.lock = threading.Lock()
 
     def __call__(self, method, url, params=None, data=None, **kw):
@@ -89,7 +91,10 @@ class FakeGoogle:
                 return response(body=SIMGAD, headers={"Content-Type": "image/png"}, url=url)
             if "content.js" in url:
                 self.calls["content_js"] += 1
+                if self.block_content_js:
+                    return response(302, b"", headers={"Location": "https://www.google.com/sorry/index"}, url=url)
                 body = (self.content_video or CONTENT_VIDEO) if url in VIDEO_JS_URLS else CONTENT_TEXT
+                body = self.content_override or body
                 return response(body=body, headers={"Content-Type": "text/javascript"}, url=url)
             if "oembed" in url:
                 self.calls["oembed"] += 1
@@ -686,3 +691,43 @@ def test_oembed_block_never_waits_under_wait_on_block(tmp_path, reply):
     assert res.failed == {} and res.rows == 40
     assert max(sleeps, default=0) <= 0.5  # pacing only: no 900 s cooldown wait, no 60 s backoff
     assert fake.calls["oembed"] <= 2
+
+
+def test_blocked_script_host_stops_listing_but_images_still_finish(tmp_path):
+    p1, p2 = two_pages()
+    fake = FakeGoogle(search=lambda req: p2 if req.get("4") == "CUR1" else p1)
+    fake.block_content_js = True
+    clock = Clock()
+    res = run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock))
+    assert res.blocked_until is not None
+    assert fake.calls["content_js"] == 1  # nothing more is sent to a host in cooldown
+    rows = read_rows(res)
+    images = [r for r in rows if r["image_file"]]
+    assert images and all(r["extraction_method"] for r in images)  # fetch kept going
+    scripts = [r for r in rows if "content.js" in r["preview_url"]]
+    assert scripts and not any(r["extraction_method"] for r in scripts)
+
+    # after the cooldown a rerun picks up the script downloads and the rest of the listing
+    fake.block_content_js = False
+    clock.now += 901
+    res = run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock))
+    assert res.blocked_until is None and not res.failed
+    rows = read_rows(res)
+    assert len(rows) == len(SEARCH["1"])
+    assert all(r["extraction_method"] for r in rows if "content.js" in r["preview_url"] and r["format"] != "video")
+
+
+def test_unparsed_content_js_is_kept_for_inspection(tmp_path):
+    fake = FakeGoogle()
+    fake.content_override = b"(function(){var nothing=1;})();"
+    warnings = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+                 codex=codex(), log=warnings.append, poll=POLL)
+    kept = list((res.csv_path.parent / "content").glob("*.js"))
+    unparsed = [w for w in warnings if "not parsed" in w]
+    # scripts whose copy came from the URL's overlay= parameter are parsed and deleted as usual
+    assert kept and len(kept) == len(unparsed) < fake.calls["content_js"]
+    assert all("kept at" in w for w in unparsed)
+    # a rerun's startup cleanup leaves them too
+    run_scrape(tmp_path, fake, stage="export")
+    assert len(list((res.csv_path.parent / "content").glob("*.js"))) == len(kept)

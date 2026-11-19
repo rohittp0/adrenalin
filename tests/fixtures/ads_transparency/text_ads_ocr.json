@@ -54,5 +54,37 @@
    {"text": "With our flight comparison tool, you get the best deals", "confidence": 1.0, "box": [0.0, 0.6569, 0.9569, 0.0686]},
    {"text": "from 100+ travel websites. Search Flights. Affordable", "confidence": 1.0, "box": [0.0, 0.7549, 0.9425, 0.0686]},
    {"text": "Rates.", "confidence": 1.0, "box": [-0.0001, 0.8571, 0.1181, 0.0604]}
+ ]},
+ "text_ad_9688646368325413885.png": {"method": "apple_vision", "lines": [
+   {"text": "Sponsored", "confidence": 1.0, "box": [0.0421, 0.0983, 0.1684, 0.0636]},
+   {"text": "Save 70", "confidence": 1.0, "box": [0.1474, 0.2601, 0.1368, 0.0694]},
+   {"text": "70", "confidence": 1.0, "box": [0.0526, 0.289, 0.05, 0.0809]},
+   {"text": "www.save70.com/", "confidence": 0.5, "box": [0.1444, 0.3503, 0.2665, 0.0817]},
+   {"text": "$49 Flights", "confidence": 1.0, "box": [0.0394, 0.5191, 0.2634, 0.1237]},
+   {"text": "Cheapest Flight Deals? Last Minute Price Drops on Intl.", "confidence": 1.0, "box": [0.0458, 0.7168, 0.9042, 0.0838]},
+   {"text": "& Domestic Airfare. Compare Today!", "confidence": 1.0, "box": [0.0375, 0.8353, 0.6042, 0.0838]}
+ ]},
+ "text_ad_6017471862956656205.png": {"method": "apple_vision", "lines": [
+   {"text": "Sponsored", "confidence": 1.0, "box": [0.0421, 0.0983, 0.1684, 0.0636]},
+   {"text": "Save70", "confidence": 1.0, "box": [0.1473, 0.2596, 0.1264, 0.0705]},
+   {"text": "TRAVEL", "confidence": 1.0, "box": [0.0553, 0.3353, 0.0447, 0.0289]},
+   {"text": "www.save70.com/", "confidence": 0.5, "box": [0.1443, 0.3502, 0.2641, 0.0816]},
+   {"text": "70% Off - Cheap Car Rental", "confidence": 1.0, "box": [0.0395, 0.526, 0.6632, 0.1156]},
+   {"text": "2025 Car Rental Deals in <dynamically generated", "confidence": 1.0, "box": [0.0417, 0.7168, 0.8125, 0.0838]},
+   {"text": "location> from $7.95/Day. Book Easily & Quickly Online!", "confidence": 1.0, "box": [0.0395, 0.8382, 0.9184, 0.0867]}
+ ]},
+ "text_ad_6440410688637658213.png": {"method": "apple_vision", "lines": [
+   {"text": "Gesponsert", "confidence": 1.0, "box": [0.0421, 0.1018, 0.1816, 0.0719]},
+   {"text": "www.cars-rentals.com/", "confidence": 1.0, "box": [0.1447, 0.2994, 0.3289, 0.0599]},
+   {"text": "70 Rabatt Mietwagen", "confidence": 1.0, "box": [0.0447, 0.503, 0.4947, 0.1257]},
+   {"text": "Vergleiche Mietwagen ab €7,95/Tag. Erspare bis 70%", "confidence": 1.0, "box": [0.0375, 0.7066, 0.8792, 0.0958]},
+   {"text": "noch Heute. Schnelle Online-Buchung", "confidence": 1.0, "box": [0.0417, 0.8293, 0.625, 0.0868]}
+ ]},
+ "text_ad_10954299470998847669.png": {"method": "apple_vision", "lines": [
+   {"text": "→ neares com", "confidence": 0.5, "box": [-0.0003, -0.0031, 0.4288, 0.2972]},
+   {"text": "www.cheapfares.com/", "confidence": 0.5, "box": [0.1121, 0.1418, 0.3506, 0.097]},
+   {"text": "70% Off Flights From", "confidence": 1.0, "box": [0.0, 0.3657, 0.5402, 0.1418]},
+   {"text": "Cheapest Flight Deals? Last Minute Price Drops on Intl.", "confidence": 1.0, "box": [0.0, 0.6119, 0.9958, 0.1194]},
+   {"text": "& Domestic Airfare. Compare Today!", "confidence": 1.0, "box": [-0.0, 0.7463, 0.6552, 0.1418]}
  ]}
 }

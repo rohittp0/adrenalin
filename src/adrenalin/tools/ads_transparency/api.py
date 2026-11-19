@@ -29,6 +29,10 @@ from adrenalin.tools.ads_transparency.stages import (
 
 TOOL_NAME = "ads-transparency"
 RPC_INTERVAL = (6.0, 2.0)
+# content.js Previews: this host blocked a run within minutes at 0.5 s, so it is paced like a page view.
+SCRIPT_HOST, SCRIPT_INTERVAL = "displayads-formats.googleusercontent.com", (2.5, 0.5)
+# simgad images: never blocked so far; still kept to about one a second.
+IMAGE_HOST, IMAGE_INTERVAL = "tpc.googlesyndication.com", (1.0, 0.3)
 
 CSV_FIELDS: tuple[str, ...] = (
     "transparency_url", "creative_id", "variation", "format", "region", "first_shown", "last_shown",
@@ -66,9 +70,11 @@ class ScrapeResult:
     errors: list[str] = field(default_factory=list)
 
 
-def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False) -> PacedSession:
-    return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"), {HOST: RPC_INTERVAL},
-                        proxies=proxies, wait_on_block=wait_on_block)
+def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False,
+                 log: Callable[[str], None] | None = print_to_stderr) -> PacedSession:
+    return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"),
+                        {HOST: RPC_INTERVAL, SCRIPT_HOST: SCRIPT_INTERVAL, IMAGE_HOST: IMAGE_INTERVAL},
+                        proxies=proxies, wait_on_block=wait_on_block, log=log)
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:
@@ -136,7 +142,7 @@ def _remove_done_content(q: WorkQueue, run: Path) -> None:
     folder = run / CONTENT_DIR
     if not folder.is_dir():
         return
-    done = {Path(content_file(key)).name for key, _ in q.results("extract")}
+    done = {Path(content_file(key)).name for key, r in q.results("extract") if not (r or {}).get("content_unparsed")}
     for f in folder.iterdir():
         if f.name in done:
             f.unlink(missing_ok=True)
@@ -223,7 +229,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
     query = _query(options.advertiser_id, options.region, options.start, options.end)
     own_session = session is None
     if own_session:
-        session = make_session(options.out, options.proxies, options.wait_on_block)
+        session = make_session(options.out, options.proxies, options.wait_on_block, log)
     # oEmbed and the OCR domain check are optional: they must never wait out a block or back off,
     # whatever --wait-on-block says.
     oembed = session.derive(wait_on_block=False, max_retries=0)

@@ -224,7 +224,35 @@ def test_blocked_downstream_does_not_hang_throttled_upstream(tmp_path):
     result = _run(q, [Stage("A", lambda i, qu: qu.put("B", i.key, {}) and None,
                             throttle_on=("B",), max_ahead=1), Stage("B", b)])
     assert result.blocked is not None
-    assert q.backlog("A") == 0
+    # A stops instead of racing ahead of the blocked stage; its items wait for the next run
+    assert q.backlog("A") >= 8
+
+
+def test_blocked_stage_stops_its_producers_transitively_but_not_unrelated_stages(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(10):
+        q.put("A", str(i), {})
+    for i in range(5):
+        q.put("C", str(i), {})
+    logs = []
+
+    def c(item, queue):
+        raise Blocked("h", 1.0)
+
+    stages = [
+        Stage("A", lambda i, qu: qu.put("B", i.key, {}) and None, throttle_on=("B", "C"), max_ahead=100),
+        Stage("B", lambda i, qu: time.sleep(0.01), throttle_on=("C",), max_ahead=100),
+        Stage("C", c),
+        Stage("D", lambda i, qu: None),
+    ]
+    for i in range(4):
+        q.put("D", str(i), {})
+    result = Pipeline(q, stages, poll=0.01, log=logs.append).run()
+    assert result.blocked is not None
+    assert any(m.startswith("B: stopping") for m in logs) and any(m.startswith("A: stopping") for m in logs)
+    assert q.backlog("A") > 0 and q.backlog("C") == 5
+    assert len(q.items("D", "done")) == 4  # a stage that doesn't wait on C keeps going
+    q.close()
 
 
 def test_stage_status_index_and_light_reads(tmp_path):

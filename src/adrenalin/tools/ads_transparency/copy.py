@@ -248,11 +248,12 @@ def parse_overlay_param(content_js_url: str) -> AdCopy | None:
 # Text-ad layout (Google's mobile search-ad render, about 700 px wide). Measured on live Apple Vision output:
 # headline text is 0.025-0.043 image widths per character, description and sitelinks 0.014-0.020 (callouts and
 # list sitelinks up to 0.025, but they follow the description). Gaps inside a block are at most 0.73 line
-# heights, gaps before sitelinks at least 1.5. Logo glyphs ("H", "RENT", "80") end left of x = 0.07, while
-# brand and URL lines start at x >= 0.09 and body lines at x = 0.
+# heights, gaps before sitelinks at least 1.5. The brand line starts within 0.02 of the URL line's x; logo glyphs
+# ("H", "70", "TRAVEL") end left of it, and a "Sponsored" label (in any language) or a logo read together with
+# the brand ("→ neares com") starts 0.09 or more to its left. Body lines start at x = 0.
 _HEADLINE_CHAR_WIDTH = 0.022
 _BLOCK_GAP = 1.1
-_LOGO_EDGE = 0.09
+_BRAND_ALIGN = 0.04
 MIN_CONFIDENCE = 0.6
 _DOUBTFUL = 0.5  # confidence given to OCR copy whose domain looks misread, so it goes to Codex
 
@@ -341,9 +342,9 @@ def parse_text_ad_ocr(r: OcrResult) -> AdCopy | None:
     header_bottom = url.box[1] + url.box[3]
 
     def logo(l: OcrLine) -> bool:
-        return l.box[0] + l.box[2] < _LOGO_EDGE and l.box[1] < header_bottom
+        return l.box[0] + l.box[2] <= url.box[0] and l.box[1] < header_bottom
 
-    above = [l for l in lines[:u] if not logo(l)]
+    above = [l for l in lines[:u] if abs(l.box[0] - url.box[0]) <= _BRAND_ALIGN]
     brand = above[-1].text.strip() if above else ""
     rows = _rows([l for l in lines[u + 1:] if not logo(l)])
     h = _block(rows, 0, _headline_font)
