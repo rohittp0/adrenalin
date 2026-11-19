@@ -23,3 +23,12 @@ def _body(c, tmp_path):
         assert c2.get("k", "codex", "m1") == {"brand": "X"}
     finally:
         c2.close()
+
+
+def test_cache_uses_wal_and_waits_for_locks(tmp_path):
+    c = ExtractionCache(tmp_path / "c.db")
+    try:
+        assert c._db.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert c.timeout == 30.0
+    finally:
+        c.close()

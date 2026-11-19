@@ -54,3 +54,16 @@ def test_entity_dir_falls_back_to_id_slug_when_name_has_no_ascii(tmp_path):
     d = entity_dir(tmp_path, "t", "AR123", "株式会社")
     assert d == tmp_path / "t" / "ar123"
     assert json.loads((d / "entity.json").read_text()) == {"id": "AR123", "name": "株式会社"}
+
+
+def test_write_csv_atomic_defuses_spreadsheet_formulas(tmp_path):
+    import csv
+
+    p = tmp_path / "a.csv"
+    rows = [{"a": "=HYPERLINK(\"http://x\")", "b": "+1 555", "c": "-30% off", "d": "@SUM(A1)", "e": "\tTab"},
+            {"a": "Book now - save", "b": 5, "c": -1.5, "d": "", "e": None}]
+    write_csv_atomic(p, ["a", "b", "c", "d", "e"], rows)
+    got = list(csv.DictReader(p.open(encoding="utf-8")))
+    assert got[0] == {"a": "'=HYPERLINK(\"http://x\")", "b": "'+1 555", "c": "'-30% off", "d": "'@SUM(A1)",
+                      "e": "'\tTab"}
+    assert got[1] == {"a": "Book now - save", "b": "5", "c": "-1.5", "d": "", "e": ""}  # numbers untouched

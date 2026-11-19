@@ -7,13 +7,17 @@ from pathlib import Path
 
 
 class ExtractionCache:
-    """SQLite-backed cache of extracted fields, keyed by (key, method, model)."""
+    """SQLite-backed cache of extracted fields, keyed by (key, method, model). Callers namespace keys
+    (`simgad:<id>`, `domain:<host>`) because tools and kinds of data share one file."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, timeout: float = 30.0):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
-        self._db = sqlite3.connect(str(path), check_same_thread=False)
+        # Shared by every run under out/: concurrent runs wait for a lock instead of failing after 5 s.
+        self.timeout = timeout
+        self._db = sqlite3.connect(str(path), timeout=timeout, check_same_thread=False)
+        self._db.execute("PRAGMA journal_mode=WAL")
         with self._lock, self._db:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS extractions ("

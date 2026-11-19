@@ -31,6 +31,14 @@ def entity_dir(out_root: Path, tool: str, entity_id: str, name: str) -> Path:
     return d
 
 
+_FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _defuse(value: object) -> object:
+    """Prefix a text cell a spreadsheet would run as a formula (CSV injection) with `'`. Numbers stay as is."""
+    return "'" + value if isinstance(value, str) and value.startswith(_FORMULA_START) else value
+
+
 def write_csv_atomic(path: Path, fieldnames: Sequence[str], rows: Iterable[Mapping]) -> int:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
@@ -40,7 +48,7 @@ def write_csv_atomic(path: Path, fieldnames: Sequence[str], rows: Iterable[Mappi
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for row in rows:
-                writer.writerow(row)
+                writer.writerow({k: _defuse(v) for k, v in row.items()})
                 count += 1
             f.flush()
             os.fsync(f.fileno())

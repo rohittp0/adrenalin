@@ -161,11 +161,26 @@ def test_extract_image_uses_cache_before_ocr(tmp_path):
     cache = _cache(tmp_path)
     try:
         r = _text_ad_result()
-        cache.put("img1", "apple_vision", "", {"method": r.method, "lines": [
+        cache.put("simgad:img1", "apple_vision", "", {"method": r.method, "lines": [
             {"text": l.text, "confidence": l.confidence, "box": list(l.box)} for l in r.lines]})
         c = extract_image(tmp_path / "x.png", "img1", "text", cache=cache, codex=None,
                           force_vision=False, ocr=_never, warn=lambda m: None)
         assert c.brand == "flights70.com" and c.method == "apple_vision"
+    finally:
+        cache.close()
+
+
+def test_extract_image_cache_keys_are_namespaced(tmp_path):
+    cache = _cache(tmp_path)
+    try:
+        extract_image(tmp_path / "x.png", "777", "text", cache=cache, codex=None, force_vision=False,
+                      ocr=lambda p: _text_ad_result(), warn=lambda m: None)
+        assert cache.get("simgad:777", "apple_vision") is not None and cache.get("777", "apple_vision") is None
+        codex = FakeCodex({"brand": "B", "confidence": 0.9})
+        extract_image(tmp_path / "x.png", "777", "text", cache=cache, codex=codex, force_vision=True,
+                      ocr=_never, warn=lambda m: None)
+        want = {"brand": "B", "confidence": 0.9}
+        assert cache.get("simgad:777", "codex", f"gpt-5.6-luna#v{VISION_VERSION}") == want
     finally:
         cache.close()
 
@@ -179,7 +194,7 @@ def test_extract_image_falls_back_to_codex_and_records_model(tmp_path):
                           force_vision=False, ocr=lambda p: OcrResult([], "apple_vision"), warn=lambda m: None)
         assert c.method == "codex" and c.model == "gpt-5.6-luna" and c.confidence == 0.9
         assert c.brand == "B" and c.website == "b.com"
-        assert cache.get("img2", "codex", f"gpt-5.6-luna#v{VISION_VERSION}")["headline"] == "H"
+        assert cache.get("simgad:img2", "codex", f"gpt-5.6-luna#v{VISION_VERSION}")["headline"] == "H"
         # second call is served from cache
         extract_image(tmp_path / "x.png", "img2", "image", cache=cache, codex=codex,
                       force_vision=False, ocr=lambda p: OcrResult([], "apple_vision"), warn=lambda m: None)

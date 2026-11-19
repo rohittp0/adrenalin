@@ -485,7 +485,7 @@ def extract_image(
     `host_exists` (optional, network) verifies the domains OCR read. Raises OcrUnavailable when neither
     OCR nor Codex could read the image, so the item fails and is retried on the next run."""
     is_text = str(fmt).lower() in ("text", "1")
-    key = image_id
+    key = f"simgad:{image_id}"  # older caches keyed by the bare ID are simply not found: OCR runs again
 
     def load_ocr() -> OcrResult:
         for method in OCR_METHODS:
