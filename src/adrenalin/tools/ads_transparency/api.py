@@ -17,6 +17,7 @@ from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
+from adrenalin.common.progress import Bar, QueueProgress, stage_bar
 from adrenalin.tools.ads_transparency.rpc import HOST, ListedCreative, Query, TransparencyClient, transparency_url
 from adrenalin.tools.ads_transparency.stages import (
     CONTENT_DIR,
@@ -57,6 +58,7 @@ class ScrapeOptions:
     stage: Literal["list", "fetch", "extract", "export"] | None = None
     out: Path = Path("out")
     proxies: tuple[str, ...] = ()
+    progress: bool = False  # tqdm progress bars on stderr
 
 
 @dataclass
@@ -222,14 +224,50 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
     return rows
 
 
+_STAGE_LABELS = {"list": ("list", "page"), "detail": ("detail", "creative"), "fetch": ("fetch", "ad"),
+                 "script": ("scripts", "script"), "extract": ("extract", "ad")}
+
+
+def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
+    """A creatives bar (Google's estimated total until the listing finishes, then the exact count) and one bar per
+    running stage."""
+    def listed(c: dict) -> int:
+        return sum(n for (s, _), n in c.items() if s == "fetch")
+
+    def list_finished() -> bool:
+        return bool(q.get_meta("list_done"))
+
+    def creatives(c: dict) -> tuple[int, int | None]:
+        done = c.get(("extract", "done"), 0) + c.get(("extract", "failed"), 0)
+        failed_before = sum(c.get((s, "failed"), 0) for s in ("fetch", "script"))
+        if list_finished():
+            return done + failed_before, listed(c)
+        estimate = int(q.get_meta("count_estimate") or 0)
+        return done + failed_before, max(estimate, listed(c)) or None
+
+    bars = [Bar("creatives", creatives, "ad")]
+    for name in stage_names:
+        label, unit = _STAGE_LABELS.get(name, (name, "it"))
+        total = (lambda c, n=name: sum(k for (s, _), k in c.items() if s == n) if list_finished() else None) \
+            if name == "list" else None
+        bars.append(stage_bar(name, label, unit, total))
+    return bars
+
+
 def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=recognize,
            codex: CodexRunner | None = None, log: Callable[[str], None] = print_to_stderr,
            poll: float = 0.2) -> ScrapeResult:
     """Run (or resume) one scrape and export its CSV. Raises on setup errors; reports run outcomes."""
     query = _query(options.advertiser_id, options.region, options.start, options.end)
+    progress: QueueProgress | None = None
+
+    def emit(message: str) -> None:
+        """`log`, or above the progress bars while they show."""
+        (progress.write if progress is not None else log)(message)
+
     own_session = session is None
     if own_session:
-        session = make_session(options.out, options.proxies, options.wait_on_block, log)
+        session = make_session(options.out, options.proxies, options.wait_on_block, emit)
     # oEmbed and the OCR domain check are optional: they must never wait out a block or back off,
     # whatever --wait-on-block says.
     oembed = session.derive(wait_on_block=False, max_retries=0)
@@ -246,23 +284,30 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         run.mkdir(parents=True, exist_ok=True)
         q = WorkQueue(run / "state.sqlite3")
         _remove_done_content(q, run)
-        _prepare_queue(q, options, log)
+        _prepare_queue(q, options, emit)
 
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
-                           codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=log,
-                           oembed=oembed, host_exists=HostChecker(oembed, cache, log=log))
+                           codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=emit,
+                           oembed=oembed, host_exists=HostChecker(oembed, cache, log=emit))
         ads = AdsStages(ctx)
         if options.stage in (None, "extract"):
             ads.retry_titles(q)  # transient oEmbed failures of earlier runs
         stages = ads.stages(options.stage)
-        rr = Pipeline(q, stages, poll=poll, log=log).run() if stages else RunResult()
+        if options.progress and stages:
+            progress = QueueProgress(_progress_bars(q, [s.name for s in stages])).start(q)
+        try:
+            rr = Pipeline(q, stages, poll=poll, log=emit).run() if stages else RunResult()
+        finally:
+            if progress is not None:
+                progress.close()
+                progress = None
 
         csv_path = run / "ads.csv"
         n = write_csv_atomic(csv_path, CSV_FIELDS, _rows(q, options))
         failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
         result = ScrapeResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, codex.skipped,
                               list(rr.errors))
-        _log_summary(result, codex, log)
+        _log_summary(result, codex, emit)
         return result
     finally:
         if q is not None:

@@ -187,6 +187,8 @@ class AdsStages:
             else:
                 q.put("fetch", f"{c.creative_id}#1",
                       {**fields, "variation": 1, "preview": preview_to_dict(c.preview)}, update_payload=True)
+        if estimate := page.count_high or page.count_low:
+            q.set_meta("count_estimate", str(estimate))  # Google's rough total, for progress display
         if page.skipped:
             self.warn(f"skipped {page.skipped} malformed creative(s) on {item.key}")
         if cursor and not page.creatives:

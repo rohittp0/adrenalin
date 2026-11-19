@@ -41,6 +41,13 @@ def test_cli_passes_every_option(monkeypatch):
     assert (o.vision_model, o.vision_limit, o.stage) == ("m1", 5, "fetch")
     assert o.out == Path("/tmp/o") and o.proxies == ("http://p1", "http://p2")
     assert o.region == "anywhere"
+    assert not o.progress
+
+
+def test_cli_progress_flag(monkeypatch):
+    seen = capture(monkeypatch)
+    assert main(["ads-transparency", "AR1", "-p"]) == 0
+    assert seen[0].progress
 
 
 def test_cli_rejects_days_with_start():

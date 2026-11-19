@@ -34,6 +34,7 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `--wait-on-block` | Wait out a Google block instead of exiting |
 | `--stage list\|fetch\|extract\|export` | Run one stage only |
 | `--proxy URL` | Proxy, repeatable to rotate |
+| `-p`, `--progress` | Progress bars: creatives done (Google's estimated total until the listing finishes, then exact) with rate and ETA, plus one bar per stage |
 | `--out DIR` | Output root (default `out/`) |
 
 Exit codes: `0` done; `1` some items failed or the run hit an error (the CSV is still written; rerun to retry them); `2` Google blocked the run (rerun later to continue). A block on one Google host stops only the work that depends on it (e.g. image downloads continue while `content.js` downloads are blocked), and the log describes the response that was taken as a block. Run `uv run adrenalin ads-transparency --help` for everything.

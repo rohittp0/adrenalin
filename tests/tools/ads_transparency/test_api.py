@@ -731,3 +731,22 @@ def test_unparsed_content_js_is_kept_for_inspection(tmp_path):
     # a rerun's startup cleanup leaves them too
     run_scrape(tmp_path, fake, stage="export")
     assert len(list((res.csv_path.parent / "content").glob("*.js"))) == len(kept)
+
+
+def test_progress_bars_show_creatives_and_stages_and_carry_the_log(tmp_path, capsys):
+    fake = FakeGoogle()
+    fake.oembed_status = 401  # makes the run log a warning while the bars show
+    messages = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path, progress=True), session=make_session(tmp_path, fake),
+                 ocr=fake_ocr, codex=codex(), log=messages.append, poll=POLL)
+    err = capsys.readouterr().err
+    n = len(SEARCH["1"])
+    assert res.rows == n
+    for label in ("creatives", "list", "fetch", "scripts", "extract"):
+        assert label in err
+    assert f"{n}/{n}" in err  # the listing finished, so the creatives total is exact
+    assert any("oEmbed failed" in m for m in err.splitlines()) and not any("oEmbed" in m for m in messages)
+    assert any(m.startswith("exported") for m in messages)  # after the bars close, back to the caller's log
+    q = WorkQueue(res.csv_path.parent / "state.sqlite3")
+    assert q.get_meta("count_estimate") == "600"  # Google's band on the first page
+    q.close()

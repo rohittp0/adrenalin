@@ -42,6 +42,7 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--out", type=Path, default=Path("out"), help="output root (default out/)")
     p.add_argument("--proxy", action="append", default=[], dest="proxies", metavar="URL",
                    help="proxy URL; repeat to rotate per request")
+    p.add_argument("-p", "--progress", action="store_true", help="show progress bars with rates and ETA")
     p.set_defaults(_parser=p)
 
 
@@ -72,7 +73,7 @@ def run(args: argparse.Namespace) -> int:
         advertiser_id=args.advertiser_id, region=args.region, start=start, end=end,
         variations=args.variations, vision=args.vision, vision_model=args.vision_model,
         vision_limit=args.vision_limit, wait_on_block=args.wait_on_block, stage=args.stage,
-        out=args.out, proxies=tuple(args.proxies),
+        out=args.out, proxies=tuple(args.proxies), progress=args.progress,
     )
     try:
         res = api.scrape(options)

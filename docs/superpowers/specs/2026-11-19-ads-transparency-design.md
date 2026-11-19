@@ -22,6 +22,7 @@ Agreed in a design discussion on 2026-11-19. Terms are defined in `CONTEXT.md`. 
 | `--stage` | `list`, `fetch`, `extract` or `export`: run one stage only. |
 | `--out` | Output root, default `out/` (git-ignored). |
 | `--proxy` | Repeatable. Rotated per request. Default none. |
+| `-p`, `--progress` | tqdm bars on stderr: creatives finished over Google's count band (upper end) until the listing finishes, then over the listed count, with rate and ETA from this run's work only; one bar per running stage (finished over queued). Log lines print above the bars. |
 
 ## Output
 

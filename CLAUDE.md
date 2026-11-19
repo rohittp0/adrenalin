@@ -32,6 +32,7 @@ Code lives in `src/adrenalin/` in three layers:
 3. **`common/`** is shared code:
    - `http.py`: `PacedSession` (per-host pacing, proxies), `Cooldown` (block state shared across runs in `out/.cache/cooldown.sqlite3`), `Blocked`, `HostChecker` (does a host exist: one `GET https://<host>/`).
    - `pipeline.py`: `Pipeline` and the SQLite-backed `WorkQueue` for staged, resumable, backpressured runs (see ADR 0001).
+   - `progress.py`: `QueueProgress`, tqdm bars refreshed from a `WorkQueue`'s counts; its `write` is the run's log while bars show.
    - `ocr/`: `recognize()` (Apple Vision on macOS, else Tesseract) and, separately, `CodexRunner` (the `codex` CLI as a vision model, with a per-run call cap and a breaker when the binary is missing). Which of them reads an image is decided by the tool (`ads_transparency/copy.py:extract_image`).
    - `cache.py`: `ExtractionCache` of extraction results, shared by all runs; keys are namespaced (`simgad:<id>`, `domain:<host>`).
    - `output.py`: `entity_dir`, `cache_dir`, `write_csv_atomic` (also defuses spreadsheet formulas), slugs.

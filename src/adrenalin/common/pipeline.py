@@ -115,6 +115,12 @@ class WorkQueue:
             return self._db.execute("SELECT COUNT(*) FROM items WHERE stage=? AND status=?",
                                     (stage, status)).fetchone()[0]
 
+    def counts(self) -> dict[tuple[str, str], int]:
+        """Item counts of every (stage, status) pair, in one query."""
+        with self._lock:
+            rows = self._db.execute("SELECT stage, status, COUNT(*) FROM items GROUP BY stage, status").fetchall()
+        return {(st, status): n for st, status, n in rows}
+
     def results(self, stage: str, status: str = "done") -> list[tuple[str, dict | None]]:
         """(key, result) pairs without loading payloads."""
         with self._lock:
