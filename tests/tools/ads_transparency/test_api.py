@@ -1,6 +1,7 @@
 import copy
 import csv
 import json
+import socket
 import subprocess
 import threading
 from collections import Counter
@@ -100,8 +101,8 @@ class FakeGoogle:
             if method == "GET" and url.endswith("/") and url.count("/") == 3:
                 host = url.split("/")[2]  # domain check of an OCR-read host
                 self.hosts.append(host)
-                if host in self.missing_hosts:
-                    raise requests.ConnectionError(f"Failed to resolve '{host}'")
+                if host.removeprefix("www.") in self.missing_hosts:
+                    raise requests.ConnectionError(f"Failed to resolve '{host}'") from socket.gaierror(8, "unknown")
                 return response(404, b"", url=url)
         raise AssertionError(f"unexpected request {method} {url}")
 
@@ -258,17 +259,21 @@ def test_ocr_domains_checked_once_per_host(tmp_path):
     rows = read_rows(run_scrape(tmp_path, fake))
     texts = [r for r in rows if r["image_file"] and r["format"] == "text"]
     assert texts and {(r["website"], r["extraction_method"]) for r in texts} == {("lascade.com", "apple_vision")}
-    assert fake.hosts == ["lascade.com"]  # content.js rows are never checked
+    assert fake.hosts == ["www.lascade.com"]  # the host as shown; content.js rows are never checked
     read_rows(run_scrape(tmp_path, fake))
-    assert fake.hosts == ["lascade.com"]  # an existing host is remembered across runs
+    assert fake.hosts == ["www.lascade.com"]  # an existing host is remembered across runs
 
 
 def test_unresolvable_ocr_domain_sends_row_to_codex(tmp_path):
     fake = FakeGoogle()
     fake.missing_hosts = {"lascade.com"}
-    texts = [r for r in read_rows(run_scrape(tmp_path, fake)) if r["image_file"] and r["format"] == "text"]
+    logs = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+                 codex=codex(), log=logs.append, poll=POLL)
+    texts = [r for r in read_rows(res) if r["image_file"] and r["format"] == "text"]
     assert texts and {r["extraction_method"] for r in texts} == {"codex"}
-    assert fake.hosts == ["lascade.com"]
+    assert sorted(fake.hosts) == ["lascade.com", "www.lascade.com"]  # both forms tried, once each
+    assert sum("lascade.com" in m and "resolve" in m for m in logs) == 1
 
 
 def test_rerun_with_vision_requeues_ocr_rows(tmp_path):
@@ -398,15 +403,40 @@ def test_old_seen_cursors_list_is_accepted(tmp_path):
 def test_transient_oembed_failure_is_retried_next_run(tmp_path):
     fake = FakeGoogle()
     fake.oembed_status = 503
-    first = run_scrape(tmp_path, fake)
-    assert all(r["video_title"] == "" for r in read_rows(first) if r["video_id"])
-    js_calls = fake.calls["content_js"]
+    first = read_rows(run_scrape(tmp_path, fake))
+    videos = [r for r in first if r["video_id"]]
+    assert videos and all(r["video_title"] == "" and r["brand"] for r in videos)
+    js_calls, oembed_calls = fake.calls["content_js"], fake.calls["oembed"]
     fake.oembed_status = 200
     rows = read_rows(run_scrape(tmp_path, fake))
     videos = [r for r in rows if r["video_id"]]
     assert videos and all(r["video_title"] == "Rotating Tiles video" for r in videos)
-    assert fake.calls["content_js"] == js_calls + len(videos)  # the deleted script is fetched again
+    # only oEmbed is retried: the rest of the row is kept and content.js is not fetched again
+    assert fake.calls["content_js"] == js_calls and fake.calls["oembed"] == oembed_calls + len(videos)
+    strip = lambda rs: [{k: v for k, v in r.items() if k != "video_title"} for r in rs]
+    assert strip(rows) == strip(first)
     assert "title_pending" not in CSV_FIELDS
+    rows3 = read_rows(run_scrape(tmp_path, fake))
+    assert rows3 == rows and fake.calls["oembed"] == oembed_calls + len(videos)  # done: not asked again
+
+
+def test_title_retry_stops_at_first_failure(tmp_path):
+    fake = FakeGoogle()
+    fake.oembed_status = 503
+    run_scrape(tmp_path, fake)
+    before = fake.calls["oembed"]
+    run_scrape(tmp_path, fake)
+    assert fake.calls["oembed"] == before + 1  # YouTube still failing: one try, the rest wait
+
+
+def test_codex_limit_warns_once_per_run(tmp_path):
+    fake = FakeGoogle()
+    logs = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path, vision=True), session=make_session(tmp_path, fake),
+                 ocr=fake_ocr, codex=codex(limit=1), log=logs.append, poll=POLL)
+    assert res.vision_skipped == SIMGAD_CREATIVES - 1
+    limit_lines = [m for m in logs if "vision limit" in m]
+    assert len(limit_lines) == 1 and str(SIMGAD_CREATIVES - 1) in limit_lines[0]
 
 
 def test_permanent_oembed_failure_is_not_retried(tmp_path):

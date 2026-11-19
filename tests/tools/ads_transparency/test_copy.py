@@ -226,7 +226,7 @@ def test_extract_image_keeps_ocr_when_codex_fails(tmp_path):
         warnings.clear()
         c = extract_image(tmp_path / "x.png", "img5", "text", cache=cache, codex=FakeCodex(result=None),
                           force_vision=False, ocr=lambda p: low, warn=warnings.append)
-        assert c.method == "apple_vision" and len(warnings) == 1
+        assert c.method == "apple_vision" and c.vision_pending and warnings == []  # the run summary counts it
     finally:
         cache.close()
 
@@ -312,7 +312,7 @@ def test_forced_vision_limit_sets_pending(tmp_path):
     try:
         c = extract_image(tmp_path / "x.png", "f2", "text", cache=cache, codex=FakeCodex(result=None),
                           force_vision=True, ocr=lambda p: _text_ad_result(), warn=warnings.append)
-        assert c.method == "apple_vision" and c.vision_pending is True and len(warnings) == 1
+        assert c.method == "apple_vision" and c.vision_pending is True and warnings == []
     finally:
         cache.close()
 
@@ -467,7 +467,7 @@ class FakeHosts:
 
     def __call__(self, host):
         self.calls.append(host)
-        return host not in self.missing
+        return host.removeprefix("www.") not in self.missing
 
 
 def test_unresolvable_ocr_host_falls_back_to_brand_domain_and_codex(tmp_path):
@@ -477,7 +477,7 @@ def test_unresolvable_ocr_host_falls_back_to_brand_domain_and_codex(tmp_path):
         c = extract_image(tmp_path / "x.png", "h1", "text", cache=cache, codex=None, force_vision=False,
                           ocr=lambda p: r, warn=lambda m: None, host_exists=hosts)
         assert (c.display_url, c.website, c.method) == ("", "flights70.com", "apple_vision")
-        assert c.confidence <= 0.5 and "flights7o.com" in hosts.calls
+        assert c.confidence <= 0.5 and "www.flights7o.com" in hosts.calls
         codex = FakeCodex({"brand": "Flights70", "display_url": "www.flights70.com/", "confidence": 0.9})
         c = extract_image(tmp_path / "x.png", "h2", "text", cache=cache, codex=codex, force_vision=False,
                           ocr=lambda p: r, warn=lambda m: None, host_exists=hosts)
@@ -504,7 +504,7 @@ def test_resolvable_host_keeps_ocr_copy(tmp_path):
                           force_vision=False, ocr=lambda p: _ad("Flights70", "www.flights70.com/"),
                           warn=lambda m: None, host_exists=hosts)
         assert (c.display_url, c.website, c.confidence) == ("www.flights70.com/", "flights70.com", 1.0)
-        assert hosts.calls == ["flights70.com"]
+        assert hosts.calls == ["www.flights70.com"]  # the host as shown, with its www.
     finally:
         cache.close()
 
@@ -652,3 +652,11 @@ def test_vision_copy_tolerates_non_string_fields(tmp_path):
         assert (c.brand, c.cta, c.sitelinks, c.confidence) == ("", "", ["A"], None)
     finally:
         cache.close()
+
+
+def test_video_all_caps_copy_is_not_a_store_label():
+    c = parse_content_js(_video("Brand", "BIG SALE", "Up to 70% off hotels today.", "Install", "App"))
+    assert (c.headline, c.description, c.confidence) == ("BIG SALE", "Up to 70% off hotels today.", 1.0)
+    c = parse_content_js(_video("Brand", "Hotels from 29 EUR", "SAVE 70% ON HOTELS",
+                                "Book now and save big on stays.", "Install", "App"))
+    assert (c.headline, c.description) == ("SAVE 70% ON HOTELS", "Book now and save big on stays.")

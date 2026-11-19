@@ -167,20 +167,19 @@ def test_host_checker_any_response_means_the_host_exists(tmp_path):
     from adrenalin.common.http import HostChecker
 
     outcomes = {"flights70.com": 200, "forbidden.com": 403, "broken.com": 503,
-                "flights7o.com": requests.ConnectionError("Name or service not known"),
-                "slow.com": requests.Timeout("timed out"), "badtls.com": requests.exceptions.SSLError("bad cert")}
+                "flights7o.com": _dns_error("flights7o.com"), "www.flights7o.com": _dns_error("www.flights7o.com")}
     check, cache, session, calls = _checker_env(tmp_path, outcomes)
     try:
-        assert [check(h) for h in outcomes] == [True, True, True, False, False, False]
+        assert [check(h) for h in list(outcomes)[:4]] == [True, True, True, False]
         method, url, kw = calls[0]
         assert (method, url) == ("GET", "https://flights70.com/")
         assert kw["timeout"] == 5 and kw["stream"] is True and kw["allow_redirects"] is True
-        # one request per host per run, whatever the verdict
+        # one request per name per run, whatever the verdict
         assert check("FLIGHTS70.com") and not check("flights7o.com") and len(calls) == len(outcomes)
         # positive verdicts persist across runs; negative ones are re-checked (a network outage is temporary)
         again = HostChecker(session, cache)
         assert again("flights70.com") and not again("flights7o.com")
-        assert [u for _, u, _ in calls[len(outcomes):]] == ["https://flights7o.com/"]
+        assert [u for _, u, _ in calls[len(outcomes):]] == ["https://flights7o.com/", "https://www.flights7o.com/"]
     finally:
         cache.close()
 
@@ -206,3 +205,49 @@ def test_streamed_request_never_reads_the_body(tmp_path):
     assert e.session.get("https://example.com/", stream=True) is r
     with pytest.raises(Blocked):  # a /sorry/ redirect is still a block
         e.session.get("https://example.com/", stream=True)
+
+
+def _dns_error(host):
+    """The exception chain requests raises when a name does not resolve."""
+    import socket
+
+    from urllib3.exceptions import MaxRetryError, NameResolutionError
+
+    reason = NameResolutionError(host, None, socket.gaierror(8, "nodename nor servname provided, or not known"))
+    return requests.ConnectionError(MaxRetryError(None, "/", reason))
+
+
+def test_host_checker_only_dns_failure_means_missing(tmp_path):
+    from adrenalin.common.http import HostChecker
+
+    outcomes = {"flights7o.com": _dns_error("flights7o.com"), "www.flights7o.com": _dns_error("www.flights7o.com"),
+                "slow.com": requests.Timeout("timed out"), "badtls.com": requests.exceptions.SSLError("bad cert"),
+                "refused.com": requests.ConnectionError("[Errno 61] Connection refused")}
+    check, cache, session, calls = _checker_env(tmp_path, outcomes)
+    try:
+        assert not check("flights7o.com")
+        assert check("slow.com") and check("badtls.com") and check("refused.com")
+        # inconclusive errors are not remembered across runs; DNS failures neither
+        again = HostChecker(session, cache)
+        n = len(calls)
+        assert again("slow.com") and not again("flights7o.com") and len(calls) > n
+    finally:
+        cache.close()
+
+
+def test_host_checker_tries_the_other_www_form_and_logs_misses_once(tmp_path):
+    from adrenalin.common.http import HostChecker
+
+    outcomes = {"www.bare-only.com": _dns_error("www.bare-only.com"), "bare-only.com": 200,
+                "www-only.com": _dns_error("www-only.com"), "www.www-only.com": 200,
+                "www.gone.com": _dns_error("www.gone.com"), "gone.com": _dns_error("gone.com")}
+    check, cache, session, calls = _checker_env(tmp_path, outcomes)
+    logs = []
+    check = HostChecker(session, cache, log=logs.append)
+    try:
+        assert check("www.bare-only.com") and check("www-only.com")
+        assert not check("www.gone.com") and not check("gone.com") and not check("www.gone.com")
+        assert len(logs) == 1 and "gone.com" in logs[0]
+        assert [u for _, u, _ in calls].count("https://gone.com/") == 1  # each name requested once per run
+    finally:
+        cache.close()

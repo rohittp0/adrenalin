@@ -160,8 +160,8 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
         q.requeue("extract", [k for k, r in done
                               if (r or {}).get("preview_kind") == "image" and (r or {}).get("method") != "codex"])
     q.set_meta("options", json.dumps({"vision": options.vision}))
-    # Codex-limit deferrals and transient oEmbed failures are retried on every run until they succeed.
-    q.requeue("extract", [k for k, r in done if (r or {}).get("vision_pending") or (r or {}).get("title_pending")])
+    # Codex-limit deferrals are re-extracted on every run until Codex reads them.
+    q.requeue("extract", [k for k, r in done if (r or {}).get("vision_pending")])
 
 
 def _join(v) -> str:
@@ -244,8 +244,11 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
 
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
                            codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=log,
-                           oembed=oembed, host_exists=HostChecker(oembed, cache))
-        stages = AdsStages(ctx).stages(options.stage)
+                           oembed=oembed, host_exists=HostChecker(oembed, cache, log=log))
+        ads = AdsStages(ctx)
+        if options.stage in (None, "extract"):
+            ads.retry_titles(q)  # transient oEmbed failures of earlier runs
+        stages = ads.stages(options.stage)
         rr = Pipeline(q, stages, poll=poll, log=log).run() if stages else RunResult()
 
         csv_path = run / "ads.csv"

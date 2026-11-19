@@ -286,6 +286,17 @@ class AdsStages:
         return {**copy.to_dict(), "video_title": title, "title_pending": title_pending,
                 "preview_kind": p.kind if p else ""}
 
+    def retry_titles(self, q: WorkQueue) -> None:
+        """Fetch the video titles that failed temporarily on an earlier run, from the stored video ID. Only the
+        title changes: the rest of the row is kept and content.js is not needed."""
+        for key, r in q.results("extract"):
+            if not (r or {}).get("title_pending") or not r.get("video_id"):
+                continue
+            title, pending = self._video_title(r["video_id"])
+            q.complete("extract", key, {**r, "video_title": title, "title_pending": pending})
+            if pending:
+                return  # YouTube still failing: the rest wait for the next run
+
     def _read_js(self, pl: dict, p: Preview) -> str:
         path = self.ctx.run / pl["content_file"] if pl.get("content_file") else None
         try:

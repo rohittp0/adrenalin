@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import itertools
 import random
+import socket
 import sqlite3
 import threading
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from urllib3.exceptions import NameResolutionError
 
 from adrenalin.common.cache import ExtractionCache
 
@@ -212,23 +214,55 @@ class PacedSession:
         self._session.close()
 
 
-class HostChecker:
-    """Whether a host name exists, from one `GET https://<host>/`: any HTTP response (any status, or a
-    block page) means yes; a DNS, connection, TLS or timeout error means no. Use a fail-fast session
-    (`derive(wait_on_block=False, max_retries=0)`). Each host is requested once per checker; hosts that
-    exist are also remembered in `cache` across runs. Hosts that don't are not, since a network outage
-    would otherwise mark real hosts as missing for good."""
+def _dns_failure(e: BaseException) -> bool:
+    """Whether a requests error was caused by a host name that does not resolve."""
+    stack, seen = [e], set()
+    while stack:
+        x = stack.pop()
+        if x is None or id(x) in seen:
+            continue
+        seen.add(id(x))
+        if isinstance(x, (socket.gaierror, NameResolutionError)):
+            return True
+        stack += [x.__cause__, x.__context__, getattr(x, "reason", None)]
+        stack += [a for a in getattr(x, "args", ()) if isinstance(a, BaseException)]
+    return False
 
-    def __init__(self, session: PacedSession, cache: ExtractionCache | None = None, timeout: float = 5.0):
+
+class HostChecker:
+    """Whether a host name exists, from `GET https://<host>/` (body never read). Only a DNS resolution
+    failure means missing: any HTTP response, a block page, and TLS, refused or timeout errors all count as
+    existing, so a slow or misconfigured site is never called a misread. Before saying missing, the other
+    `www.` form is tried. Use a fail-fast session (`derive(wait_on_block=False, max_retries=0)`).
+    Each name is requested once per checker; names that answered are also remembered in `cache` across runs.
+    Misses are not, since a resolver outage would otherwise mark real hosts as missing for good."""
+
+    def __init__(self, session: PacedSession, cache: ExtractionCache | None = None, timeout: float = 5.0,
+                 log: Callable[[str], None] | None = None):
         self._s = session
         self._cache = cache
         self._timeout = timeout
+        self._log = log
         self._known: dict[str, bool] = {}
         self._host_locks: dict[str, threading.Lock] = {}
+        self._reported: set[str] = set()
         self._lock = threading.Lock()
 
     def __call__(self, host: str) -> bool:
         host = host.strip().strip(".").lower()
+        if self._exists(host):
+            return True
+        other = host[4:] if host.startswith("www.") else f"www.{host}"
+        if "." in other.removeprefix("www.") and self._exists(other):
+            return True
+        with self._lock:
+            first = host.removeprefix("www.") not in self._reported
+            self._reported.add(host.removeprefix("www."))
+        if first and self._log is not None:
+            self._log(f"warning: {host} does not resolve (DNS); treated as misread by OCR")
+        return False
+
+    def _exists(self, host: str) -> bool:
         with self._lock:
             lock = self._host_locks.setdefault(host, threading.Lock())
         with lock:  # concurrent extract workers asking for one host make one request
@@ -240,18 +274,21 @@ class HostChecker:
         key = f"domain:{host}"
         if self._cache is not None and self._cache.get(key, "domain") is not None:
             return True
-        exists = self._request(host)
-        if exists and self._cache is not None:
+        exists, answered = self._request(host)
+        if answered and self._cache is not None:
             self._cache.put(key, "domain", "", {"exists": True})
         return exists
 
-    def _request(self, host: str) -> bool:
+    def _request(self, host: str) -> tuple[bool, bool]:
+        """(exists, the host answered)."""
         try:
             resp = self._s.get(f"https://{host}/", timeout=self._timeout, allow_redirects=True, stream=True)
         except Blocked:
-            return True
-        except (requests.RequestException, ValueError):
-            return False
+            return True, False
+        except requests.RequestException as e:
+            return not _dns_failure(e), False
+        except ValueError:  # not a valid host name
+            return False, False
         with contextlib.suppress(Exception):
             resp.close()  # the body is never read
-        return True
+        return True, True

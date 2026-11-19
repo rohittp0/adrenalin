@@ -63,11 +63,14 @@ class AdCopy:
         return cls(**{k: v for k, v in d.items() if k in names})
 
 
+def _host(url: str) -> str:
+    """The host of a URL as shown, `www.` included, lowercased."""
+    s = re.sub(r"^[a-z][a-z0-9+.-]*://", "", url.strip(), flags=re.I)
+    return re.split(r"[/?#]", s, maxsplit=1)[0].lower()
+
+
 def website_from(display_url: str) -> str:
-    s = display_url.strip()
-    s = re.sub(r"^[a-z][a-z0-9+.-]*://", "", s, flags=re.I)
-    host = re.split(r"[/?#]", s, maxsplit=1)[0]
-    host = host.lower()
+    host = _host(display_url)
     return host[4:] if host.startswith("www.") else host
 
 
@@ -149,6 +152,11 @@ def parse_content_js(js: str) -> AdCopy | None:
     return c
 
 
+# Play Store info labels in app-install Previews; each is followed by its value. Matched exactly: other
+# all-caps strings ("BIG SALE") are ad copy.
+_STORE_LABELS = {"DOWNLOADS", "CATEGORY", "DEVELOPER", "RATING", "RATINGS", "REVIEWS", "INSTALLS", "SIZE", "PRICE"}
+
+
 def _video_headline_description(strings: list[str], brand: str) -> tuple[str, str]:
     """Headline and description of a video / app-install Preview's markup strings. The layout is brand,
     [headline], [store info: DOWNLOADS/CATEGORY/DEVELOPER label + value], description (wrapped over several
@@ -156,12 +164,12 @@ def _video_headline_description(strings: list[str], brand: str) -> tuple[str, st
     cta = next((i for i, t in enumerate(strings) if t.lower() in _CTA_LOWER), len(strings))
     body: list[str] = []
     label = False
-    for i, t in enumerate(strings[:cta]):
+    for t in strings[:cta]:
         if label:
             label = False  # the value after a store-info label
         elif t == brand:
             continue
-        elif i and len(t) > 2 and t.isupper():
+        elif t in _STORE_LABELS:
             label = True
         elif body and not re.search(r"[.!?…:]$", body[-1]) and re.match(r"[a-z|&,–—-]", t):
             body[-1] = f"{body[-1]} {t}"  # a wrapped sentence: "... Enhance your" + "maritime operations ..."
@@ -379,7 +387,8 @@ def verify_hosts(c: AdCopy, host_exists) -> None:
     website falls back to the brand line's domain when that one resolves) and the copy goes to Codex."""
     bad: set[str] = set()
     url_host = website_from(c.display_url)
-    if url_host and not host_exists(url_host):
+    # the host as shown, with its www. (the checker also tries the other form)
+    if url_host and not host_exists(_host(c.display_url)):
         bad.add(url_host)
         c.display_url = ""
     if c.website and (c.website in bad or (c.website != url_host and not host_exists(c.website))):
@@ -466,8 +475,7 @@ def _vision(path: Path, key: str, cache: ExtractionCache, codex: CodexRunner | N
     except CodexError as e:
         warn(f"vision extraction failed for {key}: {e}; keeping OCR result")
         return None, False
-    if fields is None:
-        warn(f"vision limit reached; keeping OCR result for {key}")
+    if fields is None:  # over the call cap: the run summary reports how many, once
         return None, True
     if not isinstance(fields, dict):
         warn(f"vision extraction failed for {key}: unexpected codex output: {type(fields).__name__}; "
