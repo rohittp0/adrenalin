@@ -65,6 +65,7 @@ class FakeGoogle:
         self.oembed_status = 200
         self.oembed_reply = None
         self.hosts = []
+        self.content_video = None
         self.missing_hosts = set()
         self.lock = threading.Lock()
 
@@ -87,7 +88,7 @@ class FakeGoogle:
                 return response(body=SIMGAD, headers={"Content-Type": "image/png"}, url=url)
             if "content.js" in url:
                 self.calls["content_js"] += 1
-                body = CONTENT_VIDEO if url in VIDEO_JS_URLS else CONTENT_TEXT
+                body = (self.content_video or CONTENT_VIDEO) if url in VIDEO_JS_URLS else CONTENT_TEXT
                 return response(body=body, headers={"Content-Type": "text/javascript"}, url=url)
             if "oembed" in url:
                 self.calls["oembed"] += 1
@@ -415,6 +416,19 @@ def test_permanent_oembed_failure_is_not_retried(tmp_path):
     before = Counter(fake.calls)
     run_scrape(tmp_path, fake)
     assert fake.calls["oembed"] == before["oembed"] and fake.calls["content_js"] == before["content_js"]
+
+
+def test_content_js_without_copy_warns(tmp_path):
+    fake = FakeGoogle()
+    fake.content_video = (b"var a = {'adData': [{'squareImage': "
+                          b"'https://tpc.googlesyndication.com/simgad/12147114744176439645'}]};")
+    logs = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+                 codex=codex(), log=logs.append, poll=POLL)
+    videos = [r for r in read_rows(res) if r["format"] == "video"]
+    assert videos and all(r["image_urls"].endswith("/12147114744176439645") for r in videos)
+    assert all(r["extraction_confidence"] == "" and r["brand"] == "" for r in videos)
+    assert sum("no ad copy" in m for m in logs) == len(videos)
 
 
 def test_oembed_failure_blanks_title_without_failing(tmp_path):

@@ -18,7 +18,7 @@ from adrenalin.common.http import Blocked, PacedSession
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.pipeline import Item, Stage, WorkQueue
-from adrenalin.tools.ads_transparency.copy import AdCopy, extract_image, parse_content_js, parse_overlay_param
+from adrenalin.tools.ads_transparency.copy import AdCopy, extract_image, parse_content_preview
 from adrenalin.tools.ads_transparency.rpc import (
     ListedCreative,
     PaginationLoop,
@@ -269,10 +269,12 @@ class AdsStages:
             self.warn(f"no preview for {item.key}; copy left blank")
             copy = AdCopy()
         elif p.kind == "content_js":
-            copy = parse_content_js(self._read_js(pl, p)) or parse_overlay_param(p.url)
+            copy = parse_content_preview(self._read_js(pl, p), p.url)
             if copy is None:
                 self.warn(f"content.js not parsed for {item.key}; copy left blank")
                 copy = AdCopy()
+            elif not copy.has_copy:
+                self.warn(f"no ad copy in content.js for {item.key}; brand, headline and description left blank")
             if copy.video_id:
                 title, title_pending = self._video_title(copy.video_id)
         else:

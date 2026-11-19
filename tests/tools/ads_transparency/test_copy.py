@@ -570,3 +570,59 @@ def test_codex_cache_is_versioned(tmp_path):
         assert (c.brand, c.sitelinks, codex.calls, c.model) == ("New", ["A link"], 1, "gpt-5.6-luna")
     finally:
         cache.close()
+
+
+# -- content.js video / app-install copy ----------------------------------------------------------
+
+def _video(*strings):
+    return "x ytimg.com/vi/VID123/hq.jpg " + _page(*strings)
+
+
+_STORE_INFO = ("DOWNLOADS", "Downloads", "CATEGORY", "Category", "DEVELOPER", "Lascade")
+
+
+def test_video_description_joins_wrapped_fragments_and_headline_follows_brand():
+    # strings of live row ...571713
+    c = parse_content_js(_video("MarineRadar", "Simplify Marine Work", *_STORE_INFO,
+                                "Access ship details fast. Enhance your", "maritime operations with ease!",
+                                "Install", "MarineRadar:", "Vessel Tracker"))
+    assert (c.brand, c.headline, c.cta) == ("MarineRadar", "Simplify Marine Work", "Install")
+    assert c.description == "Access ship details fast. Enhance your maritime operations with ease!"
+    # live row ...780481: the wrapped part starts with "|"
+    c = parse_content_js(_video("MarineRadar", "Vessel Finder Online", *_STORE_INFO,
+                                "Real-time ship tracking online | Vessel Finder", "| Instant Marine Traffic",
+                                "Install", "MarineRadar:", "Vessel Tracker"))
+    assert c.headline == "Vessel Finder Online"
+    assert c.description == "Real-time ship tracking online | Vessel Finder | Instant Marine Traffic"
+
+
+def test_video_without_headline_or_description():
+    # live row ...420609: fragments of the description are not a headline
+    c = parse_content_js(_video("Cheap Hotels・Hotels70", "Save up to 70% on Hotel Booking", "Online!",
+                                "Save up to 70% on Hotel Booking Online!", "Install", "Cheap Hotels・", "Hotels70"))
+    assert (c.headline, c.description) == ("", "Save up to 70% on Hotel Booking Online!")
+    # live rows ...358529: only the app title after the button, which is not a description
+    c = parse_content_js(_video("eSIM70", "Install", "eSIM70: eSIM", "For Travel Data"))
+    assert (c.brand, c.headline, c.description, c.cta) == ("eSIM70", "", "", "Install")
+    assert c.full_text == "eSIM70\nInstall\neSIM70: eSIM\nFor Travel Data"
+
+
+def test_video_fixture_has_no_headline():
+    c = parse_content_js((FIX / "content_video.js").read_text(encoding="utf-8"))
+    assert c.headline == ""
+
+
+_IMAGE_ONLY = "var a = {'adData': [{'squareImage': 'https://tpc.googlesyndication.com/simgad/12147114744176439645'}]};"
+
+
+def test_content_js_with_images_but_no_copy_is_not_confident():
+    from adrenalin.tools.ads_transparency.copy import parse_content_preview
+
+    c = parse_content_preview(_IMAGE_ONLY, "https://x.example/content.js?assets=abc")
+    assert c.image_urls == ["https://tpc.googlesyndication.com/simgad/12147114744176439645"]
+    assert not c.has_copy and c.confidence is None and c.method == "content_js"
+    # the overlay= parameter supplies the copy when the script has none
+    c = parse_content_preview(_IMAGE_ONLY, OVERLAY_URL)
+    assert c.has_copy and c.headline.startswith("eSIM for 190+ Countries") and c.confidence == 1.0
+    assert c.image_urls == ["https://tpc.googlesyndication.com/simgad/12147114744176439645"]
+    assert parse_content_preview("var x = 1;", "https://x.example/content.js") is None

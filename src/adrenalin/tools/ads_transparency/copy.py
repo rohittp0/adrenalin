@@ -50,6 +50,10 @@ class AdCopy:
     confidence: float | None = None
     vision_pending: bool = False
 
+    @property
+    def has_copy(self) -> bool:
+        return bool(self.brand or self.headline or self.description or self.display_url)
+
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
 
@@ -132,15 +136,56 @@ def parse_content_js(js: str) -> AdCopy | None:
             found = True
     elif strings:
         c.brand = c.brand or strings[0]
-        c.description = c.description or max(strings, key=len)
+        headline, description = _video_headline_description(strings, c.brand)
+        c.headline, c.description = c.headline or headline, c.description or description
         c.cta = next((t for t in strings if t.lower() in _CTA_LOWER), "")
         c.full_text = "\n".join(dict.fromkeys(strings))
         found = True
 
     if not found:
         return None
-    c.method, c.confidence = "content_js", 1.0
+    c.method, c.confidence = "content_js", 1.0 if c.has_copy else None
     c.website = website_from(c.display_url) or (urlparse(c.landing_url).hostname or "")
+    return c
+
+
+def _video_headline_description(strings: list[str], brand: str) -> tuple[str, str]:
+    """Headline and description of a video / app-install Preview's markup strings. The layout is brand,
+    [headline], [store info: DOWNLOADS/CATEGORY/DEVELOPER label + value], description (wrapped over several
+    strings, often repeated whole), the CTA button, then the app title, which is neither."""
+    cta = next((i for i, t in enumerate(strings) if t.lower() in _CTA_LOWER), len(strings))
+    body: list[str] = []
+    label = False
+    for i, t in enumerate(strings[:cta]):
+        if label:
+            label = False  # the value after a store-info label
+        elif t == brand:
+            continue
+        elif i and len(t) > 2 and t.isupper():
+            label = True
+        elif body and not re.search(r"[.!?…:]$", body[-1]) and re.match(r"[a-z|&,–—-]", t):
+            body[-1] = f"{body[-1]} {t}"  # a wrapped sentence: "... Enhance your" + "maritime operations ..."
+        else:
+            body.append(t)
+    if not body:
+        return "", ""
+    description = max(body, key=len)
+    before = body[:body.index(description)]
+    headline = next((t for t in reversed(before) if t not in description), "")
+    return headline, description
+
+
+def parse_content_preview(js: str, url: str) -> AdCopy | None:
+    """Copy of a `content.js` Preview: the script, plus the URL's `overlay=` text when the script has no copy."""
+    c = parse_content_js(js)
+    if c is not None and c.has_copy:
+        return c
+    overlay = parse_overlay_param(url)
+    if overlay is None or c is None:
+        return overlay or c
+    c.headline, c.description, c.display_url = overlay.headline, overlay.description, overlay.display_url
+    c.website = overlay.website or c.website
+    c.confidence = overlay.confidence
     return c
 
 
