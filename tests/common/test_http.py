@@ -108,3 +108,18 @@ def test_proxies_rotate_per_request(tmp_path):
         e.session.get("https://a.com/1")
     assert [c[2]["proxies"]["https"] for c in e.calls] == ["p1", "p2", "p1"]
     assert all(c[2]["allow_redirects"] is False for c in e.calls)
+
+
+def test_wait_on_block_rechecks_cooldown_extended_during_sleep(tmp_path):
+    e = Env(tmp_path, [resp(200)], wait_on_block=True)
+    e.cooldown.block("a.com", 60, now=0.0)
+    orig = e.sleep
+
+    def extending_sleep(s):
+        orig(s)
+        if len(e.sleeps) == 1:  # another thread extends the cooldown meanwhile
+            e.cooldown.block("a.com", 100, now=e.now)
+
+    e.session._sleep = extending_sleep
+    assert e.session.get("https://a.com/1").status_code == 200
+    assert e.sleeps == [60, 100]

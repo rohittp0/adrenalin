@@ -34,8 +34,14 @@ class Cooldown:
         self._clock = clock
         self._lock = threading.Lock()
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as db:
-            db.execute("CREATE TABLE IF NOT EXISTS cooldown (host TEXT PRIMARY KEY, until REAL)")
+        db = self._connect()
+        try:
+            with db:
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS cooldown (host TEXT PRIMARY KEY, until REAL)"
+                )
+        finally:
+            db.close()
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self._path, timeout=30)
@@ -131,12 +137,13 @@ class PacedSession:
             self._last[host] = self._clock()
 
     def _wait_or_raise(self, host: str) -> None:
-        remaining = self._cooldown.remaining(host, now=self._clock())
-        if remaining <= 0:
-            return
-        if not self._wait_on_block:
-            raise Blocked(host, self._cooldown.until(host))
-        self._sleep(remaining)
+        while True:
+            remaining = self._cooldown.remaining(host, now=self._clock())
+            if remaining <= 0:
+                return
+            if not self._wait_on_block:
+                raise Blocked(host, self._cooldown.until(host))
+            self._sleep(remaining)
 
     def _block(self, host: str) -> float:
         return self._cooldown.block(host, self._block_seconds, now=self._clock())
