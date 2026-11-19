@@ -32,8 +32,9 @@ class FakeSession:
     def post(self, url, params=None, data=None, headers=None, **kw):
         self.calls.append((url, params, data, headers))
         body = self.bodies.pop(0) if len(self.bodies) > 1 else self.bodies[0]
+        status, body = body if isinstance(body, tuple) else (200, body)
         r = requests.Response()
-        r.status_code = 200
+        r.status_code = status
         r._content = body if isinstance(body, bytes) else json.dumps(body).encode()
         return r
 
@@ -177,3 +178,20 @@ def test_advertiser_name_unfiltered_query_makes_one_request():
     s = FakeSession([{"1": []}])
     assert TransparencyClient(s).advertiser_name(Query("AR1", None, None, None)) is None
     assert len(s.calls) == 1
+
+
+@pytest.mark.parametrize("status", [400, 404, 500, 503])
+def test_non_200_json_response_raises_instead_of_an_empty_page(status):
+    from adrenalin.tools.ads_transparency.rpc import RpcError
+
+    q = Query("AR1", None, None, None)
+    with pytest.raises(RpcError, match=f"HTTP {status}"):
+        TransparencyClient(FakeSession([(status, {})])).search(q)
+    assert issubclass(RpcError, ValueError)  # a rejected resumed cursor restarts the listing
+
+
+def test_viewer_geo_context_is_named():
+    from adrenalin.tools.ads_transparency.rpc import VIEWER_GEO_ID
+
+    req = build_search_request(Query("AR1", None, None, None), None)
+    assert req["7"] == {"1": 1, "2": 0, "3": VIEWER_GEO_ID}

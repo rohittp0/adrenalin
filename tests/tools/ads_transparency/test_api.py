@@ -341,6 +341,82 @@ def test_cursor_error_mid_run_fails_item_and_retries_next_run(tmp_path):
     assert sum(1 for b in fake.search_bodies if "4" not in b) == page1_calls  # no restart from page 1
 
 
+def test_non_200_search_fails_list_instead_of_truncating(tmp_path):
+    p1, p2 = two_pages()
+    replies = [response(500, {})]
+    fake = FakeGoogle(search=lambda req: (replies.pop(0) if replies else p2) if req.get("4") == "CUR1" else p1)
+    res = run_scrape(tmp_path, fake)
+    assert res.failed == {"list": 1} and res.rows == 20
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    try:
+        assert not q.get_meta("list_done")
+    finally:
+        q.close()
+    assert run_scrape(tmp_path, fake).rows == 40
+
+
+def test_cursor_page_with_no_creatives_warns(tmp_path):
+    p1, _ = two_pages()
+    fake = FakeGoogle(search=lambda req: {"1": []} if req.get("4") == "CUR1" else p1)
+    logs = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+                 codex=codex(), log=logs.append, poll=POLL)
+    assert res.rows == 20 and res.failed == {}
+    assert any("page:CUR1" in m and "no creatives" in m for m in logs)
+
+
+def test_list_page_rerun_after_crash_is_not_a_pagination_loop(tmp_path):
+    # A crash after the page recorded its next cursor but before it was marked done reruns the page.
+    p1, p2 = two_pages()
+    fake = FakeGoogle(search=lambda req: p2 if req.get("4") == "CUR1" else p1)
+    opts = dict(start=date(2026, 1, 1), end=date(2026, 6, 30))  # closed window: no relist
+    run_scrape(tmp_path, fake, **opts)
+    q = WorkQueue(run_dir(tmp_path, "anywhere_2026-01-01_2026-06-30") / "state.sqlite3")
+    try:
+        q.requeue("list", ["page:"])
+    finally:
+        q.close()
+    res = run_scrape(tmp_path, fake, **opts)
+    assert res.failed == {} and res.rows == 40
+
+
+def test_old_seen_cursors_list_is_accepted(tmp_path):
+    p1, p2 = two_pages()
+    fake = FakeGoogle(search=lambda req: p2 if req.get("4") == "CUR1" else p1)
+    opts = dict(start=date(2026, 1, 1), end=date(2026, 6, 30))
+    run_scrape(tmp_path, fake, stage="list", **opts)
+    q = WorkQueue(run_dir(tmp_path, "anywhere_2026-01-01_2026-06-30") / "state.sqlite3")
+    try:
+        q.set_meta("seen_cursors", '["CUR0"]')
+        q.requeue("list", ["page:CUR1"])
+    finally:
+        q.close()
+    assert run_scrape(tmp_path, fake, **opts).failed == {}
+
+
+def test_transient_oembed_failure_is_retried_next_run(tmp_path):
+    fake = FakeGoogle()
+    fake.oembed_status = 503
+    first = run_scrape(tmp_path, fake)
+    assert all(r["video_title"] == "" for r in read_rows(first) if r["video_id"])
+    js_calls = fake.calls["content_js"]
+    fake.oembed_status = 200
+    rows = read_rows(run_scrape(tmp_path, fake))
+    videos = [r for r in rows if r["video_id"]]
+    assert videos and all(r["video_title"] == "Rotating Tiles video" for r in videos)
+    assert fake.calls["content_js"] == js_calls + len(videos)  # the deleted script is fetched again
+    assert "title_pending" not in CSV_FIELDS
+
+
+def test_permanent_oembed_failure_is_not_retried(tmp_path):
+    fake = FakeGoogle()
+    fake.oembed_status = 401  # embedding disabled / private video
+    run_scrape(tmp_path, fake)
+    before = Counter(fake.calls)
+    run_scrape(tmp_path, fake)
+    assert fake.calls["oembed"] == before["oembed"] and fake.calls["content_js"] == before["content_js"]
+
+
 def test_oembed_failure_blanks_title_without_failing(tmp_path):
     fake = FakeGoogle()
     fake.oembed_status = 401

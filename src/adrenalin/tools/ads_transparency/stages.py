@@ -68,6 +68,13 @@ def creative_fields(c: ListedCreative) -> dict:
     }
 
 
+def _seen_cursors(raw: str | None) -> dict[str, str]:
+    """The `seen_cursors` meta: {cursor: page key that produced it}. Older runs stored a list of cursors
+    (producer unknown, so any repeat of those is still a loop)."""
+    data = json.loads(raw or "{}")
+    return {c: "" for c in data} if isinstance(data, list) else data
+
+
 def page_key(cursor: str | None) -> str:
     return f"page:{cursor or ''}"
 
@@ -160,7 +167,7 @@ class AdsStages:
             if not (cursor and resumed):
                 raise
             ctx.log(f"list: cursor expired, restarting listing ({e})")
-            q.set_meta("seen_cursors", "[]")
+            q.set_meta("seen_cursors", "{}")
             self._put_page(q, None)
             return {"restarted": True}
 
@@ -174,13 +181,16 @@ class AdsStages:
                       {**fields, "variation": 1, "preview": preview_to_dict(c.preview)}, update_payload=True)
         if page.skipped:
             self.warn(f"skipped {page.skipped} malformed creative(s) on {item.key}")
+        if cursor and not page.creatives:
+            self.warn(f"{item.key} returned no creatives")
 
         nxt = page.next_cursor
         if nxt:
-            seen = json.loads(q.get_meta("seen_cursors") or "[]")
-            if nxt in seen:
+            # cursor -> the page that produced it; a page rerun after a crash produces the same cursor again
+            seen = _seen_cursors(q.get_meta("seen_cursors"))
+            if seen.get(nxt, item.key) != item.key:
                 raise PaginationLoop(f"cursor repeated: {nxt}")
-            seen.append(nxt)
+            seen[nxt] = item.key
             q.set_meta("seen_cursors", json.dumps(seen))
             self._put_page(q, nxt)
         else:
@@ -227,30 +237,34 @@ class AdsStages:
 
     # -- extract ------------------------------------------------------------
 
-    def _video_title(self, video_id: str) -> str:
+    def _video_title(self, video_id: str) -> tuple[str, bool]:
+        """The video's title, and whether a failure looks temporary (worth retrying on the next run)."""
+        transient = True
         try:
-            resp = (self.ctx.oembed or self.ctx.session).get(OEMBED_URL, params={"url": watch_url(video_id), "format": "json"},
-                                        allow_redirects=True)
+            resp = (self.ctx.oembed or self.ctx.session).get(
+                OEMBED_URL, params={"url": watch_url(video_id), "format": "json"}, allow_redirects=True)
             if resp.status_code == 200:
                 data = resp.json()
                 if isinstance(data, dict) and isinstance(data.get("title"), str):
-                    return data["title"]
-                problem = "no title in response"
+                    return data["title"], False
+                problem, transient = "no title in response", False
             else:
                 problem = f"HTTP {resp.status_code}"
+                # 401/403/404: private video or embedding disabled; it won't change on a rerun
+                transient = resp.status_code == 429 or resp.status_code >= 500
         except (Blocked, requests.RequestException, ValueError) as e:
             problem = f"{type(e).__name__}: {e}"
         with self._lock:
             first, self._oembed_warned = not self._oembed_warned, True
         if first:
             self.warn(f"YouTube oEmbed failed ({problem}); video_title left blank")
-        return ""
+        return "", transient
 
     def extract(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
         pl = item.payload
         p = preview_from_dict(pl.get("preview"))
-        title = ""
+        title, title_pending = "", False
         if p is None:
             self.warn(f"no preview for {item.key}; copy left blank")
             copy = AdCopy()
@@ -260,14 +274,15 @@ class AdsStages:
                 self.warn(f"content.js not parsed for {item.key}; copy left blank")
                 copy = AdCopy()
             if copy.video_id:
-                title = self._video_title(copy.video_id)
+                title, title_pending = self._video_title(copy.video_id)
         else:
             copy = extract_image(
                 ctx.entity / pl["image_file"], image_name(p), pl.get("format", ""),
                 cache=ctx.cache, codex=ctx.codex, force_vision=ctx.vision, ocr=ctx.ocr, warn=self.warn,
                 host_exists=ctx.host_exists,
             )
-        return {**copy.to_dict(), "video_title": title, "preview_kind": p.kind if p else ""}
+        return {**copy.to_dict(), "video_title": title, "title_pending": title_pending,
+                "preview_kind": p.kind if p else ""}
 
     def _read_js(self, pl: dict, p: Preview) -> str:
         path = self.ctx.run / pl["content_file"] if pl.get("content_file") else None

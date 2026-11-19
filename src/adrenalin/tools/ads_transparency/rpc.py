@@ -19,10 +19,17 @@ DETAIL_URL = "https://adstransparency.google.com/anji/_/rpc/LookupService/GetCre
 _FORMATS = {1: "text", 2: "image", 3: "video"}
 _IGNORED_JS_PARAMS = {"htmlParentId", "responseCallback"}
 _IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
+# Geo ID of the viewer context the web UI sends with every request (2356 = India, where these requests were
+# captured). It is not the Region filter (search filter "8"), which comes from `Query.geo_id`.
+VIEWER_GEO_ID = 2356
 
 
 class PaginationLoop(ValueError):
     pass
+
+
+class RpcError(ValueError):
+    """A Transparency RPC answered with a non-200 status."""
 
 
 @dataclass(frozen=True)
@@ -80,14 +87,14 @@ def build_search_request(query: Query, cursor: str | None, page_size: int = 100)
     if query.end:
         # The request's end date is exclusive.
         filters["7"] = _yyyymmdd(query.end + timedelta(days=1))
-    req: dict[str, Any] = {"2": page_size, "3": filters, "7": {"1": 1, "2": 0, "3": 2356}}
+    req: dict[str, Any] = {"2": page_size, "3": filters, "7": {"1": 1, "2": 0, "3": VIEWER_GEO_ID}}
     if cursor:
         req["4"] = cursor
     return req
 
 
 def _build_detail_request(advertiser_id: str, creative_id: str) -> dict:
-    return {"1": advertiser_id, "2": creative_id, "5": {"1": 1, "2": 0, "3": 2356}}
+    return {"1": advertiser_id, "2": creative_id, "5": {"1": 1, "2": 0, "3": VIEWER_GEO_ID}}
 
 
 def _int_or_none(v: Any) -> int | None:
@@ -213,6 +220,9 @@ class TransparencyClient:
                 "Referer": f"https://{HOST}/advertiser/{advertiser_id}",
             },
         )
+        if resp.status_code != 200:
+            # A JSON error body would otherwise parse as an empty last page and truncate the listing.
+            raise RpcError(f"HTTP {resp.status_code} from {url}")
         try:
             data = resp.json()
         except ValueError as e:

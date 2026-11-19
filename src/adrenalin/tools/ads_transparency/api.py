@@ -150,7 +150,7 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
         if done and (options.end is None or options.end >= date.fromisoformat(done)):
             log("list: window still open, listing again from page 1")
             q.set_meta("list_done", "")  # an interrupted relist resumes instead of restarting
-            q.set_meta("seen_cursors", "[]")
+            q.set_meta("seen_cursors", "{}")
             q.requeue("list", ["page:"])
     if options.stage not in (None, "extract"):
         return
@@ -160,7 +160,8 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
         q.requeue("extract", [k for k, r in done
                               if (r or {}).get("preview_kind") == "image" and (r or {}).get("method") != "codex"])
     q.set_meta("options", json.dumps({"vision": options.vision}))
-    q.requeue("extract", [k for k, r in done if (r or {}).get("vision_pending")])
+    # Codex-limit deferrals and transient oEmbed failures are retried on every run until they succeed.
+    q.requeue("extract", [k for k, r in done if (r or {}).get("vision_pending") or (r or {}).get("title_pending")])
 
 
 def _join(v) -> str:
