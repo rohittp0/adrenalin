@@ -23,7 +23,7 @@ _SKIP_STRINGS = {"Single Ad Rendering Service"}
 _URL_RE = re.compile(r"^[\w.-]+\.[a-z]{2,}(/\S*)?$")
 _ESCAPE_RE = re.compile(r"\\x([0-9a-fA-F]{2})|\\u([0-9a-fA-F]{4})")
 _MARKUP_RE = re.compile(r">([^<>]+)<")
-_JS_PUNCT_RE = re.compile(r"[{}\[\];=\\|<>]|&&|=>|\(\)")
+_JS_CODE_RE = re.compile(r"[{}\\]|=>|&&|\|\||\bfunction\b|\bvar\b|\.\w+\(|\w\(\w*\)|\w\[|\)[\w!;{)]|\)\s*[;{]|\(!")
 _IMAGE_KEYS = ("squareImage", "landscapeImage", "portraitImage")
 
 
@@ -48,6 +48,7 @@ class AdCopy:
     sitelinks: list[str] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
     confidence: float | None = None
+    vision_pending: bool = False
 
     def to_dict(self) -> dict:
         return dataclasses.asdict(self)
@@ -76,7 +77,7 @@ def _markup_strings(s: str) -> list[str]:
     out = []
     for m in _MARKUP_RE.finditer(s):
         t = html.unescape(m.group(1)).strip()
-        if not re.search(r"[^\W\d_]", t) or _JS_PUNCT_RE.search(t) or t in _SKIP_STRINGS:
+        if not re.search(r"[^\W\d_]", t) or _JS_CODE_RE.search(t) or t in _SKIP_STRINGS:
             continue
         out.append(t)
     return out
@@ -119,13 +120,16 @@ def parse_content_js(js: str) -> AdCopy | None:
 
     strings = _markup_strings(s)
     if not c.video_id:
-        if len(strings) >= 3:
-            brand, url, headline, *rest = strings
-            c.brand = c.brand or brand
-            c.display_url = url
-            c.headline = c.headline or headline
-            c.description = c.description or (rest[0] if rest else "")
-            c.sitelinks = rest[1:]
+        if len(strings) >= 3 and not (c.headline or c.brand or c.description):
+            c.brand = strings[0]
+            rest = strings[1:]
+            if _is_url(rest[0]):
+                c.display_url = rest[0]
+                rest = rest[1:]
+            if rest:
+                c.headline = rest[0]
+                c.description = rest[1] if len(rest) > 1 else ""
+                c.sitelinks = rest[2:]
             found = True
     elif strings:
         c.brand = c.brand or strings[0]
@@ -278,43 +282,60 @@ def extract_image(
 ) -> AdCopy:
     is_text = str(fmt).lower() in ("text", "1")
     r: OcrResult | None = None
-    copy: AdCopy | None = None  # primary OCR copy, None when the layout rules failed
     ocr_failed = False
+    pending = False
 
-    if not force_vision:
+    def load_ocr() -> OcrResult:
         for method in OCR_METHODS:
             if (hit := cache.get(image_id, method)) is not None:
-                r = _ocr_from_dict(hit)
-                break
-        if r is None:
+                return _ocr_from_dict(hit)
+        res = ocr(Path(path))
+        cache.put(image_id, res.method, "", _ocr_to_dict(res))
+        return res
+
+    def ocr_copy(res: OcrResult | None) -> AdCopy | None:
+        if res is None:
+            return None
+        return parse_text_ad_ocr(res) if is_text else parse_image_ad_ocr(res)
+
+    if not force_vision:
+        try:
+            r = load_ocr()
+        except OcrUnavailable:
+            if codex is None:
+                raise
+            ocr_failed = True
+    copy = ocr_copy(r)
+
+    if force_vision or ocr_failed or needs_vision(r, copy):
+        if codex is not None:
+            fields = cache.get(image_id, "codex", codex.model)
+            if fields is None:
+                try:
+                    fields = codex.extract(Path(path), VISION_SCHEMA, VISION_PROMPT)
+                    if fields is None:
+                        pending = True
+                        warn(f"vision limit reached; keeping OCR result for {image_id}")
+                    elif not isinstance(fields, dict):
+                        raise CodexError(f"unexpected codex output: {type(fields).__name__}")
+                    else:
+                        cache.put(image_id, "codex", codex.model, fields)
+                except CodexError as e:
+                    fields = None
+                    warn(f"vision extraction failed for {image_id}: {e}; keeping OCR result")
+            if fields is not None:
+                return _vision_copy(fields, codex.model)
+        if r is None and not ocr_failed:  # forced vision yielded nothing: fall back to OCR
             try:
-                r = ocr(Path(path))
+                r = load_ocr()
             except OcrUnavailable:
                 if codex is None:
                     raise
-                ocr_failed = True
-            else:
-                cache.put(image_id, r.method, "", _ocr_to_dict(r))
-        if r is not None:
-            copy = parse_text_ad_ocr(r) if is_text else parse_image_ad_ocr(r)
-
-    need = force_vision or ocr_failed or needs_vision(r, copy)
-
-    if need and codex is not None:
-        fields = cache.get(image_id, "codex", codex.model)
-        if fields is None:
-            try:
-                fields = codex.extract(Path(path), VISION_SCHEMA, VISION_PROMPT)
-            except CodexError as e:
-                warn(f"vision extraction failed for {image_id}: {e}; keeping OCR result")
-            else:
-                if fields is None:
-                    warn(f"vision limit reached; keeping OCR result for {image_id}")
-                else:
-                    cache.put(image_id, "codex", codex.model, fields)
-        if fields is not None:
-            return _vision_copy(fields, codex.model)
+            copy = ocr_copy(r)
 
     if copy is None and r is not None and r.lines:
         copy = parse_image_ad_ocr(r)  # best effort when the text layout did not match
-    return copy if copy is not None else AdCopy()
+    if copy is None:
+        copy = AdCopy()
+    copy.vision_pending = pending
+    return copy

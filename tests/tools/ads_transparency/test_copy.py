@@ -251,3 +251,76 @@ def test_extract_image_real_ocr_text_fixture(tmp_path):
         assert c.brand == "flights70.com"
     finally:
         cache.close()
+
+
+def _page(*strings):
+    return "".join(f"\\x3cdiv\\x3e{t}\\x3c/div\\x3e" for t in strings)
+
+
+def test_content_js_text_ad_keeps_pipe_in_copy():
+    c = parse_content_js(_page("Single Ad Rendering Service", "Acme", "www.acme.com/x", "Brand | Cheap Flights",
+                               "Fly; now = save [today]", "Link A"))
+    assert (c.brand, c.display_url, c.headline) == ("Acme", "www.acme.com/x", "Brand | Cheap Flights")
+    assert c.description == "Fly; now = save [today]" and c.sitelinks == ["Link A"]
+
+
+def test_content_js_text_ad_without_url_has_no_junk_display_url():
+    c = parse_content_js(_page("Acme", "Great Headline", "A description here"))
+    assert c.display_url == "" and c.brand == "Acme" and c.headline == "Great Headline"
+    assert c.description == "A description here"
+
+
+def test_content_js_code_noise_still_filtered():
+    c = parse_content_js(_page("0&&m.h", "x.call(a)", "Acme", "www.acme.com", "Headline", "Desc"))
+    assert c.brand == "Acme" and c.display_url == "www.acme.com"
+
+
+def test_content_js_adData_not_overwritten_by_positional():
+    raw = (FIX / "content_image.js").read_text(encoding="utf-8") + _page("Zed", "www.zed.com", "ZH", "ZD")
+    c = parse_content_js(raw)
+    assert c.brand == "Rent80" and c.display_url == "" and c.sitelinks == []
+
+
+_CODEX_OK = {"brand": "B", "confidence": 0.9}
+
+
+def test_forced_vision_codex_error_keeps_ocr(tmp_path):
+    cache, warnings = _cache(tmp_path), []
+    try:
+        c = extract_image(tmp_path / "x.png", "f1", "text", cache=cache, codex=FakeCodex(exc=CodexError("x")),
+                          force_vision=True, ocr=lambda p: _text_ad_result(), warn=warnings.append)
+        assert c.method == "apple_vision" and c.brand == "flights70.com" and not c.vision_pending
+        assert len(warnings) == 1
+    finally:
+        cache.close()
+
+
+def test_forced_vision_limit_sets_pending(tmp_path):
+    cache, warnings = _cache(tmp_path), []
+    try:
+        c = extract_image(tmp_path / "x.png", "f2", "text", cache=cache, codex=FakeCodex(result=None),
+                          force_vision=True, ocr=lambda p: _text_ad_result(), warn=warnings.append)
+        assert c.method == "apple_vision" and c.vision_pending is True and len(warnings) == 1
+    finally:
+        cache.close()
+
+
+def test_needs_vision_limit_sets_pending(tmp_path):
+    cache = _cache(tmp_path)
+    try:
+        c = extract_image(tmp_path / "x.png", "f3", "text", cache=cache, codex=FakeCodex(result=None),
+                          force_vision=False, ocr=lambda p: _text_ad_result(0.4), warn=lambda m: None)
+        assert c.vision_pending is True and c.method == "apple_vision"
+        assert AdCopy.from_dict(c.to_dict()).vision_pending is True
+    finally:
+        cache.close()
+
+
+def test_codex_non_dict_treated_as_error(tmp_path):
+    cache, warnings = _cache(tmp_path), []
+    try:
+        c = extract_image(tmp_path / "x.png", "f4", "text", cache=cache, codex=FakeCodex(result=["bad"]),
+                          force_vision=True, ocr=lambda p: _text_ad_result(), warn=warnings.append)
+        assert c.method == "apple_vision" and len(warnings) == 1 and not c.vision_pending
+    finally:
+        cache.close()
