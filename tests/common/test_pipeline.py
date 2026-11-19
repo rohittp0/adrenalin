@@ -1,0 +1,227 @@
+import threading
+import time
+
+import pytest
+
+from adrenalin.common.http import Blocked
+from adrenalin.common.pipeline import Pipeline, Stage, WorkQueue
+
+
+def quiet(_msg):
+    pass
+
+
+def test_put_is_idempotent_and_claim_marks_running(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    assert q.put("A", "1", {"x": 1}) is True
+    assert q.put("A", "1", {"x": 2}) is False
+    assert q.backlog("A") == 1
+    item = q.claim("A")
+    assert item.key == "1" and item.payload == {"x": 1} and item.status == "running"
+    assert q.claim("A") is None
+    assert q.backlog("A") == 1
+    q.complete("A", "1", {"ok": True})
+    assert q.backlog("A") == 0
+    assert q.items("A", "done")[0].result == {"ok": True}
+    q.close()
+
+
+def test_reopen_resets_running_to_pending(tmp_path):
+    p = tmp_path / "q.sqlite3"
+    q = WorkQueue(p)
+    q.put("A", "1", {})
+    assert q.claim("A") is not None
+    q.close()
+    q = WorkQueue(p)
+    assert q.backlog("A") == 1
+    assert q.claim("A").key == "1"
+    q.close()
+
+
+def test_failed_items_retry_on_reopen_until_max_attempts(tmp_path):
+    p = tmp_path / "q.sqlite3"
+    q = WorkQueue(p)
+    q.put("A", "1", {})
+    for _ in range(3):
+        assert q.claim("A") is not None
+        q.fail("A", "1", "boom")
+        q.close()
+        q = WorkQueue(p)
+    assert q.claim("A") is None
+    assert q.items("A", "failed")[0].error == "boom"
+    q.close()
+
+
+def test_put_update_payload_keeps_result(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {"v": 1})
+    q.claim("A")
+    q.complete("A", "1", {"r": 1})
+    assert q.put("A", "1", {"v": 2}, update_payload=True) is False
+    (it,) = q.items("A")
+    assert it.payload == {"v": 2} and it.result == {"r": 1} and it.status == "done"
+    q.close()
+
+
+def test_requeue_and_meta(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {})
+    q.claim("A")
+    q.complete("A", "1", {"r": 1})
+    q.requeue("A", ["1"])
+    (it,) = q.items("A")
+    assert it.status == "pending" and it.result is None
+    assert q.get_meta("k") is None
+    q.set_meta("k", "v1")
+    q.set_meta("k", "v2")
+    assert q.get_meta("k") == "v2"
+    q.close()
+
+
+def _run(q, stages):
+    baseline = threading.active_count()
+    result = Pipeline(q, stages, poll=0.01, log=quiet).run()
+    assert threading.active_count() == baseline
+    return result
+
+
+def test_items_flow_through_stages_in_order(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "seed", {})
+
+    def a(item, queue):
+        for i in range(5):
+            queue.put("B", str(i), {"i": i})
+
+    result = _run(q, [Stage("A", a), Stage("B", lambda item, queue: {"ok": item.payload["i"]})])
+    assert result.failed == {} and result.blocked is None
+    assert len(q.items("B", "done")) == 5
+    q.close()
+
+
+def test_backpressure_caps_upstream_lead(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(20):
+        q.put("A", str(i), {})
+    seen = []
+
+    def a(item, queue):
+        queue.put("B", item.key, {})
+
+    def b(item, queue):
+        seen.append(queue.backlog("B"))
+        time.sleep(0.01)
+
+    sa = Stage("A", a, throttle_on=("B",), max_ahead=3)
+    _run(q, [sa, Stage("B", b)])
+    assert len(q.items("B", "done")) == 20
+    assert max(seen) <= 3 + sa.concurrency
+    q.close()
+
+
+def test_blocked_stops_stage_but_downstream_drains(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(6):
+        q.put("A", str(i), {})
+    n = []
+
+    def a(item, queue):
+        n.append(1)
+        if len(n) == 3:
+            raise Blocked("h", 123.0)
+        queue.put("B", item.key, {})
+
+    result = _run(q, [Stage("A", a), Stage("B", lambda i, qu: None)])
+    assert result.blocked is not None and result.blocked.host == "h"
+    assert q.backlog("A") > 0
+    assert len(q.items("B", "done")) == 2 == len(q.items("B"))
+    q.close()
+
+
+def test_worker_exception_marks_item_failed_and_continues(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "seed", {})
+
+    def a(item, queue):
+        for i in range(3):
+            queue.put("B", str(i), {})
+
+    def b(item, queue):
+        if item.key == "1":
+            raise ValueError("bad item")
+
+    result = _run(q, [Stage("A", a), Stage("B", b)])
+    assert result.failed == {"B": 1}
+    assert "bad item" in q.items("B", "failed")[0].error
+    assert len(q.items("B", "done")) == 2
+    q.close()
+
+
+def test_concurrency_runs_workers_in_parallel(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(2):
+        q.put("A", str(i), {})
+    barrier = threading.Barrier(2)
+
+    def a(item, queue):
+        barrier.wait(timeout=5)
+
+    result = _run(q, [Stage("A", a, concurrency=2)])
+    assert result.failed == {}
+    assert len(q.items("A", "done")) == 2
+    q.close()
+
+
+def test_requeue_resets_attempts(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {})
+    q.claim("A")
+    q.fail("A", "1", "x")
+    q.requeue("A", ["1"])
+    q.claim("A")
+    q.fail("A", "1", "x")
+    q.close()
+    q = WorkQueue(tmp_path / "q.sqlite3", max_attempts=2)  # attempts==1 after requeue+claim
+    assert q.items("A", "pending") and not q.items("A", "failed")
+    q.close()
+
+
+def test_pipeline_rejects_bad_config(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    with pytest.raises(ValueError):
+        Pipeline(q, [Stage("A", lambda i, qu: None), Stage("A", lambda i, qu: None)])
+    with pytest.raises(ValueError):
+        Pipeline(q, [Stage("A", lambda i, qu: None, throttle_on=("Z",))])
+    q.close()
+
+
+def test_stage_loop_crash_is_recorded(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {})
+    real = q.claim
+    calls = []
+
+    def flaky(stage):
+        if stage == "A" and not calls:
+            calls.append(1)
+            raise RuntimeError("db gone")
+        return real(stage)
+
+    q.claim = flaky
+    result = _run(q, [Stage("A", lambda i, qu: None), Stage("B", lambda i, qu: None)])
+    assert len(result.errors) == 1 and "db gone" in result.errors[0]
+    q.close()
+
+
+def test_blocked_downstream_does_not_hang_throttled_upstream(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(10):
+        q.put("A", str(i), {})
+
+    def b(item, queue):
+        raise Blocked("h", 1.0)
+
+    result = _run(q, [Stage("A", lambda i, qu: qu.put("B", i.key, {}) and None,
+                            throttle_on=("B",), max_ahead=1), Stage("B", b)])
+    assert result.blocked is not None
+    assert q.backlog("A") == 0
