@@ -191,3 +191,18 @@ def test_host_checker_counts_a_block_page_as_existing(tmp_path):
         assert check("google.com") and len(calls) == 1
     finally:
         cache.close()
+
+
+def test_streamed_request_never_reads_the_body(tmp_path):
+    class Unread(requests.Response):
+        @property
+        def content(self):
+            raise AssertionError("body read")
+
+    r = Unread()
+    r.status_code, r.url = 200, "https://example.com/"
+    r.headers["Content-Type"] = "text/html"
+    e = Env(tmp_path, [r, resp(302, headers={"Location": SORRY})])
+    assert e.session.get("https://example.com/", stream=True) is r
+    with pytest.raises(Blocked):  # a /sorry/ redirect is still a block
+        e.session.get("https://example.com/", stream=True)

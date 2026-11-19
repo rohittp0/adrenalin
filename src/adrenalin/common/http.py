@@ -79,10 +79,10 @@ class Cooldown:
         return max(until, self.until(host))
 
 
-def is_block_response(resp: requests.Response) -> bool:
+def is_block_response(resp: requests.Response, read_body: bool = True) -> bool:
     if "/sorry/" in (resp.url or "") or "/sorry/" in resp.headers.get("Location", ""):
         return True
-    if "text/html" in resp.headers.get("Content-Type", "").lower():
+    if read_body and "text/html" in resp.headers.get("Content-Type", "").lower():
         text = resp.content[:4000].decode("utf-8", errors="ignore").lower()
         return "recaptcha" in text
     return False
@@ -169,7 +169,8 @@ class PacedSession:
                 send["proxies"] = {"http": p, "https": p}
             resp = self._transport(method, url, **send)
 
-            if is_block_response(resp):
+            # stream=True callers (the host check) never download the body, so only the URL tells a block
+            if is_block_response(resp, read_body=not kwargs.get("stream")):
                 until = self._block(host)
                 if self._wait_on_block and block_waits < self._max_retries:
                     block_waits += 1
