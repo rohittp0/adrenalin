@@ -63,6 +63,7 @@ class FakeGoogle:
         self.search_bodies = []
         self.fail_simgad = 0
         self.oembed_status = 200
+        self.oembed_reply = None
         self.lock = threading.Lock()
 
     def __call__(self, method, url, params=None, data=None, **kw):
@@ -88,6 +89,8 @@ class FakeGoogle:
                 return response(body=body, headers={"Content-Type": "text/javascript"}, url=url)
             if "oembed" in url:
                 self.calls["oembed"] += 1
+                if self.oembed_reply is not None:
+                    return self.oembed_reply
                 if self.oembed_status != 200:
                     return response(self.oembed_status, b"Unauthorized", url=url)
                 return response(body=OEMBED, headers={"Content-Type": "application/json"}, url=url)
@@ -102,10 +105,10 @@ class Clock:
         return self.now
 
 
-def make_session(tmp_path, fake, clock=None):
+def make_session(tmp_path, fake, clock=None, sleep=None, wait_on_block=False):
     clock = clock or Clock()
     return PacedSession(Cooldown(tmp_path / "test-cooldown.sqlite3", clock=clock), intervals={},
-                        transport=fake, sleep=lambda s: None, clock=clock)
+                        transport=fake, sleep=sleep or (lambda s: None), clock=clock, wait_on_block=wait_on_block)
 
 
 def fake_ocr(path):
@@ -270,29 +273,46 @@ def test_codex_limit_rows_requeued_next_run(tmp_path):
     assert res2.vision_skipped == SIMGAD_CREATIVES - 6
 
 
+BAD_REQUEST = response(400, b"<html><body>Bad Request</body></html>", {"Content-Type": "text/html"})
+SORRY = response(302, b"", {"Location": "https://www.google.com/sorry/index"})
+
+
+def cursor_calls(fake):
+    return sum(1 for b in fake.search_bodies if b.get("4") == "CUR1")
+
+
 def test_expired_cursor_restarts_listing(tmp_path):
+    # A cursor resumed from an earlier run is rejected: listing restarts from page 1.
     p1, p2 = two_pages()
-    state = {"expired": 1}
-
-    def search(req):
-        if req.get("4") == "CUR1":
-            if state["expired"]:
-                state["expired"] -= 1
-                return response(400, b"<html><body>Bad Request</body></html>", {"Content-Type": "text/html"})
-            return p2
-        return p1
-
-    fake = FakeGoogle(search=search)
-    res = run_scrape(tmp_path, fake)
+    replies = [SORRY, BAD_REQUEST]
+    fake = FakeGoogle(search=lambda req: (replies.pop(0) if replies else p2) if req.get("4") == "CUR1" else p1)
+    clock = Clock()
+    session = make_session(tmp_path, fake, clock)
+    assert run_scrape(tmp_path, fake, session=session).blocked_until is not None
+    clock.now += 1000
+    res = run_scrape(tmp_path, fake, session=session)
     rows = read_rows(res)
     assert len(rows) == 40 == len({r["creative_id"] for r in rows})
-    assert sum(1 for b in fake.search_bodies if b.get("4") == "CUR1") == 2
-    assert res.failed == {}
+    assert cursor_calls(fake) == 3  # sorry, rejected resume, after the restart
+    assert res.failed == {} and res.blocked_until is None
     q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
     try:
         assert q.get_meta("list_done") == date.today().isoformat()
     finally:
         q.close()
+
+
+def test_cursor_error_mid_run_fails_item_and_retries_next_run(tmp_path):
+    # A cursor obtained in this run is not "expired": its error fails the item (no restart).
+    p1, p2 = two_pages()
+    replies = [BAD_REQUEST]
+    fake = FakeGoogle(search=lambda req: (replies.pop(0) if replies else p2) if req.get("4") == "CUR1" else p1)
+    res = run_scrape(tmp_path, fake)
+    assert res.failed == {"list": 1} and res.rows == 20
+    page1_calls = sum(1 for b in fake.search_bodies if "4" not in b)
+    res2 = run_scrape(tmp_path, fake)
+    assert res2.failed == {} and res2.rows == 40
+    assert sum(1 for b in fake.search_bodies if "4" not in b) == page1_calls  # no restart from page 1
 
 
 def test_oembed_failure_blanks_title_without_failing(tmp_path):
@@ -403,3 +423,77 @@ def test_stage_export_with_vision_does_not_record_vision(tmp_path):
     assert read_rows(run_scrape(tmp_path, fake, vision=True, stage="export")) == first
     rows = read_rows(run_scrape(tmp_path, fake, vision=True))
     assert {r["extraction_method"] for r in rows if r["image_file"]} == {"codex"}
+
+
+def test_content_js_kept_out_of_queue_and_deleted_after_extract(tmp_path):
+    fake = FakeGoogle()
+    res = run_scrape(tmp_path, fake)
+    assert res.rows == 40 and res.failed == {}
+    assert not list((run_dir(tmp_path) / "content").glob("*"))
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    try:
+        payloads = [i.payload for i in q.items("extract")]
+        assert payloads and all("js" not in p and len(json.dumps(p)) < 4000 for p in payloads)
+        assert sum("content_file" in p for p in payloads) == 5
+    finally:
+        q.close()
+
+
+def test_leftover_content_files_of_done_items_are_removed_on_start(tmp_path):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    try:
+        rel = next(i.payload["content_file"] for i in q.items("extract") if "content_file" in i.payload)
+    finally:
+        q.close()
+    leftover = run_dir(tmp_path) / rel
+    leftover.write_text("stale")
+    run_scrape(tmp_path, fake, stage="export")
+    assert not leftover.exists()
+
+
+def test_missing_content_file_refetches(tmp_path):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake, stage="list")
+    run_scrape(tmp_path, fake, stage="fetch")
+    files = list((run_dir(tmp_path) / "content").glob("*.js"))
+    assert len(files) == 5
+    files[0].unlink()
+    before = fake.calls["content_js"]
+    res = run_scrape(tmp_path, fake)
+    rows = read_rows(res)
+    assert res.failed == {} and fake.calls["content_js"] == before + 1
+    assert sum(r["extraction_method"] == "content_js" for r in rows) == 5
+    assert not list((run_dir(tmp_path) / "content").glob("*"))
+
+
+def test_second_vision_run_retries_failed_codex(tmp_path):
+    fake = FakeGoogle()
+
+    def failing(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, "", "codex down")
+
+    first = read_rows(run_scrape(tmp_path, fake, codex_runner=codex(run=failing), vision=True))
+    assert {r["extraction_method"] for r in first if r["image_file"]} == {"apple_vision"}
+    rows = read_rows(run_scrape(tmp_path, fake, vision=True))
+    assert {r["extraction_method"] for r in rows if r["image_file"]} == {"codex"}
+
+
+@pytest.mark.parametrize("reply", [SORRY, response(429, b"slow down")], ids=["sorry", "429"])
+def test_oembed_block_never_waits_under_wait_on_block(tmp_path, reply):
+    fake = FakeGoogle()
+    fake.oembed_reply = reply
+    clock, sleeps = Clock(), []
+
+    def sleep(s):
+        sleeps.append(s)
+        clock.now += s
+
+    session = make_session(tmp_path, fake, clock, sleep=sleep, wait_on_block=True)
+    res = run_scrape(tmp_path, fake, session=session)
+    videos = [r for r in read_rows(res) if r["video_id"]]
+    assert videos and all(r["video_title"] == "" for r in videos)
+    assert res.failed == {} and res.rows == 40
+    assert max(sleeps, default=0) <= 0.5  # pacing only: no 900 s cooldown wait, no 60 s backoff
+    assert fake.calls["oembed"] <= 2

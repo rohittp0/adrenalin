@@ -225,3 +225,40 @@ def test_blocked_downstream_does_not_hang_throttled_upstream(tmp_path):
                             throttle_on=("B",), max_ahead=1), Stage("B", b)])
     assert result.blocked is not None
     assert q.backlog("A") == 0
+
+
+def test_stage_status_index_and_light_reads(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for k in "abc":
+        q.put("A", k, {"big": "x" * 1000})
+    q.claim("A")
+    q.complete("A", "a", {"r": 1})
+    q.claim("A")
+    q.fail("A", "b", "boom")
+    assert q.results("A") == [("a", {"r": 1})]
+    assert q.results("A", "pending") == [("c", None)]
+    assert (q.count("A", "done"), q.count("A", "failed"), q.count("A", "pending"), q.count("B", "done")) == (1, 1, 1, 0)
+    plan = q._db.execute("EXPLAIN QUERY PLAN SELECT id FROM items WHERE stage='A' AND status='pending' "
+                         "ORDER BY id LIMIT 1").fetchall()
+    assert any("items_stage_status" in str(row) for row in plan)
+    q.close()
+
+
+def test_on_done_runs_after_complete_and_its_errors_do_not_fail_the_item(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for k in ("1", "2"):
+        q.put("A", k, {})
+    seen, logs = [], []
+
+    def on_done(item, result):
+        assert q.count("A", "done") >= 1  # already completed
+        seen.append((item.key, result))
+        if item.key == "2":
+            raise OSError("cleanup failed")
+
+    res = Pipeline(q, [Stage("A", lambda item, q: {"k": item.key}, on_done=on_done)], poll=0.01,
+                   log=logs.append).run()
+    assert sorted(seen) == [("1", {"k": "1"}), ("2", {"k": "2"})]
+    assert res.failed == {} and q.count("A", "done") == 2
+    assert any("cleanup failed" in m for m in logs)
+    q.close()

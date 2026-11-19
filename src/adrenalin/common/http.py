@@ -102,6 +102,8 @@ class PacedSession:
         rng: Callable[[], float] = random.random,
     ):
         self._cooldown = cooldown
+        self._custom_transport = transport
+        self._proxy_list = tuple(proxies)
         self._intervals = dict(intervals)
         self._default_interval = default_interval
         self._proxies = itertools.cycle(proxies) if proxies else None
@@ -183,6 +185,18 @@ class PacedSession:
                 attempt += 1
                 continue
             return resp
+
+    def derive(self, *, wait_on_block: bool | None = None, max_retries: int | None = None) -> PacedSession:
+        """A new session sharing this one's cooldown, intervals, proxies, transport, sleep and clock,
+        with its own block/retry policy and its own pacing state. Close it separately."""
+        return PacedSession(
+            self._cooldown, self._intervals,
+            default_interval=self._default_interval, proxies=self._proxy_list,
+            wait_on_block=self._wait_on_block if wait_on_block is None else wait_on_block,
+            max_retries=self._max_retries if max_retries is None else max_retries,
+            block_seconds=self._block_seconds, transport=self._custom_transport,
+            sleep=self._sleep, clock=self._clock, rng=self._rng,
+        )
 
     def get(self, url: str, **kwargs) -> requests.Response:
         return self.request("GET", url, **kwargs)

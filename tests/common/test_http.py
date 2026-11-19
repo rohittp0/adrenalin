@@ -123,3 +123,21 @@ def test_wait_on_block_rechecks_cooldown_extended_during_sleep(tmp_path):
     e.session._sleep = extending_sleep
     assert e.session.get("https://a.com/1").status_code == 200
     assert e.sleeps == [60, 100]
+
+
+def test_derive_shares_cooldown_and_transport_but_fails_fast(tmp_path):
+    e = Env(tmp_path, [resp(429), resp(302, headers={"Location": SORRY})], wait_on_block=True,
+            proxies=["p1"])
+    fast = e.session.derive(wait_on_block=False, max_retries=0)
+    with pytest.raises(Blocked):  # 429: no backoff sleep, no retry
+        fast.get("https://a.com/1")
+    assert len(e.calls) == 1 and e.sleeps == []
+    assert e.cooldown.remaining("a.com", now=e.now) > 0  # shared cooldown
+    with pytest.raises(Blocked):  # cooldown active: raises instead of waiting
+        fast.get("https://a.com/2")
+    assert len(e.calls) == 1 and e.sleeps == []
+    with pytest.raises(Blocked):  # sorry on another host: no wait, no retry
+        fast.get("https://b.com/1")
+    assert len(e.calls) == 2 and e.sleeps == []
+    assert e.calls[0][2]["proxies"]["https"] == "p1"
+    fast.close()

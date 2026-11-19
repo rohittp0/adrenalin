@@ -18,7 +18,14 @@ from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
 from adrenalin.tools.ads_transparency.rpc import HOST, ListedCreative, Query, TransparencyClient, transparency_url
-from adrenalin.tools.ads_transparency.stages import STAGE_NAMES, AdsStages, StageContext, watch_url
+from adrenalin.tools.ads_transparency.stages import (
+    CONTENT_DIR,
+    STAGE_NAMES,
+    AdsStages,
+    StageContext,
+    content_file,
+    watch_url,
+)
 
 TOOL_NAME = "ads-transparency"
 RPC_INTERVAL = (6.0, 2.0)
@@ -124,6 +131,17 @@ def run_dir_name(options: ScrapeOptions) -> str:
     return name + ("_variations" if options.variations else "")
 
 
+def _remove_done_content(q: WorkQueue, run: Path) -> None:
+    """Delete content.js files left behind by extract items that already completed."""
+    folder = run / CONTENT_DIR
+    if not folder.is_dir():
+        return
+    done = {Path(content_file(key)).name for key, _ in q.results("extract")}
+    for f in folder.iterdir():
+        if f.name in done:
+            f.unlink(missing_ok=True)
+
+
 def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], None]) -> None:
     # Requeues only when the stage that redoes the work runs: a requeue clears the item's result,
     # so e.g. `--stage export` must not blank copy it cannot re-extract.
@@ -136,15 +154,13 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
             q.requeue("list", ["page:"])
     if options.stage not in (None, "extract"):
         return
-    stored = json.loads(q.get_meta("options") or "{}")
-    if options.vision and not stored.get("vision"):
-        keys = [i.key for i in q.items("extract", "done")
-                if (i.payload.get("preview") or {}).get("kind") == "image"
-                and (i.result or {}).get("method") != "codex"]
-        q.requeue("extract", keys)
+    done = q.results("extract")
+    if options.vision:
+        # Every --vision run retries image rows Codex hasn't read yet (first --vision, Codex errors).
+        q.requeue("extract", [k for k, r in done
+                              if (r or {}).get("preview_kind") == "image" and (r or {}).get("method") != "codex"])
     q.set_meta("options", json.dumps({"vision": options.vision}))
-    pending = [i.key for i in q.items("extract", "done") if (i.result or {}).get("vision_pending")]
-    q.requeue("extract", pending)
+    q.requeue("extract", [k for k, r in done if (r or {}).get("vision_pending")])
 
 
 def _join(v) -> str:
@@ -161,7 +177,7 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
     if options.variations:
         # The list stage refreshes detail payloads; fetch payloads keep the first listing.
         listing = {i.key: {k: v for k, v in i.payload.items() if k != "preview"} for i in q.items("detail")}
-    copies = {i.key: i.result or {} for i in q.items("extract", "done")}
+    copies = {k: r or {} for k, r in q.results("extract")}
     rows = []
     for f in q.items("fetch"):
         pl = {**f.payload, **listing.get(f.payload["creative_id"], {})}
@@ -207,6 +223,8 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
     own_session = session is None
     if own_session:
         session = make_session(options.out, options.proxies, options.wait_on_block)
+    # oEmbed is optional: it must never wait out a block or back off, whatever --wait-on-block says.
+    oembed = session.derive(wait_on_block=False, max_retries=0)
     cache: ExtractionCache | None = None
     q: WorkQueue | None = None
     try:
@@ -219,16 +237,18 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         run = ent / "runs" / run_dir_name(options)
         run.mkdir(parents=True, exist_ok=True)
         q = WorkQueue(run / "state.sqlite3")
+        _remove_done_content(q, run)
         _prepare_queue(q, options, log)
 
-        ctx = StageContext(client=client, session=session, query=query, entity=ent, cache=cache, codex=codex,
-                           variations=options.variations, vision=options.vision, ocr=ocr, log=log)
+        ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
+                           codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=log,
+                           oembed=oembed)
         stages = AdsStages(ctx).stages(options.stage)
         rr = Pipeline(q, stages, poll=poll, log=log).run() if stages else RunResult()
 
         csv_path = run / "ads.csv"
         n = write_csv_atomic(csv_path, CSV_FIELDS, _rows(q, options))
-        failed = {s: k for s in STAGE_NAMES if (k := len(q.items(s, "failed")))}
+        failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
         result = ScrapeResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, codex.skipped,
                               list(rr.errors))
         _log_summary(result, codex, log)
@@ -238,6 +258,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
             q.close()
         if cache is not None:
             cache.close()
+        oembed.close()
         if own_session:
             session.close()
 

@@ -45,6 +45,7 @@ class WorkQueue:
                 status TEXT NOT NULL DEFAULT 'pending',
                 error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(stage, key));
+            CREATE INDEX IF NOT EXISTS items_stage_status ON items(stage, status);
             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         with self._lock, self._db:
@@ -65,13 +66,13 @@ class WorkQueue:
 
     def claim(self, stage: str) -> Item | None:
         with self._lock, self._db:
-            row = self._db.execute(
-                f"SELECT {_COLS} FROM items WHERE stage=? AND status='pending' ORDER BY id LIMIT 1",
-                (stage,)).fetchone()
-            if row is None:
+            # Find the id through the (stage, status) index first, then read only that row.
+            found = self._db.execute(
+                "SELECT id FROM items WHERE stage=? AND status='pending' ORDER BY id LIMIT 1", (stage,)).fetchone()
+            if found is None:
                 return None
-            self._db.execute("UPDATE items SET status='running', attempts=attempts+1 WHERE stage=? AND key=?",
-                             (stage, row[1]))
+            row = self._db.execute(f"SELECT {_COLS} FROM items WHERE id=?", found).fetchone()
+            self._db.execute("UPDATE items SET status='running', attempts=attempts+1 WHERE id=?", found)
             item = _item(row)
             item.status = "running"
             return item
@@ -109,6 +110,18 @@ class WorkQueue:
                 f"SELECT COUNT(*) FROM items WHERE stage IN ({marks}) AND status IN ('pending','running')",
                 stages).fetchone()[0]
 
+    def count(self, stage: str, status: str) -> int:
+        with self._lock:
+            return self._db.execute("SELECT COUNT(*) FROM items WHERE stage=? AND status=?",
+                                    (stage, status)).fetchone()[0]
+
+    def results(self, stage: str, status: str = "done") -> list[tuple[str, dict | None]]:
+        """(key, result) pairs without loading payloads."""
+        with self._lock:
+            rows = self._db.execute("SELECT key, result FROM items WHERE stage=? AND status=? ORDER BY id",
+                                    (stage, status)).fetchall()
+        return [(k, json.loads(r) if r is not None else None) for k, r in rows]
+
     def items(self, stage: str, status: str | None = None) -> list[Item]:
         sql, args = f"SELECT {_COLS} FROM items WHERE stage=?", [stage]
         if status is not None:
@@ -139,6 +152,8 @@ class Stage:
     concurrency: int = 1
     throttle_on: tuple[str, ...] = ()
     max_ahead: int = 0
+    # called after the item is marked done; errors are logged and never fail the item
+    on_done: Callable[[Item, dict | None], None] | None = None
 
 
 @dataclass
@@ -188,7 +203,8 @@ class Pipeline:
                     stopped[name].wait(poll)
                     continue
                 try:
-                    q.complete(name, item.key, stage.worker(item, q))
+                    out = stage.worker(item, q)
+                    q.complete(name, item.key, out)
                 except Blocked as exc:
                     q.release(name, item.key)
                     with state_lock:
@@ -201,6 +217,12 @@ class Pipeline:
                     msg = f"{type(exc).__name__}: {exc}"
                     q.fail(name, item.key, msg)
                     self.log(f"{name}: {item.key} failed: {msg}")
+                else:
+                    if stage.on_done is not None:
+                        try:
+                            stage.on_done(item, out)
+                        except Exception as exc:  # noqa: BLE001 - post-completion hook must not fail the item
+                            self.log(f"{name}: {item.key} on_done failed: {type(exc).__name__}: {exc}")
 
         def runner(stage: Stage) -> None:
             try:
@@ -225,7 +247,7 @@ class Pipeline:
         for t in threads:
             t.join()
         for s in self.stages:
-            n = len(q.items(s.name, "failed"))
+            n = q.count(s.name, "failed")
             if n:
                 result.failed[s.name] = n
         return result

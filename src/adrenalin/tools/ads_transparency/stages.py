@@ -29,7 +29,7 @@ from adrenalin.tools.ads_transparency.rpc import (
 
 STAGE_NAMES = ("list", "detail", "fetch", "extract")
 OEMBED_URL = "https://www.youtube.com/oembed"
-MAX_CURSOR_RESTARTS = 3
+CONTENT_DIR = "content"
 
 # (concurrency, throttle_on, max_ahead), from the plan's backpressure limits.
 _STAGE_CONFIG = {
@@ -72,12 +72,31 @@ def page_key(cursor: str | None) -> str:
     return f"page:{cursor or ''}"
 
 
+def content_file(key: str) -> str:
+    """Run-relative path of a fetched content.js, named per queue item so no two items share a file."""
+    return f"{CONTENT_DIR}/{hashlib.sha1(key.encode()).hexdigest()}.js"
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Unique temp name: several creatives can share one simgad image.
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".part")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
 @dataclass
 class StageContext:
     client: TransparencyClient
     session: PacedSession
     query: Query
     entity: Path
+    run: Path
     cache: ExtractionCache
     codex: CodexRunner | None
     variations: bool = False
@@ -85,6 +104,8 @@ class StageContext:
     ocr: Callable = recognize
     log: Callable[[str], None] = print
     today: Callable[[], date] = date.today
+    # oEmbed must never wait or back off: a fail-fast session sharing the cooldown (defaults to `session`)
+    oembed: PacedSession | None = None
 
 
 class AdsStages:
@@ -92,7 +113,7 @@ class AdsStages:
         self.ctx = ctx
         self._lock = threading.Lock()
         self._oembed_warned = False
-        self._cursor_restarts = 0
+        self._listed = False  # whether this run's list stage has claimed a page yet
 
     def warn(self, message: str) -> None:
         self.ctx.log(f"warning: {message}")
@@ -112,7 +133,8 @@ class AdsStages:
         for name in names:
             concurrency, throttle_on, max_ahead = _STAGE_CONFIG[name]
             out.append(Stage(name, workers[name], concurrency,
-                             tuple(t for t in throttle_on if t in names), max_ahead))
+                             tuple(t for t in throttle_on if t in names), max_ahead,
+                             on_done=self.extract_done if name == "extract" else None))
         return out
 
     # -- list ---------------------------------------------------------------
@@ -126,15 +148,14 @@ class AdsStages:
     def list_page(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
         cursor = item.key.removeprefix("page:") or None
+        with self._lock:
+            resumed, self._listed = not self._listed, True
         try:
             page = ctx.client.search(ctx.query, cursor)
         except ValueError as e:
-            if not cursor:
-                raise
-            with self._lock:
-                self._cursor_restarts += 1
-                restarts = self._cursor_restarts
-            if restarts > MAX_CURSOR_RESTARTS:
+            # Only a cursor carried over from an earlier run can have expired; an error on a cursor
+            # obtained in this run fails the item normally (retried on the next run).
+            if not (cursor and resumed):
                 raise
             ctx.log(f"list: cursor expired, restarting listing ({e})")
             q.set_meta("seen_cursors", "[]")
@@ -184,19 +205,6 @@ class AdsStages:
             raise requests.HTTPError(f"HTTP {resp.status_code} for {url}", response=resp)
         return resp
 
-    def _download(self, url: str, path: Path) -> None:
-        resp = self._get_ok(url)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Unique temp name: several creatives can share one simgad image.
-        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".part")
-        try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(resp.content)
-            os.replace(tmp, path)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-
     def fetch(self, item: Item, q: WorkQueue) -> dict:
         p = preview_from_dict(item.payload.get("preview"))
         result: dict = {}
@@ -205,10 +213,13 @@ class AdsStages:
             rel = f"images/{image_name(p)}.png"
             path = self.ctx.entity / rel
             if not path.exists():
-                self._download(p.url, path)
+                write_atomic(path, self._get_ok(p.url).content)
             result["image_file"] = rel
         elif p is not None:
-            extra["js"] = self._get_ok(p.url).content.decode("utf-8", errors="replace")
+            # The script (often 150-450 KB) goes to a file, never into the queue database.
+            rel = content_file(item.key)
+            write_atomic(self.ctx.run / rel, self._get_ok(p.url).content)
+            extra["content_file"] = rel
         q.put("extract", item.key, {**item.payload, **result, **extra}, update_payload=True)
         return result
 
@@ -216,7 +227,7 @@ class AdsStages:
 
     def _video_title(self, video_id: str) -> str:
         try:
-            resp = self.ctx.session.get(OEMBED_URL, params={"url": watch_url(video_id), "format": "json"},
+            resp = (self.ctx.oembed or self.ctx.session).get(OEMBED_URL, params={"url": watch_url(video_id), "format": "json"},
                                         allow_redirects=True)
             if resp.status_code == 200:
                 data = resp.json()
@@ -242,7 +253,7 @@ class AdsStages:
             self.warn(f"no preview for {item.key}; copy left blank")
             copy = AdCopy()
         elif p.kind == "content_js":
-            copy = parse_content_js(pl.get("js", "")) or parse_overlay_param(p.url)
+            copy = parse_content_js(self._read_js(pl, p)) or parse_overlay_param(p.url)
             if copy is None:
                 self.warn(f"content.js not parsed for {item.key}; copy left blank")
                 copy = AdCopy()
@@ -253,4 +264,19 @@ class AdsStages:
                 ctx.entity / pl["image_file"], image_name(p), pl.get("format", ""),
                 cache=ctx.cache, codex=ctx.codex, force_vision=ctx.vision, ocr=ctx.ocr, warn=self.warn,
             )
-        return {**copy.to_dict(), "video_title": title}
+        return {**copy.to_dict(), "video_title": title, "preview_kind": p.kind if p else ""}
+
+    def _read_js(self, pl: dict, p: Preview) -> str:
+        path = self.ctx.run / pl["content_file"] if pl.get("content_file") else None
+        try:
+            if path is None:
+                raise FileNotFoundError("no content file recorded")
+            data = path.read_bytes()
+        except FileNotFoundError:
+            data = self._get_ok(p.url).content  # file lost (crash, cleanup): download it again
+        return data.decode("utf-8", errors="replace")
+
+    def extract_done(self, item: Item, result: dict | None) -> None:
+        """After the extract item is marked done its content.js file is no longer needed."""
+        if rel := item.payload.get("content_file"):
+            (self.ctx.run / rel).unlink(missing_ok=True)
