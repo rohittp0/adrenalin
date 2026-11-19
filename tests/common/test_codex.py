@@ -115,3 +115,13 @@ def test_codex_live_extracts_rent80():
     }
     out = CodexRunner().extract(FIX / "simgad_image.png", schema, "Return the advertiser brand name shown in this ad image.")
     assert out["brand"] == "Rent80"
+
+
+def test_codex_relative_image_path_is_made_absolute(tmp_path, monkeypatch):
+    (tmp_path / "a.png").write_bytes(b"x")
+    monkeypatch.chdir(tmp_path)
+    fake = FakeRun()
+    CodexRunner(run=fake).extract(Path("a.png"), SCHEMA, "p")
+    argv, _ = fake.calls[0]
+    assert argv[argv.index("-i") + 1] == str((tmp_path / "a.png").resolve())
+    assert argv[-2:] == ["--", "p"]

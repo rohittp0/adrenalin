@@ -46,9 +46,9 @@ class CodexRunner:
             argv = [
                 "codex", "exec", "--skip-git-repo-check", "--sandbox", "read-only",
                 "-m", self.model, "-c", "model_reasoning_effort=low",
-                "-i", str(image),
+                "-i", str(Path(image).resolve()),
                 "--output-schema", str(schema_file), "-o", str(out_file),
-                prompt,
+                "--", prompt,
             ]
             try:
                 proc = self._run(

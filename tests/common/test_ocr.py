@@ -38,3 +38,15 @@ def test_ocr_result_properties():
     assert OcrResult([], "x").confidence == 0.0
     r = OcrResult([OcrLine("a", 0.5, (0, 0, 1, 1)), OcrLine("b", 1.0, (0, 0.5, 1, 1))], "x")
     assert r.text == "a\nb" and r.confidence == 0.75
+
+
+def test_engine_errors_other_than_unavailable_propagate(monkeypatch):
+    from adrenalin.common.ocr import apple_vision, tesseract
+
+    def bad(path):
+        raise ValueError("bad image")
+
+    monkeypatch.setattr(apple_vision, "recognize", bad)
+    monkeypatch.setattr(tesseract, "recognize", bad)
+    with pytest.raises(ValueError, match="bad image"):
+        recognize(FIX / "simgad_text.png")

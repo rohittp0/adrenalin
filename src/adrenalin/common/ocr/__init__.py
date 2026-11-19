@@ -20,6 +20,6 @@ def recognize(path: Path) -> OcrResult:
     for engine in engines:
         try:
             return engine.recognize(Path(path))
-        except Exception:  # missing module/binary: try the next engine
-            continue
+        except (ImportError, FileNotFoundError, tesseract.TesseractNotFound):
+            continue  # engine unavailable: try the next one; other errors propagate
     raise OcrUnavailable(_NO_ENGINE)

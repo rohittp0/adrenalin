@@ -5,6 +5,18 @@ from pathlib import Path
 from .base import OcrLine, OcrResult
 
 
+def _not_found_type() -> type[BaseException]:
+    try:
+        import pytesseract
+
+        return pytesseract.TesseractNotFoundError
+    except ImportError:  # pragma: no cover
+        return ImportError
+
+
+TesseractNotFound = _not_found_type()
+
+
 def recognize(path: Path) -> OcrResult:
     import pytesseract
     from PIL import Image
