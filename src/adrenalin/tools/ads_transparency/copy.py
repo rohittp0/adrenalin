@@ -358,18 +358,23 @@ VISION_SCHEMA = {
         "headline": {"type": "string"},
         "description": {"type": "string"},
         "cta": {"type": "string"},
+        "sitelinks": {"type": "array", "items": {"type": "string"}},
         "full_text": {"type": "string"},
         "confidence": {"type": "number"},
     },
-    "required": ["brand", "display_url", "headline", "description", "cta", "full_text", "confidence"],
+    "required": ["brand", "display_url", "headline", "description", "cta", "sitelinks", "full_text", "confidence"],
     "additionalProperties": False,
 }
+# Bump when the schema or prompt changes: cached Codex results of older versions are then not reused.
+VISION_VERSION = 2
 
 VISION_PROMPT = (
     "This image is a Google ad. Read it and return JSON with: brand (advertiser name), display_url "
-    "(the visible URL, empty if none), headline, description, cta (call-to-action button text, empty if none), "
-    "full_text (all visible text, one line per text line) and confidence (0 to 1, how sure you are). "
-    "Copy text exactly as shown. Use an empty string for anything not present."
+    "(the visible URL, empty if none), headline, description, cta (the text of a call-to-action button such as "
+    "Install or Shop now; empty if there is no button, as in search/text ads), sitelinks (the extra links and "
+    "callouts shown under a search ad, such as link pills, a list of links or a tagged line, one string each, "
+    "in reading order; empty list if none), full_text (all visible text, one line per text line) and "
+    "confidence (0 to 1, how sure you are). Copy text exactly as shown. Use an empty string for anything not present."
 )
 
 
@@ -384,8 +389,17 @@ def _ocr_from_dict(d: dict) -> OcrResult:
     return OcrResult([OcrLine(l["text"], l["confidence"], tuple(l["box"])) for l in d["lines"]], d["method"])
 
 
+def _squash(text) -> str:
+    return " ".join(str(text).split())
+
+
 def _vision_copy(d: dict, model: str) -> AdCopy:
-    c = AdCopy.from_dict({k: v for k, v in d.items() if k not in ("method", "model", "website", "confidence")})
+    c = AdCopy.from_dict({k: v for k, v in d.items()
+                          if k not in ("method", "model", "website", "confidence", "sitelinks")})
+    for f in ("brand", "display_url", "headline", "description", "cta"):
+        setattr(c, f, _squash(getattr(c, f)))
+    links = d.get("sitelinks")
+    c.sitelinks = [t for s in links if (t := _squash(s))] if isinstance(links, list) else []
     c.website = website_from(c.display_url)
     c.method, c.model = "codex", model
     conf = d.get("confidence")
@@ -393,75 +407,83 @@ def _vision_copy(d: dict, model: str) -> AdCopy:
     return c
 
 
+def _vision(path: Path, key: str, cache: ExtractionCache, codex: CodexRunner | None, warn) -> tuple[dict | None, bool]:
+    """Codex fields for an image (cached per model and VISION_VERSION), and whether the call cap deferred it."""
+    if codex is None:
+        return None, False
+    version = f"{codex.model}#v{VISION_VERSION}"
+    if (hit := cache.get(key, "codex", version)) is not None:
+        return hit, False
+    if getattr(codex, "missing", False):
+        return None, False  # codex is not installed: already reported once
+    try:
+        fields = codex.extract(Path(path), VISION_SCHEMA, VISION_PROMPT)
+    except CodexError as e:
+        warn(f"vision extraction failed for {key}: {e}; keeping OCR result")
+        return None, False
+    if fields is None:
+        warn(f"vision limit reached; keeping OCR result for {key}")
+        return None, True
+    if not isinstance(fields, dict):
+        warn(f"vision extraction failed for {key}: unexpected codex output: {type(fields).__name__}; "
+             "keeping OCR result")
+        return None, False
+    cache.put(key, "codex", version, fields)
+    return fields, False
+
+
 def extract_image(
     path: Path, image_id: str, fmt: str, *, cache: ExtractionCache, codex: CodexRunner | None,
     force_vision: bool, ocr=recognize, warn=log, host_exists: Callable[[str], bool] | None = None,
 ) -> AdCopy:
     """Copy of a `simgad` image: OCR + layout rules, Codex when OCR fails or with `force_vision`.
-    `host_exists` (optional, network) verifies the domains OCR read."""
+    `host_exists` (optional, network) verifies the domains OCR read. Raises OcrUnavailable when neither
+    OCR nor Codex could read the image, so the item fails and is retried on the next run."""
     is_text = str(fmt).lower() in ("text", "1")
-    r: OcrResult | None = None
-    ocr_failed = False
-    pending = False
+    key = image_id
 
     def load_ocr() -> OcrResult:
         for method in OCR_METHODS:
-            if (hit := cache.get(image_id, method)) is not None:
+            if (hit := cache.get(key, method)) is not None:
                 return _ocr_from_dict(hit)
         res = ocr(Path(path))
-        cache.put(image_id, res.method, "", _ocr_to_dict(res))
+        cache.put(key, res.method, "", _ocr_to_dict(res))
         return res
 
-    def ocr_copy(res: OcrResult | None) -> AdCopy | None:
-        if res is None:
-            return None
+    def parse(res: OcrResult) -> AdCopy | None:
         c = parse_text_ad_ocr(res) if is_text else parse_image_ad_ocr(res)
         if c is not None and host_exists is not None:
             verify_hosts(c, host_exists)
         return c
 
+    r: OcrResult | None = None
+    no_ocr: OcrUnavailable | None = None
     if not force_vision:
         try:
             r = load_ocr()
-        except OcrUnavailable:
-            if codex is None:
-                raise
-            ocr_failed = True
-    copy = ocr_copy(r)
-
-    if force_vision or ocr_failed or needs_vision(r, copy):
-        if codex is not None:
-            fields = cache.get(image_id, "codex", codex.model)
-            if fields is None:
-                try:
-                    fields = codex.extract(Path(path), VISION_SCHEMA, VISION_PROMPT)
-                    if fields is None:
-                        pending = True
-                        warn(f"vision limit reached; keeping OCR result for {image_id}")
-                    elif not isinstance(fields, dict):
-                        raise CodexError(f"unexpected codex output: {type(fields).__name__}")
-                    else:
-                        cache.put(image_id, "codex", codex.model, fields)
-                except CodexError as e:
-                    fields = None
-                    warn(f"vision extraction failed for {image_id}: {e}; keeping OCR result")
-            if fields is not None:
-                return _vision_copy(fields, codex.model)
-        if r is None and not ocr_failed:  # forced vision yielded nothing: fall back to OCR
+        except OcrUnavailable as e:
+            no_ocr = e
+    copy = parse(r) if r is not None else None
+    pending = False
+    if force_vision or no_ocr is not None or needs_vision(r, copy):
+        fields, pending = _vision(path, key, cache, codex, warn)
+        if fields is not None:
+            return _vision_copy(fields, codex.model)
+        if r is None and no_ocr is None:  # forced vision yielded nothing: fall back to OCR
             try:
                 r = load_ocr()
-            except OcrUnavailable:
-                if codex is None:
-                    raise
-            copy = ocr_copy(r)
+                copy = parse(r)
+            except OcrUnavailable as e:
+                no_ocr = e
+        if r is None:
+            raise no_ocr
 
-    if copy is None and r is not None and r.lines:
+    if copy is None and r.lines:
         copy = parse_image_ad_ocr(r)  # best effort when the text layout did not match
         if is_text:
             copy.cta = ""  # a Text ad has no button; the last short line is a sitelink
         if host_exists is not None:
             verify_hosts(copy, host_exists)
-    if copy is None:
-        copy = AdCopy()
+    copy = copy or AdCopy()
     copy.vision_pending = pending
     return copy

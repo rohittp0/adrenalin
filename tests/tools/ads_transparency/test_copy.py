@@ -7,6 +7,9 @@ from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.ocr import OcrLine, OcrResult, OcrUnavailable
 from adrenalin.common.ocr.codex import CodexError
 from adrenalin.tools.ads_transparency.copy import (
+    VISION_PROMPT,
+    VISION_SCHEMA,
+    VISION_VERSION,
     AdCopy,
     extract_image,
     needs_vision,
@@ -176,7 +179,7 @@ def test_extract_image_falls_back_to_codex_and_records_model(tmp_path):
                           force_vision=False, ocr=lambda p: OcrResult([], "apple_vision"), warn=lambda m: None)
         assert c.method == "codex" and c.model == "gpt-5.6-luna" and c.confidence == 0.9
         assert c.brand == "B" and c.website == "b.com"
-        assert cache.get("img2", "codex", "gpt-5.6-luna")["headline"] == "H"
+        assert cache.get("img2", "codex", f"gpt-5.6-luna#v{VISION_VERSION}")["headline"] == "H"
         # second call is served from cache
         extract_image(tmp_path / "x.png", "img2", "image", cache=cache, codex=codex,
                       force_vision=False, ocr=lambda p: OcrResult([], "apple_vision"), warn=lambda m: None)
@@ -487,5 +490,83 @@ def test_resolvable_host_keeps_ocr_copy(tmp_path):
                           warn=lambda m: None, host_exists=hosts)
         assert (c.display_url, c.website, c.confidence) == ("www.flights70.com/", "flights70.com", 1.0)
         assert hosts.calls == ["flights70.com"]
+    finally:
+        cache.close()
+
+
+# -- no OCR engine: an image nobody could read fails (retried next run) instead of a blank row ----
+
+def _no_ocr(p):
+    raise OcrUnavailable("No OCR engine")
+
+
+@pytest.mark.parametrize("codex", [FakeCodex(exc=CodexError("codex exited 1")), FakeCodex(result=None)],
+                         ids=["codex-error", "codex-limit"])
+@pytest.mark.parametrize("force", [False, True], ids=["ocr-first", "forced-vision"])
+def test_no_ocr_and_no_codex_result_raises(tmp_path, codex, force):
+    cache = _cache(tmp_path)
+    try:
+        with pytest.raises(OcrUnavailable):
+            extract_image(tmp_path / "x.png", "n1", "text", cache=cache, codex=codex, force_vision=force,
+                          ocr=_no_ocr, warn=lambda m: None)
+    finally:
+        cache.close()
+
+
+def test_missing_codex_warns_once(tmp_path):
+    from adrenalin.common.ocr.codex import CodexMissing
+
+    class Missing(FakeCodex):
+        missing = False
+
+        def extract(self, image, schema, prompt):
+            self.calls += 1
+            self.missing = True
+            raise CodexMissing("codex binary not found")
+
+    cache, warnings, codex = _cache(tmp_path), [], Missing()
+    try:
+        for i in range(3):
+            c = extract_image(tmp_path / "x.png", f"w{i}", "text", cache=cache, codex=codex, force_vision=False,
+                              ocr=lambda p: _text_ad_result(0.4), warn=warnings.append)
+            assert c.method == "apple_vision"
+        assert codex.calls == 1 and len(warnings) == 1
+    finally:
+        cache.close()
+
+
+# -- Codex output ---------------------------------------------------------------------------------
+
+def test_vision_schema_asks_for_sitelinks_and_button_only_cta():
+    assert VISION_SCHEMA["properties"]["sitelinks"] == {"type": "array", "items": {"type": "string"}}
+    assert set(VISION_SCHEMA["required"]) == set(VISION_SCHEMA["properties"])
+    assert "sitelinks" in VISION_PROMPT and "button" in VISION_PROMPT
+
+
+def test_vision_copy_collapses_whitespace_except_full_text(tmp_path):
+    cache = _cache(tmp_path)
+    fields = {"brand": "Hotels70", "display_url": "www.hotels70.com/", "headline": "Stop Overpaying - Price\nDrop",
+              "description": "Don't just book,\n discover!  Hotels70", "cta": "",
+              "sitelinks": ["Last-Minute\nDeals", " ", "Book Hotels70"], "full_text": "Hotels70\nStop", "confidence": 1}
+    try:
+        c = extract_image(tmp_path / "x.png", "v1", "text", cache=cache, codex=FakeCodex(fields),
+                          force_vision=True, ocr=_never, warn=lambda m: None)
+        assert (c.headline, c.description) == ("Stop Overpaying - Price Drop", "Don't just book, discover! Hotels70")
+        assert c.sitelinks == ["Last-Minute Deals", "Book Hotels70"] and c.cta == ""
+        assert c.full_text == "Hotels70\nStop" and c.confidence == 1.0 and c.model == "gpt-5.6-luna"
+    finally:
+        cache.close()
+
+
+def test_codex_cache_is_versioned(tmp_path):
+    cache = _cache(tmp_path)
+    try:
+        # a result cached before sitelinks were asked for is not reused
+        cache.put("simgad:v2", "codex", "gpt-5.6-luna", {"brand": "Old", "cta": "Last-Minute Deals"})
+        cache.put("v2", "codex", "gpt-5.6-luna", {"brand": "Old", "cta": "Last-Minute Deals"})
+        codex = FakeCodex({"brand": "New", "sitelinks": ["A link"], "confidence": 0.9})
+        c = extract_image(tmp_path / "x.png", "v2", "text", cache=cache, codex=codex, force_vision=True,
+                          ocr=_never, warn=lambda m: None)
+        assert (c.brand, c.sitelinks, codex.calls, c.model) == ("New", ["A link"], 1, "gpt-5.6-luna")
     finally:
         cache.close()

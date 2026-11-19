@@ -125,3 +125,23 @@ def test_codex_relative_image_path_is_made_absolute(tmp_path, monkeypatch):
     argv, _ = fake.calls[0]
     assert argv[argv.index("-i") + 1] == str((tmp_path / "a.png").resolve())
     assert argv[-2:] == ["--", "p"]
+
+
+def test_missing_codex_binary_trips_a_breaker(tmp_path):
+    from adrenalin.common.ocr.codex import CodexMissing
+
+    img = tmp_path / "a.png"
+    img.write_bytes(b"x")
+    calls = []
+
+    def missing(argv, **kw):
+        calls.append(argv)
+        raise FileNotFoundError("codex")
+
+    runner = CodexRunner(limit=2, run=missing)
+    for _ in range(5):
+        with pytest.raises(CodexMissing):
+            runner.extract(img, SCHEMA, "p")
+    assert len(calls) == 1 and runner.missing
+    assert runner.calls == 0 and runner.skipped == 0  # no Codex call happened: the cap is not used up
+    assert issubclass(CodexMissing, CodexError)

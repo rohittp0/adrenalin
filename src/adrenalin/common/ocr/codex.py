@@ -14,6 +14,10 @@ class CodexError(RuntimeError):
     """The codex CLI failed, timed out or is not installed."""
 
 
+class CodexMissing(CodexError):
+    """The codex binary is not installed. Raised for every later call too, without trying again."""
+
+
 class CodexRunner:
     def __init__(
         self,
@@ -31,9 +35,12 @@ class CodexRunner:
         self._lock = threading.Lock()
         self.calls = 0
         self.skipped = 0
+        self.missing = False  # circuit breaker: set once the binary is found missing
 
     def extract(self, image: Path, schema: dict, prompt: str) -> dict | None:
         with self._lock:
+            if self.missing:
+                raise CodexMissing("codex binary not found")
             if self.calls >= self.limit:
                 self.skipped += 1
                 return None
@@ -56,7 +63,10 @@ class CodexRunner:
                     capture_output=True, text=True, timeout=self.timeout,
                 )
             except FileNotFoundError as e:
-                raise CodexError(f"codex binary not found: {e}") from e
+                with self._lock:
+                    self.missing = True
+                    self.calls -= 1  # nothing ran: don't use up the cap
+                raise CodexMissing(f"codex binary not found: {e}") from e
             except subprocess.TimeoutExpired as e:
                 raise CodexError(f"codex timed out after {self.timeout}s") from e
             if proc.returncode != 0:

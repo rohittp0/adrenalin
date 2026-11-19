@@ -11,7 +11,7 @@ import pytest
 import requests
 
 from adrenalin.common.http import Cooldown, PacedSession
-from adrenalin.common.ocr import OcrLine, OcrResult
+from adrenalin.common.ocr import OcrLine, OcrResult, OcrUnavailable
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.output import EntityCollision
 from adrenalin.common.pipeline import WorkQueue
@@ -504,6 +504,49 @@ def test_second_vision_run_retries_failed_codex(tmp_path):
     assert {r["extraction_method"] for r in first if r["image_file"]} == {"apple_vision"}
     rows = read_rows(run_scrape(tmp_path, fake, vision=True))
     assert {r["extraction_method"] for r in rows if r["image_file"]} == {"codex"}
+
+
+def no_ocr(path):
+    raise OcrUnavailable("No OCR engine: install tesseract")
+
+
+@pytest.mark.parametrize("codex_run", ["exit-1", "missing"])
+def test_no_ocr_engine_and_no_codex_fails_image_items(tmp_path, codex_run):
+    fake, calls = FakeGoogle(), []
+
+    def run(argv, **kwargs):
+        calls.append(argv)
+        if codex_run == "missing":
+            raise FileNotFoundError("codex")
+        return subprocess.CompletedProcess(argv, 1, "", "codex down")
+
+    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=no_ocr,
+                 codex=codex(run=run), log=lambda m: None, poll=POLL)
+    assert res.failed == {"extract": SIMGAD_CREATIVES} and res.rows == 40
+    rows = read_rows(res)
+    assert not any(r["extraction_method"] for r in rows if r["image_file"])  # no blank "done" rows
+    if codex_run == "missing":
+        assert 1 <= len(calls) <= 2  # circuit breaker: only calls already in flight (2 extract workers)
+    else:
+        assert len(calls) == SIMGAD_CREATIVES
+
+
+def test_cli_exits_1_when_no_ocr_engine_and_no_codex(tmp_path, monkeypatch, capsys):
+    from adrenalin.cli import main
+    from adrenalin.tools.ads_transparency import api
+
+    fake = FakeGoogle()
+    real = api.scrape
+
+    def scrape_offline(options, **kw):
+        def missing(argv, **kwargs):
+            raise FileNotFoundError("codex")
+        return real(options, session=make_session(tmp_path, fake), ocr=no_ocr, codex=codex(run=missing),
+                    log=lambda m: None, poll=POLL)
+
+    monkeypatch.setattr(api, "scrape", scrape_offline)
+    assert main(["ads-transparency", AR, "--out", str(tmp_path)]) == 1
+    assert f"extract: {SIMGAD_CREATIVES}" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("reply", [SORRY, response(429, b"slow down")], ids=["sorry", "429"])
