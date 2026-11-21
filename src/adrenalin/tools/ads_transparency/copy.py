@@ -117,7 +117,8 @@ def _app_install_data(s: str) -> dict[str, str]:
     keys are absent."""
     if not re.search(r"'layout':\s*'uac_youtube_video_v2'", s):
         return {}
-    out = {k: (m.group(1) if (m := re.search(r"'" + k + r"':\s*'([^']*)'", s)) else "") for k in _APP_KEYS}
+    # a value ends at a quote followed by the next key or the dict's end, so "Rio's" stays whole
+    out = {k: (m.group(1) if (m := re.search(r"'" + k + r"':\s*'(.*?)'(?=\s*[,}])", s)) else "") for k in _APP_KEYS}
     return out if out["shortAppName"] or out["appName"] or out["shortDescription"] else {}
 
 

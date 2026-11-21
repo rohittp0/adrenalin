@@ -331,3 +331,16 @@ def test_derive_keeps_adaptive_config_with_fresh_state(tmp_path):
     e = _adaptive_env(tmp_path, start=0.5, replies=[resp(503)])
     e.session.get("https://img.com/x")
     assert e.session.derive().interval("img.com") == 0.5
+
+
+def test_adaptive_slows_on_connection_errors_and_timeouts(tmp_path):
+    for exc in (requests.ConnectionError("reset"), requests.Timeout("read timed out")):
+        e = _adaptive_env(tmp_path / type(exc).__name__, start=0.5)
+
+        def broken(method, url, exc=exc, **kwargs):
+            raise exc
+
+        e.session._transport = broken
+        with pytest.raises(type(exc)):
+            e.session.get("https://img.com/x")
+        assert e.session.interval("img.com") == 1.0

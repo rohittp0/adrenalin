@@ -550,7 +550,7 @@ def test_summary_written_with_status_counts_and_accounts(tmp_path):
     assert summary["listed"] == res.rows == res.listed
     assert sum(summary["copy_status"].values()) == res.rows
     assert set(summary["copy_status"]) <= set(COPY_STATUSES)
-    assert summary["coverage"] is None and summary["sampling"] is None and summary["buckets"] == []
+    assert summary["coverage"] is None and summary["sampling"] is None and summary["groups"] == []
     assert {"busy", "waiting"} <= set(next(iter(summary["stage_seconds"].values())))
     for a in summary["ads_accounts"]:
         assert a["ads_account_id"] and a["source"] in ("exposed", "inferred")
@@ -1100,10 +1100,10 @@ def test_large_inventory_samples_and_stops_at_coverage(tmp_path, small_limits):
     assert res.coverage == summary["coverage"]
     assert summary["sampling"]["p"] == 5 / 600
     groups = Counter(group_of(r) for r in rows)
-    assert {b["bucket"]: b["inventory"] for b in summary["buckets"]} == dict(groups)
-    for b in summary["buckets"]:
-        assert b["read"] >= min(sampling.MIN_PER_BUCKET, b["inventory"])
-        assert set(b) == {"bucket", "inventory", "read", "messages", "coverage"}
+    assert {b["bucket"]: b["inventory"] for b in summary["groups"]} == dict(groups)
+    for b in summary["groups"]:
+        assert b["processed"] >= min(sampling.MIN_PER_BUCKET, b["inventory"])
+        assert set(b) == {"bucket", "inventory", "processed", "messages", "coverage"}
     assert fake.calls["simgad"] < SIMGAD_CREATIVES
 
 
@@ -1184,8 +1184,8 @@ def test_variations_with_sampling(tmp_path, small_limits):
         assert len(rs) == (2 if c in admitted else 1)
         assert len({r["copy_status"] for r in rs}) == 1 and len({r["sample_weight"] for r in rs}) == 1
     summary = summary_of(res)
-    assert sum(b["inventory"] for b in summary["buckets"]) == 40
-    assert sum(b["read"] for b in summary["buckets"]) == len(admitted)
+    assert sum(b["inventory"] for b in summary["groups"]) == 40
+    assert sum(b["processed"] for b in summary["groups"]) == len(admitted)
 
 
 def test_sample_weight_per_bucket(tmp_path, small_limits):
@@ -1195,7 +1195,7 @@ def test_sample_weight_per_bucket(tmp_path, small_limits):
     weights: Counter = Counter()
     for r in processed(rows):
         weights[group_of(r)] += float(r["sample_weight"])
-    buckets = summary_of(res)["buckets"]
+    buckets = summary_of(res)["groups"]
     assert buckets
     for b in buckets:
         assert weights[b["bucket"]] == pytest.approx(b["inventory"], abs=1e-6)
@@ -1255,7 +1255,7 @@ def test_no_readable_messages_stops_after_the_minimums(tmp_path, small_limits):
     rows = read_rows(res)
     assert len(rows) == SIMGAD_CREATIVES and not any(r["headline"] for r in rows)
     # every group's minimum, then stop: Coverage can't be estimated, so reading on would read everything
-    floor = sum(min(sampling.MIN_PER_BUCKET, b["inventory"]) for b in summary_of(res)["buckets"])
+    floor = sum(min(sampling.MIN_PER_BUCKET, b["inventory"]) for b in summary_of(res)["groups"])
     assert len(processed(rows)) == floor < SIMGAD_CREATIVES
     assert any(f"Coverage unknown: no readable Messages after {floor} Creatives" in m for m in logs)
 
@@ -1332,7 +1332,7 @@ def test_variations_weights_follow_variation_1(tmp_path, small_limits):
         if r["variation"] == "1" and r["sample_weight"]:
             weights[group[r["creative_id"]]] += float(r["sample_weight"])
     res = run_scrape(tmp_path, fake, variations=True, stage="export")
-    buckets = [b for b in summary_of(res)["buckets"] if b["read"]]
+    buckets = [b for b in summary_of(res)["groups"] if b["processed"]]
     assert buckets and res.rows == len(rows)
     for bucket in buckets:
         assert weights[bucket["bucket"]] == pytest.approx(bucket["inventory"], abs=1e-6)
@@ -1413,7 +1413,7 @@ def test_max_ads_samples_an_inventory_within_the_full_read_limit(tmp_path, monke
     meta, held = stored_sampling(tmp_path)
     assert meta["p"] == 10 / 600 and held > 0
     assert any(r["copy_status"] == "not_sampled" for r in rows)
-    floor = sum(min(sampling.MIN_PER_BUCKET, b["inventory"]) for b in summary_of(res)["buckets"])
+    floor = sum(min(sampling.MIN_PER_BUCKET, b["inventory"]) for b in summary_of(res)["groups"])
     assert len(processed(rows)) <= 10 + floor
 
 
@@ -1578,3 +1578,74 @@ def test_round_judges_only_processed_creatives(tmp_path):
     assert out["admitted"] == 0 and not out.get("deferred")  # A3 was read and has no Message: stop
     assert any("no readable Message" in m for m in logs)
     q.close()
+
+
+def test_cli_prints_incomplete_and_blocked_once(tmp_path, monkeypatch, capsys):
+    from adrenalin.cli import main
+    from adrenalin.tools.ads_transparency import api
+
+    p1, _ = two_pages()
+    fake = FakeGoogle(search=lambda req: SORRY if req.get("4") == "CUR1" else p1)
+    real = api.scrape
+    monkeypatch.setattr(api, "scrape", lambda options, **kw: real(
+        options, session=make_session(tmp_path, fake), ocr=fake_ocr, codex=codex(), poll=POLL, **kw))
+    assert main(["ads-transparency", AR, "--out", str(tmp_path)]) == 2
+    err = capsys.readouterr().err.splitlines()
+    assert sum(ln.startswith("INCOMPLETE:") for ln in err) == 1 and err[-1].startswith("INCOMPLETE:")
+    assert sum(ln.startswith("blocked until") for ln in err) == 1
+    assert any("list: blocked" in ln for ln in err)  # the stage's own log line is kept
+
+
+def test_stage_export_keeps_the_sampling_options_and_stage_times(tmp_path, small_limits):
+    fake = FakeGoogle()
+    first = summary_of(run_scrape(tmp_path, fake, coverage=0.5, max_ads=30))
+    assert first["stage_seconds"]
+    again = summary_of(run_scrape(tmp_path, fake, stage="export"))
+    assert (again["sampling"]["target"], again["sampling"]["max_ads"]) == (0.5, 30)
+    assert again["stage_seconds"] == first["stage_seconds"]
+
+
+@pytest.mark.parametrize("opts", [{"coverage": 0}, {"coverage": 1}, {"coverage": 1.5}, {"max_ads": 0}])
+def test_scrape_options_reject_bad_coverage_and_max_ads(opts):
+    with pytest.raises(ValueError):
+        ScrapeOptions(AR, **opts)
+
+
+def test_broken_preview_with_unparsable_detail_is_confirmed_after_3_runs(tmp_path):
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    fake.detail_reply = response(body={"1": {}})  # permanently unparsable
+    for _ in range(4):
+        assert run_scrape(tmp_path, fake).failed == {}
+    assert fake.calls["detail"] == 3
+    got = extract_results(tmp_path)[broken_key(tmp_path)]
+    assert got["preview_broken"] and not got["broken_unverified"]
+
+
+def test_broken_preview_blocked_detail_does_not_use_up_the_checks(tmp_path):
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    fake.detail_reply = SORRY
+    clock = Clock()
+    session = make_session(tmp_path, fake, clock)
+    for _ in range(4):
+        run_scrape(tmp_path, fake, session=session)
+        clock.now += 1000
+    assert extract_results(tmp_path)[broken_key(tmp_path)]["broken_unverified"]
+
+
+def test_max_ads_below_the_group_minimums_warns(tmp_path, small_limits):
+    logs = []
+    scrape(ScrapeOptions(AR, out=tmp_path, max_ads=5), session=make_session(tmp_path, FakeGoogle()),
+           ocr=fake_ocr, codex=codex(), log=logs.append, poll=POLL)
+    assert any(m.startswith("warning: --max-ads 5 is below the group minimums") for m in logs)
+
+
+def test_rerun_with_a_different_max_ads_notes_the_kept_head_start(tmp_path, small_limits):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    logs = []
+    scrape(ScrapeOptions(AR, out=tmp_path, max_ads=3), session=make_session(tmp_path, fake), ocr=fake_ocr,
+           codex=codex(), log=logs.append, poll=POLL)
+    assert stored_sampling(tmp_path)[0]["p"] == 5 / 600
+    assert any(m.startswith("note: the head start was set by this run folder's first run") for m in logs)

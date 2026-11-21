@@ -113,7 +113,8 @@ def describe_response(resp: requests.Response, read_body: bool = True) -> str:
 @dataclass(frozen=True)
 class AdaptivePace:
     """A host's pace that adapts: `speedup` x after `clean_streak` clean responses in a row (down to
-    `floor`), `slowdown` x on a 429, 5xx or block (up to `ceiling`). Intervals are in seconds."""
+    `floor`), `slowdown` x on a 429, 5xx, block, timeout or connection error (up to `ceiling`). Intervals are in
+    seconds."""
     start: float
     floor: float
     ceiling: float
@@ -177,7 +178,7 @@ class PacedSession:
         return self._intervals.get(host, self._default_interval)[0]
 
     def _record(self, host: str, clean: bool) -> None:
-        """Feed an adaptive host's pace one response: clean, or a 429, 5xx or block."""
+        """Feed an adaptive host's pace one response: clean, or a 429, 5xx, block or network error."""
         cfg = self._adaptive.get(host)
         if cfg is None:
             return
@@ -230,7 +231,11 @@ class PacedSession:
                 with self._proxy_lock:
                     p = next(self._proxies)
                 send["proxies"] = {"http": p, "https": p}
-            resp = self._transport(method, url, **send)
+            try:
+                resp = self._transport(method, url, **send)
+            except requests.RequestException:
+                self._record(host, clean=False)  # a timeout or dropped connection is a sign to slow down too
+                raise
 
             # stream=True callers (the host check) never download the body, so only the URL tells a block
             read_body = not kwargs.get("stream")

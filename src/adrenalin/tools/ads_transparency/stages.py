@@ -25,6 +25,7 @@ from adrenalin.tools.ads_transparency.rpc import (
     PaginationLoop,
     Preview,
     Query,
+    RpcError,
     TransparencyClient,
 )
 from adrenalin.tools.ads_transparency.sample_queue import (
@@ -42,6 +43,9 @@ from adrenalin.tools.ads_transparency.sample_queue import (
 STAGE_NAMES = ("list", "sample", "detail", "fetch", "script", "extract")
 OEMBED_URL = "https://www.youtube.com/oembed"
 CONTENT_DIR = "content"
+# runs whose detail response for a Broken Preview's Creative could not be parsed before the Preview counts as
+# confirmed broken: a response that stays unparsable would otherwise cost one RPC on every run
+UNPARSABLE_DETAIL_RUNS = 3
 
 # (concurrency, throttle_on, max_ahead), from the plan's backpressure limits.
 # A stage that throttles on a blocked stage stops with it (see Pipeline): list and detail stop when script is
@@ -359,8 +363,14 @@ class AdsStages:
         else:
             copy = self._read_image(ctx.entity / pl["image_file"], p, pl.get("format", ""))
             if copy.preview_broken and not ctx.variations:  # with variations, sibling rows carry their own copy
-                copy, used, unverified = self._recover_broken(item, p, pl.get("format", ""), copy)
-                extra = {"variation_used": used.n if used else 0, "broken_unverified": unverified}
+                copy, used, unverified, unparsable = self._recover_broken(item, p, pl.get("format", ""), copy)
+                checks = pl.get("unparsable_checks", 0) + unparsable
+                if unparsable and checks >= UNPARSABLE_DETAIL_RUNS:
+                    self.warn(f"Broken Preview for {item.key}: its detail response could not be parsed on "
+                              f"{checks} runs; taken as broken without checking its other Variations")
+                    unverified = False
+                extra = {"variation_used": used.n if used else 0, "broken_unverified": unverified,
+                         "unparsable_checks": checks}
                 if used:  # the row shows the Variation that was read
                     extra |= {"preview_url": used.alt.url, "image_file": used.rel}
         return {**copy.to_dict(), "video_title": title, "title_pending": title_pending,
@@ -372,10 +382,11 @@ class AdsStages:
                              ocr=ctx.ocr, warn=self.warn, host_exists=ctx.host_exists)
 
     def _recover_broken(self, item: Item, p: Preview, fmt: str,
-                        broken: AdCopy) -> tuple[AdCopy, _Recovered | None, bool]:
+                        broken: AdCopy) -> tuple[AdCopy, _Recovered | None, bool, bool]:
         """The Preview is Google's error page. Read the Creative's other image Variations and use the first that
         is not broken. Returns (copy, the Variation used or None, whether the Variations could not be checked:
-        a block, network or RPC error, retried on the next run)."""
+        a block, network or RPC error, retried on the next run, and whether that was because the detail response
+        could not be parsed)."""
         ctx = self.ctx
         try:
             previews = ctx.client.variations(ctx.query.advertiser_id, item.key.split("#")[0])
@@ -388,12 +399,13 @@ class AdsStages:
                     write_atomic(path, self._get_ok(alt.url).content)
                 copy = self._read_image(path, alt, fmt)
                 if not copy.preview_broken:
-                    return copy, _Recovered(n, alt, rel), False
+                    return copy, _Recovered(n, alt, rel), False, False
         except (Blocked, requests.RequestException, ValueError) as e:  # ValueError: RpcError, unparsable detail
             self.warn(f"Broken Preview for {item.key}: could not check its other Variations "
                       f"({type(e).__name__}: {e}); retrying on the next run")
-            return broken, None, True
-        return broken, None, False
+            unparsable = isinstance(e, ValueError) and not isinstance(e, RpcError)
+            return broken, None, True, unparsable
+        return broken, None, False, False
 
     def retry_titles(self, q: WorkQueue) -> None:
         """Fetch the video titles that failed temporarily on an earlier run, from the stored video ID. Only the
