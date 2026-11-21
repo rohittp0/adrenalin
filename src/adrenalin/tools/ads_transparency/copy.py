@@ -585,3 +585,29 @@ def extract_image(
     copy = copy or AdCopy()
     copy.vision_pending = pending
     return copy
+
+
+COPY_STATUSES = ("read", "not_sampled", "pending", "no_copy", "preview_broken", "unreadable")
+
+
+def copy_status(extract_status: str | None, result: dict | None, held: bool = False) -> str:
+    """Why a row has or lacks copy. `extract_status` is the extract item's status (None: no item yet);
+    `held` is a Creative left out of the sample. `result["format"]` is the Creative's format, when known."""
+    if held:
+        return "not_sampled"
+    if extract_status != "done":
+        return "pending"
+    r = result or {}
+    if r.get("preview_broken"):
+        return "preview_broken"
+    if r.get("content_unparsed"):
+        return "unreadable"
+    if any(r.get(k) for k in ("brand", "headline", "description", "display_url")):
+        return "read"
+    if r.get("vision_pending"):
+        return "pending"  # the Codex read was deferred (cap or breaker), so "no copy" is not known yet
+    if r.get("preview_kind") == "content_js":
+        return "no_copy"
+    if r.get("preview_kind") == "image" and not r.get("full_text") and r.get("format") in ("image", "video"):
+        return "no_copy"
+    return "unreadable"

@@ -102,6 +102,20 @@ class WorkQueue:
                 "WHERE stage=? AND key=?",
                 [(stage, k) for k in keys])
 
+    def move(self, stage_from: str, stage_to: str, keys: Iterable[str]) -> None:
+        """Move items to another stage as fresh pending work, in one transaction. A key the target stage already
+        has keeps the target's item; the source item is dropped either way."""
+        rows = [(stage_to, stage_from, k) for k in keys]
+        with self._lock, self._db:
+            self._db.executemany(
+                "UPDATE OR IGNORE items SET stage=?, status='pending', result=NULL, error=NULL, attempts=0 "
+                "WHERE stage=? AND key=?", rows)
+            self._db.executemany("DELETE FROM items WHERE stage=? AND key=?", [(s, k) for _, s, k in rows])
+
+    def has(self, stage: str, key: str) -> bool:
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM items WHERE stage=? AND key=?", (stage, key)).fetchone() is not None
+
     def backlog(self, *stages: str) -> int:
         if not stages:
             return 0

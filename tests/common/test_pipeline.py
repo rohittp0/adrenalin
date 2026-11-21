@@ -309,3 +309,25 @@ def test_on_done_runs_after_complete_and_its_errors_do_not_fail_the_item(tmp_pat
     assert res.failed == {} and q.count("A", "done") == 2
     assert any("cleanup failed" in m for m in logs)
     q.close()
+
+
+def test_move_changes_stage_and_resets_status(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("held", "1", {"v": 1})
+    q.put("held", "2", {"v": 2})
+    q.put("held", "3", {"v": 3})
+    q.put("fetch", "3", {"v": 30})
+    q.move("held", "fetch", ["1", "3", "missing"])
+    assert [i.key for i in q.items("held")] == ["2"]
+    got = {i.key: i for i in q.items("fetch")}
+    assert got["1"].payload == {"v": 1} and got["1"].status == "pending"
+    assert got["3"].payload == {"v": 30}  # the target's item wins; the source copy is dropped
+    assert q.backlog("fetch") == 2 and q.claim("fetch").key == "1"
+    q.close()
+
+
+def test_has(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {})
+    assert q.has("A", "1") and not q.has("A", "2") and not q.has("B", "1")
+    q.close()

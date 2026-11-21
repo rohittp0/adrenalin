@@ -49,8 +49,15 @@ def coverage(messages: Sequence[str]) -> float | None:
     return 1 - singletons / n
 
 
-def admit_probability(estimate: int | None, read_all: bool = False) -> float:
-    if read_all or estimate is None or estimate <= FULL_READ_LIMIT:
+def admit_probability(estimate: int | None, read_all: bool = False, max_ads: int | None = None) -> float:
+    """Head-start admission probability: about HEAD_START Creatives (or `max_ads`, if fewer) of the estimate.
+    `max_ads` below the estimate overrides the full read of a small Inventory; `read_all` wins over everything, and
+    without an estimate every Creative is admitted."""
+    if read_all or estimate is None:
+        return 1.0
+    if max_ads is not None and estimate > max_ads:
+        return min(HEAD_START, max_ads) / estimate
+    if estimate <= FULL_READ_LIMIT:
         return 1.0
     return HEAD_START / estimate
 

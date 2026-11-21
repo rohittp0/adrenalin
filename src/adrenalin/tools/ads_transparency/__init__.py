@@ -37,6 +37,13 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--vision-model", default=DEFAULT_VISION_MODEL,
                    help=f"Codex model for vision (default {DEFAULT_VISION_MODEL}, or $ADRENALIN_VISION_MODEL)")
     p.add_argument("--vision-limit", type=int, default=200, help="max Codex calls per run (default 200)")
+    p.add_argument("--all", action="store_true", dest="read_all",
+                   help="read every Creative's copy, even when the Inventory is large enough to sample")
+    p.add_argument("--coverage", type=float, default=0.95,
+                   help="sampled runs: read until this share of Messages is found, 0 < x < 1 (default 0.95)")
+    p.add_argument("--max-ads", type=int, metavar="N",
+                   help="read copy for at most N Creatives, even for a small Inventory; the cap may be exceeded "
+                        "only by the per-bucket minimum of 3 (no effect without Google's count estimate)")
     p.add_argument("--wait-on-block", action="store_true", help="wait out Google blocks instead of exiting")
     p.add_argument("--stage", choices=("list", "fetch", "extract", "export"), help="run one stage only")
     p.add_argument("--out", type=Path, default=Path("out"), help="output root (default out/)")
@@ -68,12 +75,17 @@ def run(args: argparse.Namespace) -> int:
         parser.error(str(e))
     if args.vision_limit < 0:
         parser.error("--vision-limit must be 0 or more")
+    if not 0 < args.coverage < 1:
+        parser.error("--coverage must be between 0 and 1 (exclusive)")
+    if args.max_ads is not None and args.max_ads < 1:
+        parser.error("--max-ads must be at least 1")
 
     options = api.ScrapeOptions(
         advertiser_id=args.advertiser_id, region=args.region, start=start, end=end,
         variations=args.variations, vision=args.vision, vision_model=args.vision_model,
         vision_limit=args.vision_limit, wait_on_block=args.wait_on_block, stage=args.stage,
         out=args.out, proxies=tuple(args.proxies), progress=args.progress,
+        read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
     )
     try:
         res = api.scrape(options)

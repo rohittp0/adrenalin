@@ -1,4 +1,4 @@
-"""Queue stages of an ads-transparency scrape: list, detail, fetch and extract (ADR 0001)."""
+"""Queue stages of an ads-transparency scrape: list, sample, detail, fetch and extract (ADR 0001, ADR 0003)."""
 from __future__ import annotations
 
 import hashlib
@@ -18,6 +18,7 @@ from adrenalin.common.http import Blocked, PacedSession
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.pipeline import Item, Stage, WorkQueue
+from adrenalin.tools.ads_transparency import sample_queue, sampling
 from adrenalin.tools.ads_transparency.copy import AdCopy, extract_image, parse_content_preview
 from adrenalin.tools.ads_transparency.rpc import (
     ListedCreative,
@@ -26,10 +27,19 @@ from adrenalin.tools.ads_transparency.rpc import (
     Query,
     TransparencyClient,
 )
+from adrenalin.tools.ads_transparency.sample_queue import (
+    HELD,
+    listing_key,
+    listing_stage,
+    sample_group,
+    sampling_meta,
+    seed_round,
+)
 
 # fetch downloads images; content.js Previews go on to `script`, which has its own (slower) host, so a
-# block there stops only script downloads.
-STAGE_NAMES = ("list", "detail", "fetch", "script", "extract")
+# block there stops only script downloads. `sample` admits held Creatives into the Copy sample in rounds (ADR 0003);
+# `held` is a queue stage no worker claims: listed Creatives left out of the sample so far.
+STAGE_NAMES = ("list", "sample", "detail", "fetch", "script", "extract")
 OEMBED_URL = "https://www.youtube.com/oembed"
 CONTENT_DIR = "content"
 
@@ -38,6 +48,9 @@ CONTENT_DIR = "content"
 # blocked, while fetch, which doesn't wait on script, keeps downloading images.
 _STAGE_CONFIG = {
     "list": (1, ("detail", "fetch", "script", "extract"), 200),
+    # a round decides on complete reads only, so it waits until every admitted Creative has been read
+    # and, through `list`, until the listing is done: a round left pending by an earlier run waits out a relist
+    "sample": (1, ("list", "detail", "fetch", "script", "extract"), 0),
     "detail": (1, ("fetch", "script", "extract"), 50),
     "fetch": (4, ("extract",), 50),
     "script": (1, ("extract",), 50),
@@ -127,6 +140,10 @@ class StageContext:
     oembed: PacedSession | None = None
     # verifies domains read by OCR (None: no network check)
     host_exists: Callable[[str], bool] | None = None
+    # Copy sample: read every Creative, the Coverage target, and an optional cap on Creatives read
+    read_all: bool = False
+    coverage: float = 0.95
+    max_ads: int | None = None
 
 
 class AdsStages:
@@ -149,10 +166,10 @@ class AdsStages:
         elif only == "extract":
             names = ("extract",)
         else:
-            names = STAGE_NAMES
+            names = STAGE_NAMES  # `sample` runs only here: it admits by Coverage, so it needs reads to happen
         names = tuple(n for n in names if n != "detail" or self.ctx.variations)
-        workers = {"list": self.list_page, "detail": self.detail, "fetch": self.fetch, "script": self.script,
-                   "extract": self.extract}
+        workers = {"list": self.list_page, "sample": self.sample, "detail": self.detail, "fetch": self.fetch,
+                   "script": self.script, "extract": self.extract}
         out = []
         for name in names:
             concurrency, throttle_on, max_ahead = _STAGE_CONFIG[name]
@@ -186,15 +203,21 @@ class AdsStages:
             self._put_page(q, None)
             return {"restarted": True}
 
+        estimate = page.count_high or page.count_low
+        p = self._admit_probability(q, estimate)
+        target = listing_stage(ctx.variations)
         for c in page.creatives:
-            fields = creative_fields(c)
-            if ctx.variations:
-                q.put("detail", c.creative_id, {**fields, "preview": preview_to_dict(c.preview)},
-                      update_payload=True)
+            fields = creative_fields(c) | ({} if ctx.variations else {"variation": 1})
+            payload = {**fields, "preview": preview_to_dict(c.preview)}
+            key = listing_key(c.creative_id, ctx.variations)
+            # Admitted at random (the head start), or already admitted by a round and now listed again.
+            if q.has(target, key) or sampling.admitted(c.creative_id, p):
+                q.put(target, key, payload, update_payload=True)
             else:
-                q.put("fetch", f"{c.creative_id}#1",
-                      {**fields, "variation": 1, "preview": preview_to_dict(c.preview)}, update_payload=True)
-        if estimate := page.count_high or page.count_low:
+                # `bucket` is for inspection; rounds recompute the group, so a relist's new dates count.
+                q.put(HELD, key, {**payload, "bucket": sample_group(payload, ctx.query, ctx.today())},
+                      update_payload=True)
+        if estimate:
             q.set_meta("count_estimate", str(estimate))  # Google's rough total, for progress display
         if page.skipped:
             self.warn(f"skipped {page.skipped} malformed creative(s) on {item.key}")
@@ -212,7 +235,26 @@ class AdsStages:
             self._put_page(q, nxt)
         else:
             q.set_meta("list_done", ctx.today().isoformat())
+            if q.count(HELD, "pending"):
+                seed_round(q)  # before this page completes, so the sample stage can't finish first
         return {"creatives": len(page.creatives), "next_cursor": nxt}
+
+    def _admit_probability(self, q: WorkQueue, estimate: int | None) -> float:
+        """The run's admission probability: set from the first listed page's estimate, never recomputed."""
+        meta = sampling_meta(q)
+        if "p" not in meta:
+            # Cursor pages may carry no estimate: fall back to one stored from an earlier page.
+            estimate = estimate or int(q.get_meta("count_estimate") or 0) or None
+            meta["p"] = sampling.admit_probability(estimate, self.ctx.read_all, self.ctx.max_ads)
+            q.set_meta("sampling", json.dumps(meta))
+        return meta["p"]
+
+    # -- sample -------------------------------------------------------------
+
+    def sample(self, item: Item, q: WorkQueue) -> dict:
+        ctx = self.ctx
+        return sample_queue.run_round(q, item, sample_queue.RoundSettings(
+            ctx.variations, ctx.query, ctx.today(), ctx.read_all, ctx.coverage, ctx.max_ads), ctx.log)
 
     # -- detail -------------------------------------------------------------
 

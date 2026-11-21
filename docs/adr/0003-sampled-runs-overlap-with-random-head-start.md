@@ -9,4 +9,5 @@ When an Advertiser's Inventory is too large to read in full, the run reads only 
 ## Consequences
 
 - Runs whose Inventory is within the full-read limit admit every Creative, so they behave exactly as before.
+- At a small `p` (for example 2,000 of 90K Creatives) reading never builds the backlog needed to throttle listing, so the listing is paced only by the RPC interval (about one page every 6 s). The throttle matters only when `p` is large.
 - If Google ever lists Creatives in launch-date order, the head start stops being random. The quota top-up still guarantees every bucket its minimum, but the sample would be skewed until it does.
