@@ -18,7 +18,14 @@ from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
 from adrenalin.common.progress import Bar, QueueProgress, stage_bar
-from adrenalin.tools.ads_transparency.rpc import HOST, ListedCreative, Query, TransparencyClient, transparency_url
+from adrenalin.tools.ads_transparency.rpc import (
+    HOST,
+    ListedCreative,
+    Query,
+    TransparencyClient,
+    preview_ids,
+    transparency_url,
+)
 from adrenalin.tools.ads_transparency.stages import (
     CONTENT_DIR,
     STAGE_NAMES,
@@ -40,8 +47,10 @@ CSV_FIELDS: tuple[str, ...] = (
     "days_shown", "website", "landing_url", "display_url", "brand", "headline", "description", "cta",
     "sitelinks", "full_text", "video_id", "video_url", "video_title", "preview_url", "image_file",
     "image_width", "image_height", "logo_url", "image_urls", "extraction_method", "extraction_model",
-    "extraction_confidence",
+    "extraction_confidence", "copy_status", "sample_weight", "ads_account_id", "ads_account_source", "ad_group_id",
 )
+
+COPY_STATUSES = ("read", "not_sampled", "pending", "no_copy", "preview_broken", "unreadable")
 
 
 @dataclass(frozen=True)
@@ -190,18 +199,62 @@ def _blank(v) -> object:
     return "" if v is None else v
 
 
+def copy_status(extract_status: str | None, result: dict | None, held: bool = False) -> str:
+    """Why a row has or lacks copy. `extract_status` is the extract item's status (None: no item yet);
+    `held` is a Creative left out of the sample. `result["format"]` is the Creative's format, when known."""
+    if held:
+        return "not_sampled"
+    if extract_status != "done":
+        return "pending"
+    r = result or {}
+    if r.get("preview_broken"):
+        return "preview_broken"
+    if r.get("content_unparsed"):
+        return "unreadable"
+    if any(r.get(k) for k in ("brand", "headline", "description", "display_url")):
+        return "read"
+    if r.get("vision_pending"):
+        return "pending"  # the Codex read was deferred (cap or breaker), so "no copy" is not known yet
+    if r.get("preview_kind") == "content_js":
+        return "no_copy"
+    if r.get("preview_kind") == "image" and not r.get("full_text") and r.get("format") in ("image", "video"):
+        return "no_copy"
+    return "unreadable"
+
+
+def infer_accounts(rows: list[dict]) -> None:
+    """Fill `ads_account_id` and `ads_account_source` in place. Only content.js Previews expose an Ads account;
+    a row without one gets the account of its website when every exposed row of that website agrees."""
+    by_site: dict[str, set[str]] = {}
+    for r in rows:
+        if r.get("ads_account_id") and r.get("website"):
+            by_site.setdefault(r["website"], set()).add(r["ads_account_id"])
+    for r in rows:
+        if r.get("ads_account_id"):
+            r["ads_account_source"] = "exposed"
+            continue
+        accounts = by_site.get(r.get("website") or "", set())
+        if len(accounts) == 1:
+            r["ads_account_id"], r["ads_account_source"] = next(iter(accounts)), "inferred"
+        else:
+            r["ads_account_id"], r["ads_account_source"] = "", ""
+
+
 def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
     region = _region_label(options.region)
     listing: dict[str, dict] = {}
     if options.variations:
         # The list stage refreshes detail payloads; fetch payloads keep the first listing.
         listing = {i.key: {k: v for k, v in i.payload.items() if k != "preview"} for i in q.items("detail")}
-    copies = {k: r or {} for k, r in q.results("extract")}
+    extracts = {i.key: i for i in q.items("extract")}
     rows = []
     for f in q.items("fetch"):
         pl = {**f.payload, **listing.get(f.payload["creative_id"], {})}
         p = pl.get("preview") or {}
-        c = copies.get(f.key, {})
+        item = extracts.get(f.key)
+        c = (item.result if item and item.status == "done" else None) or {}
+        status = copy_status(item.status if item else None, {**c, "format": pl.get("format", "")})
+        account, ad_group = preview_ids(p.get("url", "")) if p.get("kind") == "content_js" else ("", "")
         cr = pl["creative_id"]
         conf = c.get("confidence")
         rows.append({
@@ -229,8 +282,14 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
             "extraction_method": c.get("method", ""),
             "extraction_model": c.get("model", ""),
             "extraction_confidence": "" if conf is None else round(float(conf), 3),
+            "copy_status": status,
+            "sample_weight": "" if status in ("not_sampled", "pending") else 1.0,  # Task 7 replaces the weight
+            "ads_account_id": account,
+            "ads_account_source": "",
+            "ad_group_id": ad_group,
         })
     rows = [{k: _one_line(v) for k, v in r.items()} for r in rows]
+    infer_accounts(rows)
     rows.sort(key=lambda r: (r["creative_id"], int(r["variation"])))
     return rows
 

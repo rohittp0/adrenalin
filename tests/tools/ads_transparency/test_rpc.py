@@ -13,6 +13,7 @@ from adrenalin.tools.ads_transparency.rpc import (
     TransparencyClient,
     build_search_request,
     parse_detail,
+    preview_ids,
     parse_search_page,
     transparency_url,
 )
@@ -195,3 +196,10 @@ def test_viewer_geo_context_is_named():
 
     req = build_search_request(Query("AR1", None, None, None), None)
     assert req["7"] == {"1": 1, "2": 0, "3": VIEWER_GEO_ID}
+
+
+def test_preview_ids_reads_account_and_ad_group():
+    url = ("https://displayads-formats.googleusercontent.com/ads/preview/content.js?client=ads-integrity-transparency"
+           "&obfuscatedCustomerId=6119286040&creativeId=1&adGroupId=196658869119&overlay=x")
+    assert preview_ids(url) == ("6119286040", "196658869119")
+    assert preview_ids("https://tpc.googlesyndication.com/simgad/123") == ("", "")
