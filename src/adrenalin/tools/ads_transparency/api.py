@@ -76,7 +76,8 @@ class ScrapeOptions:
     proxies: tuple[str, ...] = ()
     progress: bool = False  # tqdm progress bars on stderr
     # Copy sample (ADR 0003): a large Inventory is read until Coverage reaches `coverage`; `read_all` reads every
-    # Creative; `max_ads` caps the Creatives read (each bucket's minimum still comes first).
+    # Creative; `max_ads` stops sampling once that many Creatives are read (the random head start admitted while
+    # listing and each bucket's minimum are read regardless).
     read_all: bool = False
     coverage: float = 0.95
     max_ads: int | None = None

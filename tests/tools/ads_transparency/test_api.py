@@ -1034,3 +1034,33 @@ def test_sample_weight_per_bucket(tmp_path, small_limits):
     assert buckets
     for b in buckets:
         assert weights[b["bucket"]] == pytest.approx(b["inventory"], abs=1e-6)
+
+
+def test_head_start_admits_at_random_and_holds_the_rest(tmp_path, monkeypatch):
+    monkeypatch.setattr(sampling, "FULL_READ_LIMIT", 10)
+    monkeypatch.setattr(sampling, "HEAD_START", 300)  # p = 0.5
+    run_scrape(tmp_path, FakeGoogle(), stage="list")
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    fetch = {i.payload["creative_id"] for i in q.items("fetch")}
+    held = {i.payload["creative_id"] for i in q.items("held")}
+    q.close()
+    ids = {c["2"] for c in SEARCH["1"]}
+    assert fetch == {c for c in ids if sampling.admitted(c, 0.5)} and held == ids - fetch
+    assert fetch and held
+
+
+def test_resumed_listing_without_page_estimate_uses_the_stored_one(tmp_path, small_limits):
+    p1, p2 = two_pages()
+    sorry = response(302, b"", headers={"Location": "https://www.google.com/sorry/index"})
+    state = {"blocked": True}
+    fake = FakeGoogle(search=lambda req: (sorry if state["blocked"] else p2) if req.get("4") == "CUR1" else p1)
+    run_scrape(tmp_path, fake)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    meta = json.loads(q.get_meta("sampling"))
+    del meta["p"]  # as if the run stopped before p was stored
+    q.set_meta("sampling", json.dumps(meta))
+    q.close()
+    state["blocked"] = False
+    fake.search = lambda req: p2 if req.get("4") == "CUR1" else sorry  # only the cursor page, which has no estimate
+    run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock=Clock(2_000_000.0)))
+    assert stored_sampling(tmp_path)[0]["p"] == 5 / 600

@@ -350,6 +350,8 @@ class AdsStages:
         """The run's admission probability: set from the first listed page's estimate, never recomputed."""
         meta = sampling_meta(q)
         if "p" not in meta:
+            # Cursor pages may carry no estimate: fall back to one stored from an earlier page.
+            estimate = estimate or int(q.get_meta("count_estimate") or 0) or None
             meta["p"] = sampling.admit_probability(estimate, self.ctx.read_all)
             q.set_meta("sampling", json.dumps(meta))
         return meta["p"]
