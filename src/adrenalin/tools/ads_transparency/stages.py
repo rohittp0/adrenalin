@@ -19,7 +19,7 @@ from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.pipeline import Item, Stage, WorkQueue
 from adrenalin.tools.ads_transparency import sample_queue, sampling
-from adrenalin.tools.ads_transparency.copy import AdCopy, extract_image, parse_content_preview
+from adrenalin.tools.ads_transparency.copy import CONTENT_JS_VERSION, AdCopy, extract_image, parse_content_preview
 from adrenalin.tools.ads_transparency.rpc import (
     ListedCreative,
     PaginationLoop,
@@ -48,9 +48,10 @@ CONTENT_DIR = "content"
 # blocked, while fetch, which doesn't wait on script, keeps downloading images.
 _STAGE_CONFIG = {
     "list": (1, ("detail", "fetch", "script", "extract"), 200),
-    # a round decides on complete reads only, so it waits until every admitted Creative has been read
-    # and, through `list`, until the listing is done: a round left pending by an earlier run waits out a relist
-    "sample": (1, ("list", "detail", "fetch", "script", "extract"), 0),
+    # a round waits, through `list`, until the listing is done (a round left pending by an earlier run waits out a
+    # relist), and until the admitted Creatives are read: all of them, or all but one novelty round
+    # (`sample_queue.round_lead`, resolved before every claim)
+    "sample": (1, ("list", "detail", "fetch", "script", "extract"), None),
     "detail": (1, ("fetch", "script", "extract"), 50),
     "fetch": (4, ("extract",), 50),
     "script": (1, ("extract",), 50),
@@ -156,7 +157,7 @@ class AdsStages:
     def warn(self, message: str) -> None:
         self.ctx.log(f"warning: {message}")
 
-    def stages(self, only: str | None = None) -> list[Stage]:
+    def stages(self, q: WorkQueue, only: str | None = None) -> list[Stage]:
         if only == "export":
             names: tuple[str, ...] = ()
         elif only == "list":
@@ -173,6 +174,8 @@ class AdsStages:
         out = []
         for name in names:
             concurrency, throttle_on, max_ahead = _STAGE_CONFIG[name]
+            if max_ahead is None:
+                max_ahead = lambda: sample_queue.round_lead(q)  # noqa: E731
             out.append(Stage(name, workers[name], concurrency,
                              tuple(t for t in throttle_on if t in names), max_ahead,
                              on_done=self.extract_done if name == "extract" else None))
@@ -204,7 +207,7 @@ class AdsStages:
             return {"restarted": True}
 
         estimate = page.count_high or page.count_low
-        p = self._admit_probability(q, estimate)
+        p = self._admit_probability(q, estimate, cursor)
         target = listing_stage(ctx.variations)
         for c in page.creatives:
             fields = creative_fields(c) | ({} if ctx.variations else {"variation": 1})
@@ -239,12 +242,19 @@ class AdsStages:
                 seed_round(q)  # before this page completes, so the sample stage can't finish first
         return {"creatives": len(page.creatives), "next_cursor": nxt}
 
-    def _admit_probability(self, q: WorkQueue, estimate: int | None) -> float:
+    def _admit_probability(self, q: WorkQueue, estimate: int | None, cursor: str | None) -> float:
         """The run's admission probability: set from the first listed page's estimate, never recomputed."""
         meta = sampling_meta(q)
         if "p" not in meta:
             # Cursor pages may carry no estimate: fall back to one stored from an earlier page.
             estimate = estimate or int(q.get_meta("count_estimate") or 0) or None
+            if estimate is None and cursor and not self.ctx.read_all:
+                # A queue from before sampling, resumed mid-listing, has no estimate stored: `p` is stored for
+                # good, so ask page 1 for it rather than read the whole Inventory. Errors fail this page.
+                first = self.ctx.client.search(self.ctx.query, None)
+                estimate = first.count_high or first.count_low
+                if estimate:
+                    q.set_meta("count_estimate", str(estimate))
             meta["p"] = sampling.admit_probability(estimate, self.ctx.read_all, self.ctx.max_ads)
             q.set_meta("sampling", json.dumps(meta))
         return meta["p"]
@@ -345,6 +355,7 @@ class AdsStages:
                 unparsed = True
             if copy.video_id:
                 title, title_pending = self._video_title(copy.video_id)
+            extra = {"content_version": CONTENT_JS_VERSION}
         else:
             copy = self._read_image(ctx.entity / pl["image_file"], p, pl.get("format", ""))
             if copy.preview_broken and not ctx.variations:  # with variations, sibling rows carry their own copy

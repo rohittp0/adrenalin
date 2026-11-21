@@ -23,18 +23,20 @@ class Item:
     result: dict | None
     status: str
     error: str | None
+    attempts: int = 0  # claims so far; a failed item with `max_attempts` of them is never retried
 
 
-_COLS = "stage, key, payload, result, status, error"
+_COLS = "stage, key, payload, result, status, error, attempts"
 
 
 def _item(row) -> Item:
     return Item(row[0], row[1], json.loads(row[2]), json.loads(row[3]) if row[3] is not None else None,
-                row[4], row[5])
+                row[4], row[5], row[6])
 
 
 class WorkQueue:
     def __init__(self, path: Path, *, max_attempts: int = 3):
+        self.max_attempts = max_attempts
         self._lock = threading.Lock()
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -143,6 +145,13 @@ class WorkQueue:
                                     (stage, status)).fetchall()
         return [(k, json.loads(r) if r is not None else None) for k, r in rows]
 
+    def exhausted(self, stage: str) -> set[str]:
+        """Keys of failed items that used up their attempts: no run retries them (only a requeue does)."""
+        with self._lock:
+            rows = self._db.execute("SELECT key FROM items WHERE stage=? AND status='failed' AND attempts>=?",
+                                    (stage, self.max_attempts)).fetchall()
+        return {r[0] for r in rows}
+
     def items(self, stage: str, status: str | None = None) -> list[Item]:
         sql, args = f"SELECT {_COLS} FROM items WHERE stage=?", [stage]
         if status is not None:
@@ -172,7 +181,8 @@ class Stage:
     worker: Callable[[Item, WorkQueue], dict | None]
     concurrency: int = 1
     throttle_on: tuple[str, ...] = ()
-    max_ahead: int = 0
+    # backlog the stage may run ahead of `throttle_on` by; a callable is asked again before every claim
+    max_ahead: int | Callable[[], int] = 0
     # called after the item is marked done; errors are logged and never fail the item
     on_done: Callable[[Item, dict | None], None] | None = None
 
@@ -232,7 +242,10 @@ class Pipeline:
 
         def throttled(stage: Stage) -> bool:
             live_targets = tuple(n for n in stage.throttle_on if not finished[n].is_set())
-            return bool(live_targets) and q.backlog(*live_targets) > stage.max_ahead
+            if not live_targets:
+                return False
+            ahead = stage.max_ahead() if callable(stage.max_ahead) else stage.max_ahead
+            return q.backlog(*live_targets) > ahead
 
         def add_seconds(name: str, kind: str, t0: float) -> None:
             with state_lock:

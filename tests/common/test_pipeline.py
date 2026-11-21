@@ -331,3 +331,41 @@ def test_has(tmp_path):
     q.put("A", "1", {})
     assert q.has("A", "1") and not q.has("A", "2") and not q.has("B", "1")
     q.close()
+
+
+def test_exhausted_lists_failed_items_out_of_attempts(tmp_path):
+    p = tmp_path / "q.sqlite3"
+    q = WorkQueue(p, max_attempts=2)
+    q.put("A", "1", {})
+    q.put("A", "2", {})
+    for _ in range(2):
+        q.claim("A")
+        q.fail("A", "1", "boom")
+        assert q.claim("A").key == "2"
+        q.release("A", "2")
+        q.close()
+        q = WorkQueue(p, max_attempts=2)
+    q.claim("A")
+    q.fail("A", "2", "boom")  # failed once: retried on the next run
+    assert q.exhausted("A") == {"1"}
+    assert [i.attempts for i in q.items("A")] == [2, 1]
+    q.close()
+
+
+def test_max_ahead_can_be_decided_per_claim(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(10):
+        q.put("A", str(i), {})
+    limit = {"n": 0}
+    seen = []
+
+    def a(item, queue):
+        queue.put("B", item.key, {})
+
+    def b(item, queue):
+        seen.append(queue.backlog("B"))
+        time.sleep(0.01)
+
+    _run(q, [Stage("A", a, throttle_on=("B",), max_ahead=lambda: limit["n"]), Stage("B", b)])
+    assert len(q.items("B", "done")) == 10 and max(seen) <= 1
+    q.close()

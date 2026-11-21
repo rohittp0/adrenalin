@@ -40,6 +40,22 @@ def sample_group(payload: dict, query: Query, today: date) -> str:
     return f"{bucket}|{account}"
 
 
+READ_STAGES = ("detail", "fetch", "script", "extract")
+
+
+def exhausted_reads(q: WorkQueue) -> set[str]:
+    """Keys whose reading failed on every retry, in any reading stage: Variation keys (`creative#n`), and with
+    `--variations` Creative IDs of failed detail items. No run retries them, so their copy is `unreadable`."""
+    return set().union(*(q.exhausted(s) for s in READ_STAGES))
+
+
+def row_status(extract_status: str | None, result: dict | None, fmt: str, key: str, exhausted: set[str],
+               held: bool = False) -> str:
+    """The Copy status of a Variation row (`key` is `creative#n`); the one rule for the CSV and the Copy sample."""
+    failed = key in exhausted or key.partition("#")[0] in exhausted
+    return copy_status(extract_status, {**(result or {}), "format": fmt}, held=held, exhausted=failed)
+
+
 def message_of(extract_status: str | None, result: dict | None, fmt: str) -> str:
     """The Message a read counts toward Coverage; "" unless the copy was read with enough confidence."""
     r = result or {}
@@ -91,6 +107,7 @@ def sample_groups(q: WorkQueue, variations: bool, query: Query, today: date) -> 
     """Per-group Inventory, reads and Messages of the run, and each Creative's group and Message."""
     acc = SampleAccount()
     extracted = dict(q.results("extract"))
+    exhausted = exhausted_reads(q)
     for it in q.items(listing_stage(variations)):
         cr = it.payload["creative_id"]
         if cr in acc.group_of:
@@ -100,7 +117,7 @@ def sample_groups(q: WorkQueue, variations: bool, query: Query, today: date) -> 
         key = f"{cr}#1"
         status = "done" if key in extracted else None
         result = extracted.get(key)
-        if copy_status(status, {**(result or {}), "format": it.payload.get("format", "")}) != "pending":
+        if row_status(status, result, it.payload.get("format", ""), key, exhausted) != "pending":
             g.processed += 1
             acc.processed.add(cr)
             acc.message[cr] = message_of(status, result, it.payload.get("format", ""))
@@ -141,10 +158,50 @@ class RoundSettings:
     max_ads: int | None
 
 
+def round_lead(q: WorkQueue) -> int:
+    """How many unread Creatives the next round may leave behind (the `sample` stage's `max_ahead`). After a novelty
+    round the next one is chosen while up to one round is still being read, so novelty lags a round. Otherwise
+    (after the head start, a minimums round, or during a relist) it waits until every admitted Creative is read."""
+    if q.backlog("list"):
+        return 0
+    waiting = q.items("sample", "pending")
+    return ROUND_BATCH if waiting and waiting[0].payload.get("novelty") else 0
+
+
+def _in_reading(q: WorkQueue) -> set[str]:
+    """Creatives with a read still queued or running."""
+    return {i.key.partition("#")[0] for s in READ_STAGES for st in ("pending", "running") for i in q.items(s, st)}
+
+
+def _judge(q: WorkQueue, rounds: list[list[str]], tally: SampleAccount) -> tuple[str, list[list[str]]]:
+    """Judge earlier novelty rounds by their processed Creatives. "stop": one round's reads are over and its
+    processed Creatives gave no readable Message; "defer": one round's reads are over but none was processed (its
+    reads wait for Codex or failed: retried on the next run); otherwise "go". Also returns the rounds still being
+    read, judged by a later round."""
+    open_rounds = [ids for ids in rounds if not any(tally.message.get(c) for c in ids)]
+    if not open_rounds:
+        return "go", []
+    reading = _in_reading(q)
+    carry = [ids for ids in open_rounds if any(c in reading for c in ids)]
+    over = [ids for ids in open_rounds if ids not in carry]
+    if any(c in tally.processed for ids in over for c in ids):
+        return "stop", carry
+    return ("defer" if over else "go"), carry
+
+
+def _unjudged(payload: dict) -> list[list[str]]:
+    if "unjudged" in payload:
+        return payload["unjudged"]
+    # a round queued before rounds overlapped: only the previous round, if it was a novelty round
+    last = payload.get("admitted") or []
+    return [last] if payload.get("novelty") and last else []
+
+
 def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], None]) -> dict:
-    """One sampling round (the `sample` stage's worker). It runs once the listing is done and every admitted
-    Creative has been read. Once every group has its minimum it stops at the Coverage target, at `max_ads`, or when
-    Coverage can't be estimated; otherwise it admits the next held Creatives and queues the next round (with the
+    """One sampling round (the `sample` stage's worker). It runs once the listing is done and the admitted Creatives
+    have been read (all of them, or all but the last novelty round: see `round_lead`). Once every group has its
+    minimum it stops at the Coverage target, at `max_ads`, when Coverage can't be estimated, or when a novelty round
+    found no readable Message; otherwise it admits the next held Creatives and queues the next round (with the
     Creatives it admitted), before this one completes."""
     if not q.get_meta("list_done"):
         # The listing failed this run, so the Inventory is incomplete: list_page queues a round when it finishes.
@@ -156,6 +213,7 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
     cov = sampling.coverage([m for g in groups.values() for m in g.messages])
     stopped = {"admitted": 0, "read": read, "coverage": cov}
     novelty = False
+    carry: list[list[str]] = []
     if s.read_all:
         chosen = [k for g in groups.values() for k in g.held]
     else:
@@ -169,11 +227,21 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
             # Without countable Messages Coverage is never estimated, and reading on would read everything.
             log(f"sample: Coverage unknown: no readable Messages after {len(acc.processed):,} Creatives; stopping")
             return stopped
-        last = item.payload.get("admitted") or []
-        if quotas_met and item.payload.get("novelty") and not any(acc.message.get(c) for c in last):
-            log(f"sample: the last round's {len(last):,} Creatives gave no readable Message (all failed or without "
-                f"copy); stopping with Coverage {'unknown' if cov is None else f'{cov:.3f}'}")
+        verdict, carry = _judge(q, _unjudged(item.payload), acc) if quotas_met else ("go", [])
+        if verdict == "stop":
+            log(f"sample: a round's processed Creatives gave no readable Message (all failed or without copy); "
+                f"stopping with Coverage {'unknown' if cov is None else f'{cov:.3f}'}")
             return stopped
+        if verdict == "defer":
+            log("sample: a round's Creatives are all still unread (Codex limit or failed reads); no more rounds "
+                "this run, rerun to continue")
+            return {**stopped, "deferred": True}
+        if not quotas_met and s.max_ads is not None:
+            floor = sum(min(sampling.MIN_PER_BUCKET, g.inventory) for g in groups.values())
+            if floor > s.max_ads:
+                log(f"warning: --max-ads {s.max_ads:,} is below the group minimums: every launch period x "
+                    f"running/stopped x Ads account group gets up to {sampling.MIN_PER_BUCKET} reads, "
+                    f"{floor:,} Creatives in all")
         # Minimums first, alone: novelty is judged only once every group has reads to judge it by.
         novelty = quotas_met
         batch = 0 if not quotas_met else ROUND_BATCH if s.max_ads is None else \
@@ -185,9 +253,14 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
         _log_stop(log, cov, s.coverage, read, inventory)
         return stopped
     q.move(HELD, listing_stage(s.variations), chosen)
+    admitted = [k.partition("#")[0] for k in chosen]
+    held = sum(len(g.held) for g in groups.values()) - len(chosen)
+    shown = "unknown" if cov is None else f"{cov:.3f}"
+    log(f"sample: {item.key.replace(':', ' ')}: read {len(acc.processed):,}, Coverage {shown} "
+        f"(target {s.coverage}), held {held:,}")
     # The next round goes in while this one still runs, so the stage never looks finished between rounds.
     q.put("sample", f"round:{_rounds(q)}",
-          {"admitted": [k.partition("#")[0] for k in chosen], "novelty": novelty})
+          {"admitted": admitted, "novelty": novelty, "unjudged": carry + ([admitted] if novelty else [])})
     return {"admitted": len(chosen), "read": read, "coverage": cov}
 
 

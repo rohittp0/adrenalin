@@ -1415,3 +1415,166 @@ def test_max_ads_samples_an_inventory_within_the_full_read_limit(tmp_path, monke
     assert any(r["copy_status"] == "not_sampled" for r in rows)
     floor = sum(min(sampling.MIN_PER_BUCKET, b["inventory"]) for b in summary_of(res)["buckets"])
     assert len(processed(rows)) <= 10 + floor
+
+
+# -- final review fixes ---------------------------------------------------------
+
+def _resume_without_any_estimate(tmp_path, page1):
+    """A run blocked after page 1, then stripped of every stored estimate (a queue from before sampling), resumed
+    on the cursor page, which carries no estimate. `page1` is what a fresh page-1 search returns."""
+    p1, p2 = two_pages()
+    sorry = response(302, b"", headers={"Location": "https://www.google.com/sorry/index"})
+    fake = FakeGoogle(search=lambda req: sorry if req.get("4") == "CUR1" else p1)
+    run_scrape(tmp_path, fake)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    q.set_meta("sampling", "{}")
+    q.set_meta("count_estimate", "")
+    q.close()
+    fake.search = lambda req: p2 if req.get("4") == "CUR1" else page1
+    fake.calls.clear()
+    run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock=Clock(2_000_000.0)))
+    return fake
+
+
+def test_resumed_cursor_page_without_any_estimate_reads_it_from_page_1(tmp_path, small_limits):
+    p1, _ = two_pages()
+    fake = _resume_without_any_estimate(tmp_path, p1)
+    assert stored_sampling(tmp_path)[0]["p"] == 5 / 600
+    assert fake.calls["search"] == 2  # the cursor page and one page-1 search for the estimate
+
+
+def test_resumed_cursor_page_without_any_estimate_reads_all_if_page_1_has_none(tmp_path, small_limits):
+    p1, _ = two_pages()
+    del p1["4"], p1["5"]
+    _resume_without_any_estimate(tmp_path, p1)
+    assert stored_sampling(tmp_path)[0]["p"] == 1.0
+
+
+def test_variations_creative_whose_detail_failed_still_has_a_row(tmp_path):
+    fake = FakeGoogle()
+    fake.detail_reply = response(body={"1": {}})  # unparsable: every detail item fails
+    for run in range(3):
+        res = run_scrape(tmp_path, fake, variations=True)
+        rows = read_rows(res)
+        assert len(rows) == 40 and {r["variation"] for r in rows} == {"1"}
+        # failed items are retried on the next run; after the last attempt reading has failed for good
+        assert {r["copy_status"] for r in rows} == {"unreadable" if run == 2 else "pending"}
+        assert res.listed == summary_of(res)["listed"] == 40
+
+
+def test_fetch_failed_on_every_retry_is_unreadable(tmp_path):
+    fake = FakeGoogle()
+    fake.fail_simgad = 10 ** 6
+    for run in range(3):
+        rows = read_rows(run_scrape(tmp_path, fake))
+        images = [r for r in rows if "simgad" in r["preview_url"]]
+        assert len(images) == SIMGAD_CREATIVES
+        assert {r["copy_status"] for r in images} == {"unreadable" if run == 2 else "pending"}
+
+
+def test_exhausted_reads_count_as_processed_in_the_copy_sample(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    q.put("fetch", "A5#1", {**q.items("fetch")[0].payload, "creative_id": "A5"})
+    for _ in range(3):
+        q.claim("fetch")
+        q.fail("fetch", "A5#1", "HTTPError")
+        q.close()
+        q = WorkQueue(tmp_path / "state.sqlite3")
+    tally = sample_queue.sample_groups(q, False, Query(AR, None, None, None), date(2026, 11, 21))
+    assert "A5" in tally.processed and tally.message["A5"] == ""
+    q.close()
+
+
+def test_stored_error_page_copy_is_preview_broken():
+    error_page = {"headline": "500. That's an error.", "full_text": "There was an error. Please try again later.",
+                  "preview_kind": "image", "format": "text"}
+    assert copy_status("done", error_page) == "preview_broken"
+    assert sample_queue.message_of("done", error_page, "text") == ""
+
+
+def test_old_unparsed_and_store_badge_rows_are_reextracted_once(tmp_path):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    js = [k for k, r in q.results("extract") if (r or {}).get("preview_kind") == "content_js"]
+    good = {k: r for k, r in q.results("extract")}
+    old_unparsed, old_badge = js[0], js[1]
+    # rows of a run from before the content.js parser fixes (no parser version stored)
+    q.complete("extract", old_unparsed, {"preview_kind": "content_js", "content_unparsed": True})
+    stale = {k: v for k, v in good[old_badge].items() if k != "content_version"}
+    q.complete("extract", old_badge, {**stale, "headline": "Google Play"})
+    q.close()
+    before = fake.calls["content_js"]
+    run_scrape(tmp_path, fake)
+    got = extract_results(tmp_path)
+    for k in (old_unparsed, old_badge):
+        assert got[k]["headline"] == good[k]["headline"] and not got[k]["content_unparsed"]
+    assert fake.calls["content_js"] == before + 2  # their scripts were deleted after the first extract
+    run_scrape(tmp_path, fake)
+    assert fake.calls["content_js"] == before + 2  # not re-extracted again
+
+
+def test_next_round_reads_ahead_only_after_a_novelty_round(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    assert sample_queue.round_lead(q) == 0  # no round waiting
+    q.put("sample", "round:0", {})  # after the head start: every read must finish first
+    assert sample_queue.round_lead(q) == 0
+    q.complete("sample", "round:0", {})
+    q.put("sample", "round:1", {"admitted": ["A1"], "novelty": True, "unjudged": [["A1"]]})
+    assert sample_queue.round_lead(q) == sample_queue.ROUND_BATCH
+    q.put("list", "page:", {"cursor": ""})  # a relist: the Inventory must be complete first
+    assert sample_queue.round_lead(q) == 0
+    q.close()
+
+
+def test_round_logs_its_progress(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    logs = []
+    item = Item("sample", "round:4", {"admitted": ["A1"], "novelty": True}, None, "running", None)
+    out = sample_queue.run_round(q, item, _settings(), logs.append)
+    assert out["admitted"] == 5
+    assert "sample: round 4: read 4, Coverage 0.000 (target 0.95), held 0" in logs
+    q.close()
+
+
+def _codex_capped(q, *creatives):
+    fields = q.items("fetch")[0].payload
+    for c in creatives:
+        q.move("held", "fetch", [f"{c}#1"])
+        q.complete("fetch", f"{c}#1", {})
+        q.put("extract", f"{c}#1", {**fields, "creative_id": c})
+        q.complete("extract", f"{c}#1", {"preview_kind": "image", "vision_pending": True})
+
+
+def test_round_of_codex_capped_creatives_defers_instead_of_stopping(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    _codex_capped(q, "H1", "H2")
+    logs = []
+    item = Item("sample", "round:5", {"admitted": ["H1", "H2"], "novelty": True}, None, "running", None)
+    out = sample_queue.run_round(q, item, _settings(), logs.append)
+    # no processed Creative to judge the round by: admit nothing this run, and don't claim it found no Message
+    assert out["admitted"] == 0 and out["deferred"] and q.backlog("sample") == 0
+    assert not any("no readable Message" in m for m in logs)
+    q.close()
+
+
+def test_round_still_being_read_is_judged_later(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    q.move("held", "fetch", ["H1#1", "H2#1"])  # admitted by the last round, not read yet
+    item = Item("sample", "round:5", {"admitted": ["H1", "H2"], "novelty": True}, None, "running", None)
+    out = sample_queue.run_round(q, item, _settings(), lambda m: None)
+    assert out["admitted"] == 3
+    nxt = q.items("sample", "pending")[0].payload
+    assert nxt["unjudged"] == [["H1", "H2"], nxt["admitted"]] and len(nxt["admitted"]) == 3
+    q.close()
+
+
+def test_round_judges_only_processed_creatives(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    _codex_capped(q, "H1")
+    item = Item("sample", "round:5", {"admitted": ["A3", "H1"], "novelty": True}, None, "running", None)
+    logs = []
+    out = sample_queue.run_round(q, item, _settings(), logs.append)
+    assert out["admitted"] == 0 and not out.get("deferred")  # A3 was read and has no Message: stop
+    assert any("no readable Message" in m for m in logs)
+    q.close()

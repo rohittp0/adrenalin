@@ -209,6 +209,17 @@ def _video_headline_description(strings: list[str], brand: str) -> tuple[str, st
     return headline, description
 
 
+# Bumped when content.js parsing improves, so reads of an earlier version that failed are read again, once.
+CONTENT_JS_VERSION = 2
+
+
+def stale_content_read(r: dict) -> bool:
+    """A content.js read from before the current parser that it would now get right: not parsed at all, or the
+    store badge ("Google Play") taken as the headline."""
+    return (r.get("preview_kind") == "content_js" and (r.get("content_version") or 1) < CONTENT_JS_VERSION
+            and bool(r.get("content_unparsed") or r.get("headline") in _STORE_NAMES))
+
+
 def parse_content_preview(js: str, url: str) -> AdCopy | None:
     """Copy of a `content.js` Preview: the script, plus the URL's `overlay=` text when the script has no copy."""
     c = parse_content_js(js)
@@ -587,19 +598,21 @@ def extract_image(
     return copy
 
 
+_BROKEN_TEXT_KEYS = ("brand", "headline", "description", "full_text")
 COPY_STATUSES = ("read", "not_sampled", "pending", "no_copy", "preview_broken", "unreadable")
 
 
-def copy_status(extract_status: str | None, result: dict | None, held: bool = False) -> str:
+def copy_status(extract_status: str | None, result: dict | None, held: bool = False, exhausted: bool = False) -> str:
     """Why a row has or lacks copy. `extract_status` is the extract item's status (None: no item yet);
-    `held` is a Creative left out of the sample. `result["format"]` is the Creative's format, when known."""
+    `held` is a Creative left out of the sample; `exhausted`: reading it failed on every retry, in any stage.
+    `result["format"]` is the Creative's format, when known."""
     if held:
         return "not_sampled"
     if extract_status != "done":
-        return "pending"
+        return "unreadable" if exhausted else "pending"
     r = result or {}
-    if r.get("preview_broken"):
-        return "preview_broken"
+    if r.get("preview_broken") or is_broken_preview(" ".join(str(r.get(k) or "") for k in _BROKEN_TEXT_KEYS)):
+        return "preview_broken"  # stored text of the error page: a row read before Broken Previews were detected
     if r.get("content_unparsed"):
         return "unreadable"
     if any(r.get(k) for k in ("brand", "headline", "description", "display_url")):
