@@ -13,7 +13,7 @@ from datetime import date
 
 from adrenalin.common.pipeline import Item, WorkQueue
 from adrenalin.tools.ads_transparency import sampling
-from adrenalin.tools.ads_transparency.copy import MIN_CONFIDENCE, copy_status
+from adrenalin.tools.ads_transparency.copy import MIN_CONFIDENCE, copy_status, shown_copy
 from adrenalin.tools.ads_transparency.rpc import Query, preview_ids
 
 HELD = "held"
@@ -41,6 +41,32 @@ def sample_group(payload: dict, query: Query, today: date) -> str:
 
 
 READ_STAGES = ("detail", "fetch", "script", "extract")
+# an extract item's payload key: the result it had when it was queued to be read again (a stale content.js read),
+# exported until the new read is done
+PREVIOUS_RESULT = "previous_result"
+
+
+def read_results(extracts: list[Item]) -> dict[str, dict | None]:
+    """Each Variation's copy as exported, from the run's extract items: the result once done, else the result kept
+    from before it was queued to be read again; store badges are blanked (`shown_copy`). Keys with neither are
+    left out; the rest count as done."""
+    out = {}
+    for it in extracts:
+        if it.status == "done":
+            out[it.key] = shown_copy(it.result)
+        elif PREVIOUS_RESULT in it.payload:
+            out[it.key] = shown_copy(it.payload[PREVIOUS_RESULT])
+    return out
+
+
+def requeue_keeping_result(q: WorkQueue, keys: list[str]) -> None:
+    """Requeue done extract items to be read again, keeping each one's result in its payload until the new read
+    is done (`read_results`)."""
+    for key in keys:
+        it = q.item("extract", key)
+        if it is not None and it.status == "done":
+            q.put("extract", key, {**it.payload, PREVIOUS_RESULT: it.result}, update_payload=True)
+    q.requeue("extract", keys)
 
 
 def exhausted_reads(q: WorkQueue) -> set[str]:
@@ -106,7 +132,7 @@ def _admission_rank(key: str) -> str:
 def sample_groups(q: WorkQueue, variations: bool, query: Query, today: date) -> SampleTally:
     """Per-group Inventory, reads and Messages of the run, and each Creative's group and Message."""
     tally = SampleTally()
-    extracted = dict(q.results("extract"))
+    extracted = read_results(q.items("extract"))
     exhausted = exhausted_reads(q)
     for it in q.items(listing_stage(variations)):
         cr = it.payload["creative_id"]

@@ -41,6 +41,8 @@ from adrenalin.tools.ads_transparency.sample_queue import (
     SampleTally,
     exhausted_reads,
     listing_stage,
+    read_results,
+    requeue_keeping_result,
     row_status,
     sample_groups,
     sampling_meta,
@@ -48,6 +50,8 @@ from adrenalin.tools.ads_transparency.sample_queue import (
 )
 from adrenalin.tools.ads_transparency.stages import (
     CONTENT_DIR,
+    REREAD,
+    REREAD_GIVEN_UP,
     STAGE_NAMES,
     AdsStages,
     StageContext,
@@ -223,7 +227,30 @@ def _confirmed_broken(r: dict | None) -> bool:
     return bool((r or {}).get("preview_broken") and not (r or {}).get("broken_unverified"))
 
 
-def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], None]) -> None:
+def _reread_stale_content(q: WorkQueue, run: Path, *, extract: bool, script: bool) -> None:
+    """Read again the content.js reads an earlier parser got wrong (`stale_content_read`), keeping each row's
+    result until the new read is done. A script still on disk (unparsed ones are kept) is extracted again when
+    `extract` runs; a deleted one is downloaded again by the script stage, which owns that host and its blocks,
+    when `script` runs. Extract never downloads it: a block there would stop every stage (ADR 0001)."""
+    scripts = {it.key: it for it in q.items("script")}
+    on_disk = []
+    for it in q.items("extract", "done"):
+        if not stale_content_read(it.result or {}):
+            continue
+        rel = it.payload.get("content_file")
+        if rel and (run / rel).is_file():
+            on_disk.append(it.key)
+            continue
+        s = scripts.get(it.key)
+        if not script or (s is not None and (s.status != "done" or (s.result or {}).get(REREAD_GIVEN_UP))):
+            continue  # a download already queued (it keeps its attempts), or one given up
+        q.put("script", it.key, {**it.payload, REREAD: True}, update_payload=True)
+        q.requeue("script", [it.key])
+    if extract:
+        requeue_keeping_result(q, on_disk)
+
+
+def _prepare_queue(q: WorkQueue, options: ScrapeOptions, run: Path, log: Callable[[str], None]) -> None:
     # Requeues only when the stage that redoes the work runs: a requeue clears the item's result,
     # so e.g. `--stage export` must not blank copy it cannot re-extract.
     if not q.put("list", "page:", {"cursor": ""}) and options.stage in (None, "list"):
@@ -233,6 +260,7 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
             q.set_meta("list_done", "")  # an interrupted relist resumes instead of restarting
             q.set_meta("seen_cursors", "{}")
             q.requeue("list", ["page:"])
+    _reread_stale_content(q, run, extract=options.stage in (None, "extract"), script=options.stage in (None, "fetch"))
     if options.stage not in (None, "extract"):
         return
     done = q.results("extract")
@@ -256,8 +284,6 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
     q.requeue("extract", [k for k, r in done if (r or {}).get("preview_kind") == "image"
                           and ((r or {}).get("broken_unverified")
                                or is_broken_preview(f"{r.get('headline') or ''} {r.get('full_text') or ''}"))])
-    # content.js reads that an earlier parser got wrong (`_read_js` downloads a deleted script again).
-    q.requeue("extract", [k for k, r in done if stale_content_read(r or {})])
 
 
 def _join(v) -> str:
@@ -316,16 +342,18 @@ def _rows(q: WorkQueue, options: ScrapeOptions, tally: SampleTally, sampled: boo
         have_rows = {i.payload["creative_id"] for i in fetched}
         entries += [(f"{i.key}#1", i.payload, None, False) for i in details if i.key not in have_rows]
     entries += [(i.key if "#" in i.key else f"{i.key}#1", i.payload, None, True) for i in q.items(HELD)]
-    extracts = {i.key: i for i in q.items("extract")}
+    extracts = q.items("extract")
+    statuses = {i.key: i.status for i in extracts}
+    copies = read_results(extracts)
     exhausted = exhausted_reads(q)
     rows = []
     for key, payload, fetch_result, is_held in entries:
         pl = {**payload, **listing.get(payload["creative_id"], {})}
         pl.setdefault("variation", 1)  # a held (or not yet detailed) Creative's Variations aren't listed yet
         p = pl.get("preview") or {}
-        item = None if is_held else extracts.get(key)
-        c = (item.result if item and item.status == "done" else None) or {}
-        status = row_status(item.status if item else None, c, pl.get("format", ""), key, exhausted, held=is_held)
+        extract_status = None if is_held else "done" if key in copies else statuses.get(key)
+        c = (None if is_held else copies.get(key)) or {}
+        status = row_status(extract_status, c, pl.get("format", ""), key, exhausted, held=is_held)
         weight = "" if is_held else tally.weight(pl["creative_id"], sampled)
         account, ad_group = preview_ids(p.get("url", "")) if p.get("kind") == "content_js" else ("", "")
         cr = pl["creative_id"]
@@ -479,7 +507,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         run.mkdir(parents=True, exist_ok=True)
         q = WorkQueue(run / "state.sqlite3")
         _remove_done_content(q, run)
-        _prepare_queue(q, options, emit)
+        _prepare_queue(q, options, run, emit)
         _prepare_sampling(q, options, emit)
 
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,

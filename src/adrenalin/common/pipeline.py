@@ -152,6 +152,11 @@ class WorkQueue:
                                     (stage, self.max_attempts)).fetchall()
         return {r[0] for r in rows}
 
+    def item(self, stage: str, key: str) -> Item | None:
+        with self._lock:
+            row = self._db.execute(f"SELECT {_COLS} FROM items WHERE stage=? AND key=?", (stage, key)).fetchone()
+        return None if row is None else _item(row)
+
     def items(self, stage: str, status: str | None = None) -> list[Item]:
         sql, args = f"SELECT {_COLS} FROM items WHERE stage=?", [stage]
         if status is not None:

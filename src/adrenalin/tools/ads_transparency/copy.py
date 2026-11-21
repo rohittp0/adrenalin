@@ -222,6 +222,12 @@ def stale_content_read(r: dict) -> bool:
             and bool(r.get("content_unparsed") or r.get("headline") in _STORE_NAMES))
 
 
+def shown_copy(r: dict | None) -> dict | None:
+    """An extract result as it is exported and counted: a store badge an earlier parser took as the headline is
+    never copy. The stored result keeps it, so `stale_content_read` still finds the row."""
+    return {**r, "headline": ""} if r and r.get("headline") in _STORE_NAMES else r
+
+
 def parse_content_preview(js: str, url: str) -> AdCopy | None:
     """Copy of a `content.js` Preview: the script, plus the URL's `overlay=` text when the script has no copy."""
     c = parse_content_js(js)
