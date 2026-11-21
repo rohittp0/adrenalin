@@ -525,6 +525,36 @@ def test_block_mid_list_exports_partial_and_reports(tmp_path):
     assert res2.blocked_until is None and res2.rows == 40 and res2.failed == {}
 
 
+def test_summary_written_with_status_counts_and_accounts(tmp_path):
+    res = run_scrape(tmp_path, FakeGoogle())
+    summary = json.loads((res.csv_path.parent / "summary.json").read_text(encoding="utf-8"))
+    assert res.summary_path == res.csv_path.parent / "summary.json"
+    assert res.listing_complete is True and summary["listing_complete"] is True
+    assert summary["listed"] == res.rows == res.listed
+    assert sum(summary["copy_status"].values()) == res.rows
+    assert set(summary["copy_status"]) <= set(COPY_STATUSES)
+    assert summary["coverage"] is None and summary["sampling"] is None and summary["buckets"] == []
+    assert {"busy", "waiting"} <= set(next(iter(summary["stage_seconds"].values())))
+    for a in summary["ads_accounts"]:
+        assert a["ads_account_id"] and a["source"] in ("exposed", "inferred")
+    counts = [sum(a["websites"].values()) for a in summary["ads_accounts"]]
+    assert counts == sorted(counts, reverse=True)
+
+
+def test_block_mid_list_marks_incomplete(tmp_path):
+    p1, p2 = two_pages()
+    sorry = response(302, b"", {"Location": "https://www.google.com/sorry/index?continue=x"})
+    fake = FakeGoogle(search=lambda req: sorry if req.get("4") == "CUR1" else p1)
+    lines = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+                 codex=codex(), log=lines.append, poll=POLL)
+    assert res.listing_complete is False and res.listed == 20
+    summary = json.loads(res.summary_path.read_text(encoding="utf-8"))
+    assert summary["listing_complete"] is False and summary["listed"] == 20
+    assert lines[-1].startswith("INCOMPLETE: listed 20 of ~")
+    assert lines[-1].endswith("Creatives; rerun the same command to continue")
+
+
 def test_zero_creatives_in_window_writes_header_only(tmp_path):
     fake = FakeGoogle(search=lambda req: {"1": []} if {"6", "7"} & set(req["3"]) else single_page())
     res = run_scrape(tmp_path, fake, start=date(2026, 11, 1), end=date(2026, 11, 2))
