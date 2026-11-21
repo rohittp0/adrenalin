@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+from collections import Counter
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -79,6 +80,12 @@ class ScrapeResult:
     vision_skipped: int
     # pipeline-level crashes (not item failures); a non-empty list is a failed run
     errors: list[str] = field(default_factory=list)
+    # False: the listing did not finish (Incomplete run), so the CSV covers only the Creatives listed so far
+    listing_complete: bool = True
+    listed: int = 0
+    estimate: int | None = None  # Google's rough count of Creatives
+    coverage: float | None = None
+    summary_path: Path | None = None
 
 
 def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False,
@@ -324,6 +331,34 @@ def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
     return bars
 
 
+def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult) -> dict:
+    """The run's summary.json content. Sampling fields stay empty until a sampled run fills them."""
+    accounts: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        if not r.get("ads_account_id"):
+            continue
+        a = accounts.setdefault((r["ads_account_id"], r["ads_account_source"]), {
+            "ads_account_id": r["ads_account_id"], "source": r["ads_account_source"],
+            "websites": Counter(), "formats": Counter(), "rows": 0})
+        a["rows"] += 1
+        a["websites"][r.get("website") or ""] += 1
+        a["formats"][r.get("format") or ""] += 1
+    ranked = sorted(accounts.values(), key=lambda a: -a["rows"])
+    estimate = int(q.get_meta("count_estimate") or 0) or None
+    return {
+        "listing_complete": bool(q.get_meta("list_done")),
+        "listed": len({r["creative_id"] for r in rows}),
+        "google_estimate": estimate,
+        "copy_status": dict(Counter(r["copy_status"] for r in rows)),
+        "coverage": None,
+        "sampling": None,
+        "buckets": [],
+        "ads_accounts": [{"ads_account_id": a["ads_account_id"], "source": a["source"],
+                          "websites": dict(a["websites"]), "formats": dict(a["formats"])} for a in ranked],
+        "stage_seconds": {s: {k: round(v, 1) for k, v in t.items()} for s, t in rr.stage_seconds.items()},
+    }
+
+
 def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=recognize,
            codex: CodexRunner | None = None, log: Callable[[str], None] = print_to_stderr,
            poll: float = 0.2) -> ScrapeResult:
@@ -373,10 +408,15 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
                 progress = None
 
         csv_path = run / "ads.csv"
-        n = write_csv_atomic(csv_path, CSV_FIELDS, _rows(q, options))
+        rows = _rows(q, options)
+        n = write_csv_atomic(csv_path, CSV_FIELDS, rows)
+        summary = build_summary(rows, q, rr)
+        summary_path = run / "summary.json"
+        _write_json_atomic(summary_path, summary)
         failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
         result = ScrapeResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, codex.skipped,
-                              list(rr.errors))
+                              list(rr.errors), summary["listing_complete"], summary["listed"],
+                              summary["google_estimate"], summary["coverage"], summary_path)
         _log_summary(result, codex, emit)
         return result
     finally:
@@ -400,3 +440,10 @@ def _log_summary(r: ScrapeResult, codex: CodexRunner, log: Callable[[str], None]
         log(f"error: {e}")
     if r.blocked_until is not None:
         log(f"blocked until {datetime.fromtimestamp(r.blocked_until):%H:%M}")
+    if not r.listing_complete:
+        log(incomplete_message(r))
+
+
+def incomplete_message(r: ScrapeResult) -> str:
+    of = f" of ~{r.estimate:,}" if r.estimate else ""
+    return f"INCOMPLETE: listed {r.listed:,}{of} Creatives; rerun the same command to continue"

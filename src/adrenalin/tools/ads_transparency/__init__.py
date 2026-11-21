@@ -95,6 +95,9 @@ def run(args: argparse.Namespace) -> int:
     if res.blocked_until is not None:
         print(f"blocked until {_hhmm(res.blocked_until)}; rerun the same command to continue", file=sys.stderr)
         code = 2
+    if not res.listing_complete:
+        print(api.incomplete_message(res), file=sys.stderr)
+        code = code or 3
     return code
 
 
