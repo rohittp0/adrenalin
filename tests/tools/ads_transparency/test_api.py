@@ -82,6 +82,7 @@ class FakeGoogle:
         self.missing_hosts = set()
         self.block_content_js = False
         self.content_override = None
+        self.content_status = 200
         self.detail_reply = None  # a Response served for GetCreativeById instead of DETAIL
         self.lock = threading.Lock()
 
@@ -108,6 +109,8 @@ class FakeGoogle:
                     return response(302, b"", headers={"Location": "https://www.google.com/sorry/index"}, url=url)
                 body = (self.content_video or CONTENT_VIDEO) if url in VIDEO_JS_URLS else CONTENT_TEXT
                 body = self.content_override or body
+                if self.content_status != 200:
+                    return response(self.content_status, b"Not Found", url=url)
                 return response(body=body, headers={"Content-Type": "text/javascript"}, url=url)
             if "oembed" in url:
                 self.calls["oembed"] += 1
@@ -1513,6 +1516,110 @@ def test_old_unparsed_and_store_badge_rows_are_reextracted_once(tmp_path):
     assert fake.calls["content_js"] == before + 2  # their scripts were deleted after the first extract
     run_scrape(tmp_path, fake)
     assert fake.calls["content_js"] == before + 2  # not re-extracted again
+
+
+def _text_js_item(q):
+    """The first done extract item of a text content.js Preview that was read with a headline and description."""
+    return next(i for i in q.items("extract", "done")
+                if (i.result or {}).get("preview_kind") == "content_js" and i.result.get("headline")
+                and i.result.get("description") and i.payload["preview"]["url"] not in VIDEO_JS_URLS)
+
+
+def _make_store_badge_row(tmp_path, store="Google Play"):
+    """Turn a read text content.js row into one of an older parser that took the store badge as the headline.
+    Returns (key, the correct result)."""
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    try:
+        it = _text_js_item(q)
+        old = {k: v for k, v in it.result.items() if k != "content_version"}
+        q.complete("extract", it.key, {**old, "headline": store})
+        return it.key, it.result
+    finally:
+        q.close()
+
+
+def test_stale_reread_with_script_host_blocked_does_not_halt_image_extracts(tmp_path):
+    fake, clock = FakeGoogle(), Clock()
+    run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock))
+    key, good = _make_store_badge_row(tmp_path)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    q.requeue("extract", [k for k, r in q.results("extract") if (r or {}).get("preview_kind") == "image"])
+    q.close()
+    fake.block_content_js = True
+    before = fake.calls["content_js"]
+    res = run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock))
+    assert res.blocked_until is not None and fake.calls["content_js"] == before + 1
+    images = [r for r in read_rows(res) if r["image_file"]]
+    assert len(images) == SIMGAD_CREATIVES and all(r["extraction_method"] for r in images)
+    row = row_of(res, key.split("#")[0])  # still the earlier copy, without the store badge
+    assert (row["headline"], row["description"], row["copy_status"]) == ("", good["description"], "read")
+
+    fake.block_content_js = False
+    clock.now += 901
+    res = run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock))
+    assert res.blocked_until is None and not res.failed
+    assert row_of(res, key.split("#")[0])["headline"] == good["headline"]
+    assert extract_results(tmp_path)[key]["content_version"] == good["content_version"]
+
+
+def test_stale_reread_that_404s_keeps_earlier_copy_and_is_given_up(tmp_path):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    key, good = _make_store_badge_row(tmp_path)
+    fake.content_status = 404
+    before = fake.calls["content_js"]
+    for n in range(1, 4):  # one attempt per run
+        res = run_scrape(tmp_path, fake)
+        row = row_of(res, key.split("#")[0])
+        assert (row["headline"], row["description"], row["copy_status"]) == ("", good["description"], "read")
+        assert fake.calls["content_js"] == before + n
+    assert not res.failed  # given up: the row has its copy, nothing is left to retry
+    res = run_scrape(tmp_path, fake)
+    assert fake.calls["content_js"] == before + 3 and not res.failed
+    assert row_of(res, key.split("#")[0])["copy_status"] == "read"
+
+
+def test_old_unparsed_row_with_script_on_disk_is_reextracted_without_download(tmp_path):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    try:
+        it = _text_js_item(q)
+        q.complete("extract", it.key, {"preview_kind": "content_js", "content_unparsed": True})  # no version
+    finally:
+        q.close()
+    path = run_dir(tmp_path) / it.payload["content_file"]
+    path.write_bytes(CONTENT_TEXT)  # kept for inspection, as unparsed scripts are
+    before = fake.calls["content_js"]
+    res = run_scrape(tmp_path, fake)
+    assert fake.calls["content_js"] == before and not res.failed
+    assert row_of(res, it.key.split("#")[0])["headline"] == it.result["headline"]
+    assert not path.exists()
+
+
+def test_stale_reread_keeps_earlier_copy_until_extract_runs(tmp_path):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    key, good = _make_store_badge_row(tmp_path)
+    before = fake.calls["content_js"]
+    res = run_scrape(tmp_path, fake, stage="fetch")  # downloads the script again, but extract doesn't run
+    assert fake.calls["content_js"] == before + 1
+    row = row_of(res, key.split("#")[0])
+    assert (row["headline"], row["description"], row["copy_status"]) == ("", good["description"], "read")
+    res = run_scrape(tmp_path, fake)
+    assert fake.calls["content_js"] == before + 1  # read from the downloaded file
+    assert row_of(res, key.split("#")[0])["headline"] == good["headline"]
+
+
+@pytest.mark.parametrize("store", ["Google Play", "App Store"])
+def test_stage_export_never_shows_a_store_badge_headline(tmp_path, store):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    key, good = _make_store_badge_row(tmp_path, store)
+    res = run_scrape(tmp_path, fake, stage="export")
+    assert not any(r["headline"] in ("Google Play", "App Store") for r in read_rows(res))
+    row = row_of(res, key.split("#")[0])
+    assert (row["headline"], row["description"], row["copy_status"]) == ("", good["description"], "read")
 
 
 def test_next_round_reads_ahead_only_after_a_novelty_round(tmp_path):

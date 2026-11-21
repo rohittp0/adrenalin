@@ -46,6 +46,9 @@ CONTENT_DIR = "content"
 # runs whose detail response for a Broken Preview's Creative could not be parsed before the Preview counts as
 # confirmed broken: a response that stays unparsable would otherwise cost one RPC on every run
 UNPARSABLE_DETAIL_RUNS = 3
+# script item payload flag: download again the deleted script of a stale content.js read (see `AdsStages.script`);
+# the script item's result key recording that the download was given up
+REREAD, REREAD_GIVEN_UP = "reread", "reread_given_up"
 
 # (concurrency, throttle_on, max_ahead), from the plan's backpressure limits.
 # A stage that throttles on a blocked stage stops with it (see Pipeline): list and detail stop when script is
@@ -309,11 +312,26 @@ class AdsStages:
         return result
 
     def script(self, item: Item, q: WorkQueue) -> dict:
+        """Download a content.js Preview for extract. A `reread` item is a done row read by an older parser
+        (`stale_content_read`) whose script was deleted: its extract item is queued again only once the script is
+        on disk, keeping its result until the new read is done; a download that fails on every retry is given
+        up and the row keeps its earlier copy."""
         p = preview_from_dict(item.payload.get("preview"))
+        reread = bool(item.payload.get(REREAD))
+        try:
+            data = self._get_ok(p.url).content
+        except requests.RequestException as e:
+            if not reread or item.attempts + 1 < q.max_attempts:  # `attempts` counts earlier claims
+                raise
+            self.warn(f"content.js of {item.key} could not be downloaded again ({e}); its earlier copy is kept")
+            return {REREAD_GIVEN_UP: f"{type(e).__name__}: {e}"}
         # The script (often 150-450 KB) goes to a file, never into the queue database.
         rel = content_file(item.key)
-        write_atomic(self.ctx.run / rel, self._get_ok(p.url).content)
-        q.put("extract", item.key, {**item.payload, "content_file": rel}, update_payload=True)
+        write_atomic(self.ctx.run / rel, data)
+        payload = {k: v for k, v in item.payload.items() if k != REREAD}
+        q.put("extract", item.key, {**payload, "content_file": rel}, update_payload=True)
+        if reread:
+            sample_queue.requeue_keeping_result(q, [item.key])
         return {}
 
     # -- extract ------------------------------------------------------------
@@ -426,7 +444,9 @@ class AdsStages:
                 raise FileNotFoundError("no content file recorded")
             data = path.read_bytes()
         except FileNotFoundError:
-            data = self._get_ok(p.url).content  # file lost (crash, cleanup): download it again
+            # An in-flight item's file was lost (crash, cleanup): download it again. Stale reads of done rows never
+            # get here without their file (see `api._reread_stale_content`).
+            data = self._get_ok(p.url).content
         return data.decode("utf-8", errors="replace")
 
     def extract_done(self, item: Item, result: dict | None) -> None:
