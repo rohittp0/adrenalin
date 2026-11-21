@@ -1395,7 +1395,8 @@ def test_rerun_of_a_full_read_stays_a_full_read(tmp_path, monkeypatch):
 def test_round_during_a_failed_listing_is_deferred_and_seeded_again(tmp_path):
     q = _queue_with_groups(tmp_path)
     q.set_meta("list_done", "")  # the listing did not finish this run
-    item = Item("sample", "round:0", {}, None, "running", None)
+    q.put("sample", "round:0", {})
+    item = q.claim("sample")
     assert sample_queue.run_round(q, item, _settings(), lambda m: None) == {"deferred": True}
     q.complete("sample", "round:0", {"deferred": True})
     assert q.count("held", "pending") == 5 and q.backlog("sample") == 0
