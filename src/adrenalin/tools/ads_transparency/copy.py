@@ -550,6 +550,10 @@ def extract_image(
             r = load_ocr()
         except OcrUnavailable as e:
             no_ocr = e
+    if r is None and no_ocr is None:  # forced vision: an OCR read from an earlier run may know the image is broken
+        r_cached = next((_ocr_from_dict(hit) for m in OCR_METHODS if (hit := cache.get(key, m)) is not None), None)
+        if r_cached is not None and is_broken_preview(r_cached.text):
+            return AdCopy(preview_broken=True)
     if r is not None and is_broken_preview(r.text):
         return AdCopy(preview_broken=True)  # before Codex: it would only read the error page again
     copy = parse(r) if r is not None else None
@@ -557,7 +561,8 @@ def extract_image(
     if force_vision or no_ocr is not None or needs_vision(r, copy):
         fields, pending = _vision(path, key, cache, codex, warn)
         if fields is not None:
-            if is_broken_preview(f"{fields.get('headline') or ''} {fields.get('full_text') or ''}"):
+            if is_broken_preview(" ".join(
+                    str(fields.get(k) or "") for k in ("brand", "headline", "description", "full_text"))):
                 return AdCopy(preview_broken=True)
             return _vision_copy(fields, codex.model)
         if r is None and no_ocr is None:  # forced vision yielded nothing: fall back to OCR

@@ -745,3 +745,27 @@ def test_video_renderer2_parsed():
     assert c.headline == "Cheap Hotels・Hotels70"
     assert c.description.startswith("Cheap hotels anytime!")
     assert c.method == "content_js"
+
+
+def test_forced_vision_uses_cached_broken_ocr_before_codex(tmp_path):
+    cache, codex = _cache(tmp_path), FakeCodex({"brand": "B", "confidence": 0.9})
+    try:
+        extract_image(tmp_path / "x.png", "br3", "text", cache=cache, codex=codex, force_vision=False,
+                      ocr=_broken_ocr, warn=lambda m: None)  # the OCR read is cached
+        c = extract_image(tmp_path / "x.png", "br3", "text", cache=cache, codex=codex, force_vision=True,
+                          ocr=_never, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and codex.calls == 0
+
+
+@pytest.mark.parametrize("field", ["brand", "description"])
+def test_broken_codex_result_checked_in_brand_and_description(tmp_path, field):
+    cache = _cache(tmp_path)
+    codex = FakeCodex({field: "500. That's an error. Please try again later.", "confidence": 0.9})
+    try:
+        c = extract_image(tmp_path / "x.png", "br4", "text", cache=cache, codex=codex, force_vision=True,
+                          ocr=_never, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and not getattr(c, field)
