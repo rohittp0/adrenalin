@@ -20,6 +20,7 @@ from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
 from adrenalin.common.progress import Bar, QueueProgress, stage_bar
 from adrenalin.tools.ads_transparency import sampling
+from adrenalin.tools.ads_transparency.copy import is_broken_preview
 from adrenalin.tools.ads_transparency.rpc import (
     HOST,
     ListedCreative,
@@ -190,6 +191,11 @@ def _remove_done_content(q: WorkQueue, run: Path) -> None:
             f.unlink(missing_ok=True)
 
 
+def _confirmed_broken(r: dict | None) -> bool:
+    """A Broken Preview whose other Variations were checked: permanent, never worth another Codex or RPC call."""
+    return bool((r or {}).get("preview_broken") and not (r or {}).get("broken_unverified"))
+
+
 def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], None]) -> None:
     # Requeues only when the stage that redoes the work runs: a requeue clears the item's result,
     # so e.g. `--stage export` must not blank copy it cannot re-extract.
@@ -206,10 +212,16 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
     if options.vision:
         # Every --vision run retries image rows Codex hasn't read yet (first --vision, Codex errors).
         q.requeue("extract", [k for k, r in done
-                              if (r or {}).get("preview_kind") == "image" and (r or {}).get("method") != "codex"])
+                              if (r or {}).get("preview_kind") == "image" and (r or {}).get("method") != "codex"
+                              and not _confirmed_broken(r)])
     q.set_meta("options", json.dumps({"vision": options.vision}))
     # Codex-limit deferrals are re-extracted on every run until Codex reads them.
     q.requeue("extract", [k for k, r in done if (r or {}).get("vision_pending")])
+    # Rows read before Broken Previews were detected still hold the error page as copy; and a Broken Preview whose
+    # other Variations could not be checked (block, network) is checked again.
+    q.requeue("extract", [k for k, r in done if (r or {}).get("preview_kind") == "image"
+                          and ((r or {}).get("broken_unverified")
+                               or is_broken_preview(f"{r.get('headline') or ''} {r.get('full_text') or ''}"))])
 
 
 def _join(v) -> str:
@@ -296,8 +308,8 @@ def _rows(q: WorkQueue, options: ScrapeOptions, groups: dict[str, SampleGroup] |
             "video_id": c.get("video_id", ""),
             "video_url": watch_url(c["video_id"]) if c.get("video_id") else "",
             "video_title": c.get("video_title", ""),
-            "preview_url": p.get("url", ""),
-            "image_file": (f.result or {}).get("image_file", ""),
+            "preview_url": c.get("preview_url") or p.get("url", ""),  # the Variation actually read
+            "image_file": c.get("image_file") or (f.result or {}).get("image_file", ""),
             "image_width": _blank(p.get("width")),
             "image_height": _blank(p.get("height")),
             "logo_url": c.get("logo_url", ""),

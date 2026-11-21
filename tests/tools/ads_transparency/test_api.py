@@ -81,6 +81,7 @@ class FakeGoogle:
         self.missing_hosts = set()
         self.block_content_js = False
         self.content_override = None
+        self.detail_reply = None  # a Response served for GetCreativeById instead of DETAIL
         self.lock = threading.Lock()
 
     def __call__(self, method, url, params=None, data=None, **kw):
@@ -93,7 +94,7 @@ class FakeGoogle:
                 return out if isinstance(out, requests.Response) else response(body=out, url=url)
             if "GetCreativeById" in url:
                 self.calls["detail"] += 1
-                return response(body=DETAIL, url=url)
+                return self.detail_reply or response(body=DETAIL, url=url)
             if "simgad" in url:
                 self.calls["simgad"] += 1
                 if self.fail_simgad:
@@ -137,7 +138,19 @@ def make_session(tmp_path, fake, clock=None, sleep=None, wait_on_block=False):
                         transport=fake, sleep=sleep or (lambda s: None), clock=clock, wait_on_block=wait_on_block)
 
 
+BROKEN_IDS: set[str] = set()  # image names (file stems) that OCR reads as Google's error page; "*" = all
+BROKEN_OCR_LINES = ["500.", "That’s an error.", "There was an error. Please try again later."]
+
+
+@pytest.fixture(autouse=True)
+def _reset_broken_ids():
+    BROKEN_IDS.clear()
+
+
 def fake_ocr(path):
+    if BROKEN_IDS & {"*", Path(path).stem}:
+        return OcrResult([OcrLine(t, 0.95, (0.1, 0.1 + i * 0.1, 0.5, 0.05))
+                          for i, t in enumerate(BROKEN_OCR_LINES)], "apple_vision")
     lines = [
         OcrLine("Lascade", 0.95, (0.05, 0.05, 0.3, 0.05)),
         OcrLine("www.lascade.com", 0.95, (0.05, 0.12, 0.4, 0.05)),
@@ -801,6 +814,157 @@ def test_progress_bars_show_creatives_and_stages_and_carry_the_log(tmp_path, cap
     q = WorkQueue(res.csv_path.parent / "state.sqlite3")
     assert q.get_meta("count_estimate") == "600"  # Google's band on the first page
     q.close()
+
+
+# -- Broken Preview ---------------------------------------------------------------------------------
+
+BROKEN_ID = "877210798417700731"  # a listed image; DETAIL's other Variation is 10849098364905980222
+
+
+def extract_results(tmp_path, run="anywhere_all_all"):
+    q = WorkQueue(run_dir(tmp_path, run) / "state.sqlite3")
+    try:
+        return {k: r or {} for k, r in q.results("extract")}
+    finally:
+        q.close()
+
+
+def broken_key(tmp_path):
+    return next(k for k, r in extract_results(tmp_path).items() if r.get("preview_broken"))
+
+
+def broken_creative():
+    """Creative ID of the listing whose image is BROKEN_ID."""
+    from adrenalin.tools.ads_transparency.rpc import parse_search_page
+    return next(c.creative_id for c in parse_search_page(SEARCH).creatives
+                if c.preview and c.preview.image_id == BROKEN_ID)
+
+
+def row_of(res, creative_id, variation="1"):
+    return next(r for r in read_rows(res) if r["creative_id"] == creative_id and r["variation"] == variation)
+
+
+def test_broken_preview_recovered_from_other_variation(tmp_path):
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    res = run_scrape(tmp_path, fake)
+    assert res.failed == {} and fake.calls["detail"] == 1
+    results = extract_results(tmp_path)
+    got = next(r for k, r in results.items() if r.get("variation_used"))
+    assert got["variation_used"] == 2 and not got.get("preview_broken") and got["headline"] == "Big Bold Headline"
+    assert not any(r.get("preview_broken") for r in results.values())
+    assert (tmp_path / ENT / "images" / "10849098364905980222.png").exists()
+    row = row_of(res, broken_creative())
+    assert row["copy_status"] == "read" and row["headline"] == "Big Bold Headline"
+    # the row shows the Variation that was read, not the broken one
+    assert row["image_file"] == "images/10849098364905980222.png"
+    assert row["preview_url"].endswith("/10849098364905980222")
+
+
+def test_broken_preview_all_variations_broken(tmp_path):
+    BROKEN_IDS.add("*")
+    fake = FakeGoogle()
+    codex_run = FakeCodexRun()
+    res = run_scrape(tmp_path, fake, codex_runner=codex(run=codex_run))
+    assert res.failed == {} and codex_run.calls == 0
+    broken = [r for r in extract_results(tmp_path).values() if r.get("preview_kind") == "image"]
+    assert len(broken) == SIMGAD_CREATIVES
+    assert all(r["preview_broken"] and not r["broken_unverified"] and not r.get("variation_used")
+               and not r["headline"] for r in broken)
+    row = row_of(res, broken_creative())
+    assert row["copy_status"] == "preview_broken" and not row["headline"]
+    assert row["image_file"] == f"images/{BROKEN_ID}.png"
+
+
+def test_broken_preview_detail_blocked_retries_next_run(tmp_path):
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    fake.detail_reply = response(302, b"", {"Location": "https://www.google.com/sorry/index"})
+    clock = Clock()
+    session = make_session(tmp_path, fake, clock)
+    res = run_scrape(tmp_path, fake, session=session)
+    assert res.failed == {}
+    key = broken_key(tmp_path)
+    first = extract_results(tmp_path)[key]
+    assert first["preview_broken"] and first["broken_unverified"] and not first["variation_used"]
+    assert row_of(res, broken_creative())["copy_status"] == "preview_broken"
+    fake.detail_reply = None
+    clock.now += 1000  # cooldown passed
+    res = run_scrape(tmp_path, fake, session=session)
+    assert res.failed == {}
+    got = extract_results(tmp_path)[key]
+    assert got["variation_used"] == 2 and not got.get("preview_broken") and not got.get("broken_unverified")
+    assert row_of(res, broken_creative())["copy_status"] == "read"
+
+
+def test_broken_preview_unparsable_detail_is_unverified(tmp_path):
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    fake.detail_reply = response(body={"1": {}})  # no variations list: parse_detail raises ValueError
+    res = run_scrape(tmp_path, fake)
+    assert res.failed == {}
+    got = extract_results(tmp_path)[broken_key(tmp_path)]
+    assert got["broken_unverified"]
+
+
+def test_vision_reruns_do_not_retry_a_confirmed_broken_preview(tmp_path):
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    fake.detail_reply = response(body={"1": {"5": []}})  # no other Variation: the Broken Preview is confirmed
+    run_scrape(tmp_path, fake)
+    assert fake.calls["detail"] == 1
+    assert not extract_results(tmp_path)[broken_key(tmp_path)]["broken_unverified"]
+    codex_run = FakeCodexRun()
+    for _ in range(2):
+        res = run_scrape(tmp_path, fake, codex_runner=codex(run=codex_run), vision=True)
+        assert res.failed == {}
+    assert fake.calls["detail"] == 1  # no detail RPC on the --vision runs
+    assert extract_results(tmp_path)[broken_key(tmp_path)]["preview_broken"]
+    # Codex read every other image once (first --vision run) and nothing on the second
+    assert codex_run.calls == SIMGAD_CREATIVES - 1
+
+
+def test_variations_mode_does_not_use_the_fallback(tmp_path):
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    res = run_scrape(tmp_path, fake, variations=True)
+    assert res.failed == {} and fake.calls["detail"] == 40  # the detail stage only
+    row = row_of(res, broken_creative())
+    assert row["copy_status"] == "preview_broken" and not row["headline"]
+    results = extract_results(tmp_path, "anywhere_all_all_variations")
+    assert not any(r.get("variation_used") for r in results.values())
+
+
+class ErrorPageCodexRun(FakeCodexRun):
+    """Codex reading the error page as if it were ad copy, as it did before Broken Previews were detected."""
+
+    def __call__(self, argv, **kwargs):
+        super().__call__(argv, **kwargs)
+        Path(argv[argv.index("-o") + 1]).write_text(json.dumps({
+            "headline": "500. That's an error.", "full_text": "There was an error. Please try again later.",
+            "confidence": 0.9}))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+def test_old_row_with_error_page_copy_is_reextracted_once(tmp_path, monkeypatch):
+    from adrenalin.tools.ads_transparency import copy as copy_mod
+
+    BROKEN_IDS.add(BROKEN_ID)
+    fake = FakeGoogle()
+    with monkeypatch.context() as m:  # a run from before Broken Previews were detected
+        m.setattr(copy_mod, "is_broken_preview", lambda text: False)
+        run_scrape(tmp_path, fake, codex_runner=codex(run=ErrorPageCodexRun()))
+    key = f"{broken_creative()}#1"
+    old = extract_results(tmp_path)[key]
+    assert "That" in old["headline"] + old["full_text"] and not old.get("preview_broken")
+    assert fake.calls["detail"] == 0
+    res = run_scrape(tmp_path, fake)
+    got = extract_results(tmp_path)[key]
+    assert got["variation_used"] == 2 and got["headline"] == "Big Bold Headline"
+    assert row_of(res, broken_creative())["copy_status"] == "read"
+    assert fake.calls["detail"] == 1
+    run_scrape(tmp_path, fake)
+    assert fake.calls["detail"] == 1  # not re-extracted again
 
 
 COPY = {"headline": "Buy now"}
