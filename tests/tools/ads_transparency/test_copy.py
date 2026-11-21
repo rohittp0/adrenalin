@@ -681,3 +681,46 @@ def test_video_all_caps_copy_is_not_a_store_label():
     c = parse_content_js(_video("Brand", "Hotels from 29 EUR", "SAVE 70% ON HOTELS",
                                 "Book now and save big on stays.", "Install", "App"))
     assert (c.headline, c.description) == ("SAVE 70% ON HOTELS", "Book now and save big on stays.")
+
+
+# -- Broken Preview -------------------------------------------------------------------------------
+
+BROKEN_TEXT = ["500.", "That’s an error.", "There was an error. Please try again later."]
+
+
+def _broken_ocr(path):
+    return OcrResult([OcrLine(t, 0.95, (0.1, 0.1 + i * 0.1, 0.5, 0.05)) for i, t in enumerate(BROKEN_TEXT)],
+                     "apple_vision")
+
+
+def test_is_broken_preview():
+    from adrenalin.tools.ads_transparency.copy import is_broken_preview
+
+    assert is_broken_preview("500. That’s an error. | There was an error. Please try again later.")
+    assert is_broken_preview("500. That's an error. | There was an error. Please try again later.")
+    assert not is_broken_preview("$49 Flights")
+    assert not is_broken_preview("That's an error")
+    assert not is_broken_preview("")
+
+
+def test_broken_ocr_skips_codex(tmp_path):
+    cache, codex = _cache(tmp_path), FakeCodex({"brand": "B", "confidence": 0.9})
+    try:
+        c = extract_image(tmp_path / "x.png", "br1", "text", cache=cache, codex=codex, force_vision=False,
+                          ocr=_broken_ocr, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and codex.calls == 0
+    assert not (c.brand or c.headline or c.description or c.display_url or c.full_text)
+
+
+def test_broken_codex_result_is_a_broken_preview(tmp_path):
+    cache = _cache(tmp_path)
+    codex = FakeCodex({"headline": "500. That’s an error.", "full_text": "Please try again later.",
+                       "confidence": 0.9})
+    try:
+        c = extract_image(tmp_path / "x.png", "br2", "text", cache=cache, codex=codex, force_vision=True,
+                          ocr=_never, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and codex.calls == 1 and not c.headline and not c.full_text
