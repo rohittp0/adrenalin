@@ -16,8 +16,8 @@ from adrenalin.common.http import Cooldown, PacedSession
 from adrenalin.common.ocr import OcrLine, OcrResult, OcrUnavailable
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.output import EntityCollision
-from adrenalin.common.pipeline import WorkQueue
-from adrenalin.tools.ads_transparency import sampling
+from adrenalin.common.pipeline import Item, WorkQueue
+from adrenalin.tools.ads_transparency import sample_queue, sampling
 from adrenalin.tools.ads_transparency.api import (
     COPY_STATUSES,
     CSV_FIELDS,
@@ -25,9 +25,10 @@ from adrenalin.tools.ads_transparency.api import (
     copy_status,
     infer_accounts,
     list_creatives,
+    _progress_bars,
     scrape,
 )
-from adrenalin.tools.ads_transparency.rpc import preview_ids
+from adrenalin.tools.ads_transparency.rpc import Query, preview_ids
 
 FIX = Path(__file__).parents[2] / "fixtures" / "ads_transparency"
 AR = "AR04752318142645010433"
@@ -1228,3 +1229,164 @@ def test_resumed_listing_without_page_estimate_uses_the_stored_one(tmp_path, sma
     fake.search = lambda req: p2 if req.get("4") == "CUR1" else sorry  # only the cursor page, which has no estimate
     run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock=Clock(2_000_000.0)))
     assert stored_sampling(tmp_path)[0]["p"] == 5 / 600
+
+
+# -- review fixes -------------------------------------------------------------
+
+def no_copy_ocr(path):
+    return OcrResult([], "apple_vision")
+
+
+def empty_codex():
+    def run(argv, **kwargs):
+        Path(argv[argv.index("-o") + 1]).write_text(json.dumps({
+            "brand": "", "display_url": "", "headline": "", "description": "", "cta": "", "full_text": "",
+            "confidence": 0.0}))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+    return codex(run=run)
+
+
+def test_no_readable_messages_stops_after_the_minimums(tmp_path, small_limits):
+    page = single_page()
+    page["1"] = [c for c in page["1"] if "simgad" in json.dumps(c["3"])]  # image Previews only
+    logs = []
+    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, FakeGoogle(search=lambda r: page)),
+                 ocr=no_copy_ocr, codex=empty_codex(), log=logs.append, poll=POLL)
+    rows = read_rows(res)
+    assert len(rows) == SIMGAD_CREATIVES and not any(r["headline"] for r in rows)
+    # every group's minimum, then stop: Coverage can't be estimated, so reading on would read everything
+    floor = sum(min(sampling.MIN_PER_BUCKET, b["inventory"]) for b in summary_of(res)["buckets"])
+    assert len(processed(rows)) == floor < SIMGAD_CREATIVES
+    assert any(f"Coverage unknown: no readable Messages after {floor} Creatives" in m for m in logs)
+
+
+def _queue_with_groups(tmp_path):
+    """One group: two read Creatives with different Messages (Coverage 0), two read without copy, five held."""
+    q = WorkQueue(tmp_path / "state.sqlite3")
+    fields = {"format": "image", "first_shown": "2026-10-01", "last_shown": "2026-10-02", "days_shown": 2,
+              "variation": 1, "preview": {"kind": "image", "url": "https://tpc/simgad/1", "width": 1, "height": 1}}
+    for c, result in [("A1", {"headline": "One"}), ("A2", {"headline": "Two"}),
+                      ("A3", {"preview_kind": "content_js"}), ("A4", {"preview_kind": "content_js"})]:
+        q.put("fetch", f"{c}#1", {**fields, "creative_id": c})
+        q.complete("fetch", f"{c}#1", {})
+        q.put("extract", f"{c}#1", {})
+        q.complete("extract", f"{c}#1", result)
+    for c in ("H1", "H2", "H3", "H4", "H5"):
+        q.put("held", f"{c}#1", {**fields, "creative_id": c})
+    q.set_meta("list_done", "2026-11-20")
+    return q
+
+
+def _settings():
+    return sample_queue.RoundSettings(False, Query(AR, None, None, None), date(2026, 11, 21), False, 0.95, None)
+
+
+def test_round_stops_when_last_novelty_round_found_no_message(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    logs = []
+    item = Item("sample", "round:3", {"admitted": ["A3", "A4"], "novelty": True}, None, "running", None)
+    out = sample_queue.run_round(q, item, _settings(), logs.append)
+    assert out["admitted"] == 0 and q.count("held", "pending") == 5 and q.backlog("sample") == 0
+    assert any("no readable Message" in m for m in logs)
+    # a round after one that did find Messages keeps sampling
+    item = Item("sample", "round:4", {"admitted": ["A1", "A4"], "novelty": True}, None, "running", None)
+    assert sample_queue.run_round(q, item, _settings(), logs.append)["admitted"] > 0
+    q.close()
+
+
+def test_max_ads_caps_the_head_start(tmp_path, monkeypatch):
+    monkeypatch.setattr(sampling, "FULL_READ_LIMIT", 10)
+    monkeypatch.setattr(sampling, "HEAD_START", 600)  # alone, it would admit all 40 while listing
+    res = scrape(ScrapeOptions(AR, out=tmp_path, max_ads=32), session=make_session(tmp_path, FakeGoogle()),
+                 ocr=ocr_with_messages(), codex=codex(), log=lambda m: None, poll=POLL)
+    meta, _ = stored_sampling(tmp_path)
+    assert meta["p"] == 32 / 600
+    assert len(processed(read_rows(res))) == 32
+
+
+def test_variations_weights_follow_variation_1(tmp_path, small_limits):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake, variations=True)
+    name = "anywhere_all_all_variations"
+    q = WorkQueue(run_dir(tmp_path, name) / "state.sqlite3")
+    read = sorted({k.partition("#")[0] for k, _ in q.results("extract")})
+    a, b, c = read[:3]
+    q.requeue("extract", [f"{a}#2"])  # A: Variation 1 read, Variation 2 pending
+    q.complete("extract", f"{b}#2", {"preview_kind": "content_js"})  # B: Variation 2 has no copy
+    q.requeue("extract", [f"{c}#1"])  # C: Variation 1 pending, Variation 2 read
+    q.close()
+    rows = read_rows(run_scrape(tmp_path, fake, variations=True, stage="export"))
+    by = {}
+    for r in rows:
+        by.setdefault(r["creative_id"], {})[r["variation"]] = r
+    assert by[a]["2"]["copy_status"] == "pending" and by[b]["2"]["copy_status"] == "no_copy"
+    for cr in (a, b):
+        assert by[cr]["1"]["sample_weight"] == by[cr]["2"]["sample_weight"] != ""
+    assert by[c]["1"]["sample_weight"] == by[c]["2"]["sample_weight"] == ""
+    # The group comes from the listed Preview, which a Variation row doesn't show.
+    q = WorkQueue(run_dir(tmp_path, name) / "state.sqlite3")
+    group = sample_queue.sample_groups(q, True, Query(AR, None, None, None), date.today()).group_of
+    q.close()
+    weights: Counter = Counter()
+    for r in rows:
+        if r["variation"] == "1" and r["sample_weight"]:
+            weights[group[r["creative_id"]]] += float(r["sample_weight"])
+    res = run_scrape(tmp_path, fake, variations=True, stage="export")
+    buckets = [b for b in summary_of(res)["buckets"] if b["read"]]
+    assert buckets and res.rows == len(rows)
+    for bucket in buckets:
+        assert weights[bucket["bucket"]] == pytest.approx(bucket["inventory"], abs=1e-6)
+
+
+def test_round_left_pending_waits_for_the_relist(tmp_path, small_limits):
+    fake = FakeGoogle()
+    ocr = ocr_with_messages(pool=20)
+
+    def run(target):
+        return scrape(ScrapeOptions(AR, out=tmp_path, coverage=target), session=make_session(tmp_path, fake),
+                      ocr=ocr, codex=codex(), log=lambda m: None, poll=POLL)
+
+    first = len(processed(read_rows(run(0.3))))
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    q.put("sample", "round:99", {})  # left pending by an interrupted run
+    q.close()
+    second = len(processed(read_rows(run(0.99))))  # an open window: the rerun relists first
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    results = [r for _, r in q.results("sample")]
+    q.close()
+    assert not any((r or {}).get("deferred") for r in results)  # no round ran while the Inventory was relisted
+    assert second > first
+
+
+def test_progress_total_is_the_listed_inventory_on_sampled_runs(tmp_path):
+    q = WorkQueue(tmp_path / "state.sqlite3")
+    for k in ("A#1", "B#1"):
+        q.put("fetch", k, {})
+    for k in ("C#1", "D#1", "E#1"):
+        q.put("held", k, {})
+    q.set_meta("list_done", "2026-11-20")
+    q.set_meta("sampling", json.dumps({"p": 0.1}))
+    creatives = _progress_bars(q, ["list", "sample", "fetch"])[0]
+    assert creatives.count(q.counts()) == (0, 5)
+    q.close()
+
+
+def test_stage_list_then_full_run_samples(tmp_path, small_limits):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake, stage="list")
+    assert fake.calls["simgad"] == 0
+    rows = read_rows(run_scrape(tmp_path, fake))
+    assert len(rows) == 40 == len({r["creative_id"] for r in rows})
+    assert 29 <= len(processed(rows)) < 40 and not any(r["copy_status"] == "pending" for r in rows)
+
+
+def test_rerun_of_a_full_read_stays_a_full_read(tmp_path, monkeypatch):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    monkeypatch.setattr(sampling, "FULL_READ_LIMIT", 10)  # the estimate (600) would now mean sampling
+    monkeypatch.setattr(sampling, "HEAD_START", 5)
+    rows = read_rows(res := run_scrape(tmp_path, fake))  # open window: relists
+    meta, held = stored_sampling(tmp_path)
+    assert meta["p"] == 1.0 and held == 0
+    assert len(processed(rows)) == 40 and all(r["sample_weight"] == "1.0" for r in rows)
+    assert summary_of(res)["sampling"] is None

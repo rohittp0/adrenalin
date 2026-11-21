@@ -55,7 +55,7 @@ def message_of(extract_status: str | None, result: dict | None, fmt: str) -> str
 class SampleGroup:
     held: list[str] = field(default_factory=list)  # held keys, in admission-hash order
     admitted: int = 0  # Creatives sent to reading (read, pending or failed)
-    processed: int = 0  # Creatives whose copy reading finished (copy status neither pending nor not_sampled)
+    processed: int = 0  # Creatives whose copy reading finished (Variation 1 neither pending nor not_sampled)
     messages: list[str] = field(default_factory=list)  # one per processed Creative (Variation 1); "" if none
 
     @property
@@ -63,36 +63,55 @@ class SampleGroup:
         return self.admitted + len(self.held)
 
 
+@dataclass
+class SampleAccount:
+    """The run's Copy sample counted per Creative, from Variation 1 only (so `--variations` rows don't count twice)."""
+    groups: dict[str, SampleGroup] = field(default_factory=dict)
+    group_of: dict[str, str] = field(default_factory=dict)  # Creative -> group
+    processed: set[str] = field(default_factory=set)  # Creatives whose Variation 1 copy reading finished
+    message: dict[str, str] = field(default_factory=dict)  # processed Creative -> countable Message ("" if none)
+
+    def weight(self, creative_id: str, sampled: bool) -> float | str:
+        """A Creative's sample weight, for all its rows: its group's Inventory / Creatives read (1.0 on a full
+        read), or "" while its Variation 1 is unread. Per group, the weights of Variation 1 rows sum to the
+        Inventory."""
+        if creative_id not in self.processed:
+            return ""
+        if not sampled:
+            return 1.0
+        g = self.groups[self.group_of[creative_id]]
+        return sampling.sample_weight(g.inventory, g.processed)
+
+
 def _admission_rank(key: str) -> str:
     return hashlib.sha1(key.partition("#")[0].encode()).hexdigest()
 
 
-def sample_groups(q: WorkQueue, variations: bool, query: Query, today: date) -> tuple[dict[str, SampleGroup],
-                                                                                     dict[str, str]]:
-    """Per-group Inventory, reads and Messages of the run, counted per Creative (Variation 1 only), and each
-    Creative's group."""
-    groups: dict[str, SampleGroup] = {}
-    of_creative: dict[str, str] = {}
+def sample_groups(q: WorkQueue, variations: bool, query: Query, today: date) -> SampleAccount:
+    """Per-group Inventory, reads and Messages of the run, and each Creative's group and Message."""
+    acc = SampleAccount()
     extracted = dict(q.results("extract"))
     for it in q.items(listing_stage(variations)):
         cr = it.payload["creative_id"]
-        if cr in of_creative:
+        if cr in acc.group_of:
             continue
-        g = groups.setdefault(of_creative.setdefault(cr, sample_group(it.payload, query, today)), SampleGroup())
+        g = acc.groups.setdefault(acc.group_of.setdefault(cr, sample_group(it.payload, query, today)), SampleGroup())
         g.admitted += 1
         key = f"{cr}#1"
         status = "done" if key in extracted else None
         result = extracted.get(key)
         if copy_status(status, {**(result or {}), "format": it.payload.get("format", "")}) != "pending":
             g.processed += 1
-            g.messages.append(message_of(status, result, it.payload.get("format", "")))
+            acc.processed.add(cr)
+            acc.message[cr] = message_of(status, result, it.payload.get("format", ""))
+            g.messages.append(acc.message[cr])
     for it in sorted(q.items(HELD), key=lambda i: _admission_rank(i.key)):
         cr = it.payload["creative_id"]
-        if cr in of_creative:
+        if cr in acc.group_of:
             continue  # already admitted (a stale held copy); never count a Creative twice
-        g = groups.setdefault(of_creative.setdefault(cr, sample_group(it.payload, query, today)), SampleGroup())
+        g = acc.groups.setdefault(acc.group_of.setdefault(cr, sample_group(it.payload, query, today)), SampleGroup())
         g.held.append(it.key)
-    return groups, of_creative
+    return acc
 
 
 def seed_round(q: WorkQueue) -> None:
@@ -123,16 +142,20 @@ class RoundSettings:
 
 
 def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], None]) -> dict:
-    """One sampling round (the `sample` stage's worker). It runs once every admitted Creative has been read: it
-    stops at the Coverage target (or `max_ads`) once every group has its minimum, otherwise it admits the next
-    held Creatives and queues the next round, before this one completes."""
+    """One sampling round (the `sample` stage's worker). It runs once the listing is done and every admitted
+    Creative has been read. Once every group has its minimum it stops at the Coverage target, at `max_ads`, or when
+    Coverage can't be estimated; otherwise it admits the next held Creatives and queues the next round (with the
+    Creatives it admitted), before this one completes."""
     if not q.get_meta("list_done"):
-        # A relist is under way: the Inventory is incomplete. list_page queues a new round when it finishes.
+        # The listing failed this run, so the Inventory is incomplete: list_page queues a round when it finishes.
         return {"deferred": True}
-    groups, _ = sample_groups(q, s.variations, s.query, s.today)
+    acc = sample_groups(q, s.variations, s.query, s.today)
+    groups = acc.groups
     read = sum(g.admitted for g in groups.values())
     inventory = sum(g.inventory for g in groups.values())
     cov = sampling.coverage([m for g in groups.values() for m in g.messages])
+    stopped = {"admitted": 0, "read": read, "coverage": cov}
+    novelty = False
     if s.read_all:
         chosen = [k for g in groups.values() for k in g.held]
     else:
@@ -141,8 +164,18 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
         quotas_met = all(g.admitted >= min(sampling.MIN_PER_BUCKET, g.inventory) for g in groups.values())
         if sampling.should_stop(cov, read, s.coverage, s.max_ads, quotas_met):
             _log_stop(log, cov, s.coverage, read, inventory)
-            return {"admitted": 0, "read": read, "coverage": cov}
+            return stopped
+        if quotas_met and cov is None and len(acc.processed) >= min(sampling.HEAD_START, inventory):
+            # Without countable Messages Coverage is never estimated, and reading on would read everything.
+            log(f"sample: Coverage unknown: no readable Messages after {len(acc.processed):,} Creatives; stopping")
+            return stopped
+        last = item.payload.get("admitted") or []
+        if quotas_met and item.payload.get("novelty") and not any(acc.message.get(c) for c in last):
+            log(f"sample: the last round's {len(last):,} Creatives gave no readable Message (all failed or without "
+                f"copy); stopping with Coverage {'unknown' if cov is None else f'{cov:.3f}'}")
+            return stopped
         # Minimums first, alone: novelty is judged only once every group has reads to judge it by.
+        novelty = quotas_met
         batch = 0 if not quotas_met else ROUND_BATCH if s.max_ads is None else \
             max(0, min(ROUND_BATCH, s.max_ads - read))
         states = {k: sampling.BucketState(g.inventory, g.admitted, g.messages) for k, g in groups.items()}
@@ -150,10 +183,11 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
         chosen = [key for k, n in plan.items() for key in groups[k].held[:n]]
     if not chosen:
         _log_stop(log, cov, s.coverage, read, inventory)
-        return {"admitted": 0, "read": read, "coverage": cov}
+        return stopped
     q.move(HELD, listing_stage(s.variations), chosen)
     # The next round goes in while this one still runs, so the stage never looks finished between rounds.
-    q.put("sample", f"round:{_rounds(q)}", {})
+    q.put("sample", f"round:{_rounds(q)}",
+          {"admitted": [k.partition("#")[0] for k in chosen], "novelty": novelty})
     return {"admitted": len(chosen), "read": read, "coverage": cov}
 
 

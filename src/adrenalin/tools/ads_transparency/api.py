@@ -29,7 +29,14 @@ from adrenalin.tools.ads_transparency.rpc import (
     preview_ids,
     transparency_url,
 )
-from adrenalin.tools.ads_transparency.sample_queue import HELD, SampleGroup, sample_groups, sampling_meta, seed_round
+from adrenalin.tools.ads_transparency.sample_queue import (
+    HELD,
+    SampleAccount,
+    listing_stage,
+    sample_groups,
+    sampling_meta,
+    seed_round,
+)
 from adrenalin.tools.ads_transparency.stages import (
     CONTENT_DIR,
     STAGE_NAMES,
@@ -71,8 +78,8 @@ class ScrapeOptions:
     proxies: tuple[str, ...] = ()
     progress: bool = False  # tqdm progress bars on stderr
     # Copy sample (ADR 0003): a large Inventory is read until Coverage reaches `coverage`; `read_all` reads every
-    # Creative; `max_ads` stops sampling once that many Creatives are read (the random head start admitted while
-    # listing and each bucket's minimum are read regardless).
+    # Creative; `max_ads` caps the Creatives read, head start included (the cap may be exceeded only by the
+    # per-bucket minimum of 3).
     read_all: bool = False
     coverage: float = 0.95
     max_ads: int | None = None
@@ -258,10 +265,9 @@ def is_sampled(q: WorkQueue) -> bool:
     return sampling_meta(q).get("p", 1.0) < 1.0
 
 
-def _rows(q: WorkQueue, options: ScrapeOptions, groups: dict[str, SampleGroup] | None = None,
-          of_creative: dict[str, str] | None = None) -> list[dict]:
-    """CSV rows: every Variation that reached fetch, plus one `not_sampled` row per held Creative. With `groups`
-    (a Copy sample), read rows weigh their group's Inventory / Creatives read; otherwise 1.0."""
+def _rows(q: WorkQueue, options: ScrapeOptions, sample: SampleAccount, sampled: bool) -> list[dict]:
+    """CSV rows: every Variation that reached fetch, plus one `not_sampled` row per held Creative. Every row of a
+    Creative carries the Creative's weight (`SampleAccount.weight`, decided by its Variation 1)."""
     region = _region_label(options.region)
     listing: dict[str, dict] = {}
     if options.variations:
@@ -277,12 +283,7 @@ def _rows(q: WorkQueue, options: ScrapeOptions, groups: dict[str, SampleGroup] |
         item = None if is_held else extracts.get(f.key)
         c = (item.result if item and item.status == "done" else None) or {}
         status = copy_status(item.status if item else None, {**c, "format": pl.get("format", "")}, held=is_held)
-        weight: object = ""
-        if status not in ("not_sampled", "pending"):
-            weight = 1.0
-            if groups is not None and of_creative is not None:
-                g = groups[of_creative[pl["creative_id"]]]
-                weight = sampling.sample_weight(g.inventory, g.processed) if g.processed else ""
+        weight = "" if is_held else sample.weight(pl["creative_id"], sampled)
         account, ad_group = preview_ids(p.get("url", "")) if p.get("kind") == "content_js" else ("", "")
         cr = pl["creative_id"]
         conf = c.get("confidence")
@@ -331,6 +332,9 @@ def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
     """A creatives bar (Google's estimated total until the listing finishes, then the exact count) and one bar per
     running stage."""
     def listed(c: dict) -> int:
+        if is_sampled(q):  # the listed Inventory: admitted Creatives (fetch, or detail with --variations) and held
+            stage = listing_stage(any(s == "detail" for s, _ in c))
+            return sum(n for (s, _), n in c.items() if s in (stage, HELD))
         return sum(n for (s, _), n in c.items() if s == "fetch")
 
     def list_finished() -> bool:
@@ -353,10 +357,11 @@ def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
     return bars
 
 
-def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult,
-                  groups: dict[str, SampleGroup] | None = None) -> dict:
-    """The run's summary.json content. Coverage, sampling and buckets are filled for a Copy sample (`groups`)
-    and stay empty for a full read."""
+def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult, account: SampleAccount | None = None) -> dict:
+    """The run's summary.json content. Coverage, sampling and buckets are filled for a Copy sample (`account`)
+    and stay empty for a full read. Counts are per Creative (Variation 1), so with `--variations` the
+    `sample_weight` of Variation 1 rows sums to each bucket's Inventory."""
+    groups = account.groups if account is not None else None
     accounts: dict[tuple[str, str], dict] = {}
     for r in rows:
         if not r.get("ads_account_id"):
@@ -441,11 +446,11 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
                 progress = None
 
         csv_path = run / "ads.csv"
-        groups, of_creative = (sample_groups(q, options.variations, query, ctx.today()) if is_sampled(q)
-                               else (None, None))
-        rows = _rows(q, options, groups, of_creative)
+        account = sample_groups(q, options.variations, query, ctx.today())
+        sampled = is_sampled(q)
+        rows = _rows(q, options, account, sampled)
         n = write_csv_atomic(csv_path, CSV_FIELDS, rows)
-        summary = build_summary(rows, q, rr, groups)
+        summary = build_summary(rows, q, rr, account if sampled else None)
         summary_path = run / "summary.json"
         _write_json_atomic(summary_path, summary)
         failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}

@@ -49,7 +49,8 @@ CONTENT_DIR = "content"
 _STAGE_CONFIG = {
     "list": (1, ("detail", "fetch", "script", "extract"), 200),
     # a round decides on complete reads only, so it waits until every admitted Creative has been read
-    "sample": (1, ("detail", "fetch", "script", "extract"), 0),
+    # and, through `list`, until the listing is done: a round left pending by an earlier run waits out a relist
+    "sample": (1, ("list", "detail", "fetch", "script", "extract"), 0),
     "detail": (1, ("fetch", "script", "extract"), 50),
     "fetch": (4, ("extract",), 50),
     "script": (1, ("extract",), 50),
@@ -244,7 +245,7 @@ class AdsStages:
         if "p" not in meta:
             # Cursor pages may carry no estimate: fall back to one stored from an earlier page.
             estimate = estimate or int(q.get_meta("count_estimate") or 0) or None
-            meta["p"] = sampling.admit_probability(estimate, self.ctx.read_all)
+            meta["p"] = sampling.admit_probability(estimate, self.ctx.read_all, self.ctx.max_ads)
             q.set_meta("sampling", json.dumps(meta))
         return meta["p"]
 
