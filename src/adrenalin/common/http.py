@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -109,6 +110,19 @@ def describe_response(resp: requests.Response, read_body: bool = True) -> str:
     return " ".join(parts)
 
 
+@dataclass(frozen=True)
+class AdaptivePace:
+    """A host's pace that adapts: `speedup` x after `clean_streak` clean responses in a row (down to
+    `floor`), `slowdown` x on a 429, 5xx, block, timeout or connection error (up to `ceiling`). Intervals are in
+    seconds."""
+    start: float
+    floor: float
+    ceiling: float
+    speedup: float = 0.9
+    slowdown: float = 2.0
+    clean_streak: int = 20
+
+
 class PacedSession:
     def __init__(
         self,
@@ -125,7 +139,10 @@ class PacedSession:
         clock: Callable[[], float] = time.time,
         rng: Callable[[], float] = random.random,
         log: Callable[[str], None] | None = None,
+        adaptive: Mapping[str, AdaptivePace] = {},
     ):
+        self._adaptive = dict(adaptive)
+        self._adaptive_state: dict[str, list[float]] = {h: [a.start, 0] for h, a in self._adaptive.items()}
         self._cooldown = cooldown
         self._log = log
         self._custom_transport = transport
@@ -153,9 +170,33 @@ class PacedSession:
         with self._locks_guard:
             return self._locks.setdefault(host, threading.Lock())
 
+    def interval(self, host: str) -> float:
+        """The current base interval of a host."""
+        with self._host_lock(host):
+            if host in self._adaptive_state:
+                return self._adaptive_state[host][0]
+        return self._intervals.get(host, self._default_interval)[0]
+
+    def _record(self, host: str, clean: bool) -> None:
+        """Feed an adaptive host's pace one response: clean, or a 429, 5xx, block or network error."""
+        cfg = self._adaptive.get(host)
+        if cfg is None:
+            return
+        with self._host_lock(host):
+            state = self._adaptive_state[host]
+            if not clean:
+                state[0], state[1] = min(cfg.ceiling, state[0] * cfg.slowdown), 0
+                return
+            state[1] += 1
+            if state[1] >= cfg.clean_streak:
+                state[0], state[1] = max(cfg.floor, state[0] * cfg.speedup), 0
+
     def _pace(self, host: str) -> None:
         base, jitter = self._intervals.get(host, self._default_interval)
         with self._host_lock(host):
+            if host in self._adaptive_state:
+                base = self._adaptive_state[host][0]
+                jitter = 0.3 * base
             last = self._last.get(host)
             if last is not None:
                 delay = base - jitter + 2 * jitter * self._rng()
@@ -190,11 +231,16 @@ class PacedSession:
                 with self._proxy_lock:
                     p = next(self._proxies)
                 send["proxies"] = {"http": p, "https": p}
-            resp = self._transport(method, url, **send)
+            try:
+                resp = self._transport(method, url, **send)
+            except requests.RequestException:
+                self._record(host, clean=False)  # a timeout or dropped connection is a sign to slow down too
+                raise
 
             # stream=True callers (the host check) never download the body, so only the URL tells a block
             read_body = not kwargs.get("stream")
             if is_block_response(resp, read_body=read_body):
+                self._record(host, clean=False)
                 until = self._block(host)
                 self._warn(f"{host} sent a block page ({describe_response(resp, read_body)})")
                 if self._wait_on_block and block_waits < self._max_retries:
@@ -202,6 +248,7 @@ class PacedSession:
                     continue
                 raise Blocked(host, until)
 
+            self._record(host, clean=resp.status_code != 429 and resp.status_code < 500)
             if resp.status_code == 429:
                 if attempt >= self._max_retries:
                     self._warn(f"{host} still rate-limits after {attempt} backoffs ({describe_response(resp)})")
@@ -226,6 +273,7 @@ class PacedSession:
             max_retries=self._max_retries if max_retries is None else max_retries,
             block_seconds=self._block_seconds, transport=self._custom_transport,
             sleep=self._sleep, clock=self._clock, rng=self._rng, log=self._log,
+            adaptive=self._adaptive,
         )
 
     def _warn(self, message: str) -> None:

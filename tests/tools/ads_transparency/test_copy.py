@@ -681,3 +681,99 @@ def test_video_all_caps_copy_is_not_a_store_label():
     c = parse_content_js(_video("Brand", "Hotels from 29 EUR", "SAVE 70% ON HOTELS",
                                 "Book now and save big on stays.", "Install", "App"))
     assert (c.headline, c.description) == ("SAVE 70% ON HOTELS", "Book now and save big on stays.")
+
+
+# -- Broken Preview -------------------------------------------------------------------------------
+
+BROKEN_TEXT = ["500.", "That’s an error.", "There was an error. Please try again later."]
+
+
+def _broken_ocr(path):
+    return OcrResult([OcrLine(t, 0.95, (0.1, 0.1 + i * 0.1, 0.5, 0.05)) for i, t in enumerate(BROKEN_TEXT)],
+                     "apple_vision")
+
+
+def test_is_broken_preview():
+    from adrenalin.tools.ads_transparency.copy import is_broken_preview
+
+    assert is_broken_preview("500. That’s an error. | There was an error. Please try again later.")
+    assert is_broken_preview("500. That's an error. | There was an error. Please try again later.")
+    assert not is_broken_preview("$49 Flights")
+    assert not is_broken_preview("That's an error")
+    assert not is_broken_preview("")
+
+
+def test_broken_ocr_skips_codex(tmp_path):
+    cache, codex = _cache(tmp_path), FakeCodex({"brand": "B", "confidence": 0.9})
+    try:
+        c = extract_image(tmp_path / "x.png", "br1", "text", cache=cache, codex=codex, force_vision=False,
+                          ocr=_broken_ocr, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and codex.calls == 0
+    assert not (c.brand or c.headline or c.description or c.display_url or c.full_text)
+
+
+def test_broken_codex_result_is_a_broken_preview(tmp_path):
+    cache = _cache(tmp_path)
+    codex = FakeCodex({"headline": "500. That’s an error.", "full_text": "Please try again later.",
+                       "confidence": 0.9})
+    try:
+        c = extract_image(tmp_path / "x.png", "br2", "text", cache=cache, codex=codex, force_vision=True,
+                          ocr=_never, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and codex.calls == 1 and not c.headline and not c.full_text
+
+
+@pytest.mark.parametrize("store", ["Google Play", "App Store"])
+def test_store_badge_is_not_a_headline(store):
+    from adrenalin.tools.ads_transparency.copy import _video_headline_description
+
+    strings = ["Hotels70", store, "Cheap hotel deals tonight", "Install"]
+    headline, description = _video_headline_description(strings, "Hotels70")
+    assert headline != store
+    assert store not in description
+    assert description == "Cheap hotel deals tonight"
+
+
+def test_video_renderer2_parsed():
+    c = parse_content_js((FIX / "content_video_renderer2.js").read_text(encoding="utf-8"))
+    assert c is not None
+    assert c.video_id == "fvu_CcMOAc4"
+    assert c.brand == "Hotels70"
+    assert c.headline == "Cheap Hotels・Hotels70"
+    assert c.description.startswith("Cheap hotels anytime!")
+    assert c.method == "content_js"
+
+
+def test_forced_vision_uses_cached_broken_ocr_before_codex(tmp_path):
+    cache, codex = _cache(tmp_path), FakeCodex({"brand": "B", "confidence": 0.9})
+    try:
+        extract_image(tmp_path / "x.png", "br3", "text", cache=cache, codex=codex, force_vision=False,
+                      ocr=_broken_ocr, warn=lambda m: None)  # the OCR read is cached
+        c = extract_image(tmp_path / "x.png", "br3", "text", cache=cache, codex=codex, force_vision=True,
+                          ocr=_never, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and codex.calls == 0
+
+
+@pytest.mark.parametrize("field", ["brand", "description"])
+def test_broken_codex_result_checked_in_brand_and_description(tmp_path, field):
+    cache = _cache(tmp_path)
+    codex = FakeCodex({field: "500. That's an error. Please try again later.", "confidence": 0.9})
+    try:
+        c = extract_image(tmp_path / "x.png", "br4", "text", cache=cache, codex=codex, force_vision=True,
+                          ocr=_never, warn=lambda m: None)
+    finally:
+        cache.close()
+    assert c.preview_broken and not getattr(c, field)
+
+
+def test_app_install_values_keep_apostrophes():
+    js = ("'layout': 'uac_youtube_video_v2', 'shortAppName': 'Rio's Hotels', 'appName': 'Rio's Hotels: "
+          "Book Now', 'shortDescription': 'Don't miss Rio's best deals', 'developer': 'Rio'}")
+    c = parse_content_js(js)
+    assert (c.brand, c.headline) == ("Rio's Hotels", "Rio's Hotels: Book Now")
+    assert c.description == "Don't miss Rio's best deals"

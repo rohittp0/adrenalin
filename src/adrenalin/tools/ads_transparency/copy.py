@@ -49,6 +49,7 @@ class AdCopy:
     image_urls: list[str] = field(default_factory=list)
     confidence: float | None = None
     vision_pending: bool = False
+    preview_broken: bool = False  # the image is Google's own "500. That's an error." page, not the ad
 
     @property
     def has_copy(self) -> bool:
@@ -104,12 +105,31 @@ def _template_data(raw: str) -> dict[str, str]:
     return {k: _decode_escapes(v) for k, v in pair.findall("{" + block)}
 
 
+_APP_KEYS = ("shortAppName", "appName", "shortDescription", "appIconHighRes", "developer", "appStoreName")
+
+
+def _app_install_data(s: str) -> dict[str, str]:
+    """The second video renderer (layout `uac_youtube_video_v2`, ~145 KB, no `adData` block and no
+    `ytimg.com/vi/` URL; it is the app-install video Preview of a Play Store app). Investigated on six real
+    Previews: the ad text sits in a flat, JS-object-literal dict of `'key': 'value'` pairs: `video_videoId`
+    (the YouTube ID), `shortAppName`, `appName` (the store title), `shortDescription`, `developer`,
+    `appStoreName`, `appIconHighRes`. The markup carries no other copy. `s` is the decoded text. Empty when the
+    keys are absent."""
+    if not re.search(r"'layout':\s*'uac_youtube_video_v2'", s):
+        return {}
+    # a value ends at a quote followed by the next key or the dict's end, so "Rio's" stays whole
+    out = {k: (m.group(1) if (m := re.search(r"'" + k + r"':\s*'(.*?)'(?=\s*[,}])", s)) else "") for k in _APP_KEYS}
+    return out if out["shortAppName"] or out["appName"] or out["shortDescription"] else {}
+
+
 def parse_content_js(js: str) -> AdCopy | None:
     c = AdCopy()
     found = False
     s = _decode_escapes(js)
 
     if m := re.search(r"ytimg\.com/vi/([\w-]+)/", s):
+        c.video_id, found = m.group(1), True
+    elif m := re.search(r"'video_videoId':\s*'([\w-]+)'", s):
         c.video_id, found = m.group(1), True
 
     if m := re.search(r"adurl=(https?%3A[^&\"'\s\\<>]+)", s, re.I):
@@ -124,7 +144,13 @@ def parse_content_js(js: str) -> AdCopy | None:
         c.image_urls = [tpl[k] for k in _IMAGE_KEYS if tpl.get(k)]
         found = found or bool(c.headline or c.description or c.brand or c.logo_url or c.image_urls)
 
-    strings = _markup_strings(s)
+    app = _app_install_data(s)
+    if app:
+        c.brand, c.headline, c.description = app["shortAppName"], app["appName"], app["shortDescription"]
+        c.logo_url = app["appIconHighRes"]
+        found = True
+
+    strings = [] if app else _markup_strings(s)
     if not c.video_id:
         if len(strings) >= 3 and not (c.headline or c.brand or c.description):
             c.brand = strings[0]
@@ -154,6 +180,7 @@ def parse_content_js(js: str) -> AdCopy | None:
 
 # Play Store info labels in app-install Previews; each is followed by its value. Matched exactly: other
 # all-caps strings ("BIG SALE") are ad copy.
+_STORE_NAMES = {"Google Play", "App Store"}  # the store badge shown on app-install ads: never copy
 _STORE_LABELS = {"DOWNLOADS", "CATEGORY", "DEVELOPER", "RATING", "RATINGS", "REVIEWS", "INSTALLS", "SIZE", "PRICE"}
 
 
@@ -167,7 +194,7 @@ def _video_headline_description(strings: list[str], brand: str) -> tuple[str, st
     for t in strings[:cta]:
         if label:
             label = False  # the value after a store-info label
-        elif t == brand:
+        elif t == brand or t in _STORE_NAMES:
             continue
         elif t in _STORE_LABELS:
             label = True
@@ -181,6 +208,24 @@ def _video_headline_description(strings: list[str], brand: str) -> tuple[str, st
     before = body[:body.index(description)]
     headline = next((t for t in reversed(before) if t not in description), "")
     return headline, description
+
+
+# Bumped when content.js parsing improves, so reads of an earlier version that failed are read again, once.
+CONTENT_JS_VERSION = 2
+
+
+def stale_content_read(r: dict) -> bool:
+    """A content.js read from before the current parser that it would now get right: not parsed at all, or the
+    store badge ("Google Play") taken as the headline."""
+    from_js = r.get("preview_kind") == "content_js" or r.get("method") == "content_js"  # older rows: no preview_kind
+    return (from_js and (r.get("content_version") or 1) < CONTENT_JS_VERSION
+            and bool(r.get("content_unparsed") or r.get("headline") in _STORE_NAMES))
+
+
+def shown_copy(r: dict | None) -> dict | None:
+    """An extract result as it is exported and counted: a store badge an earlier parser took as the headline is
+    never copy. The stored result keeps it, so `stale_content_read` still finds the row."""
+    return {**r, "headline": ""} if r and r.get("headline") in _STORE_NAMES else r
 
 
 def parse_content_preview(js: str, url: str) -> AdCopy | None:
@@ -400,6 +445,13 @@ def verify_hosts(c: AdCopy, host_exists) -> None:
         _doubt(c)
 
 
+def is_broken_preview(text: str) -> bool:
+    """Whether text read from an image is Google's error page: the Creative was archived as a picture of its own
+    "500. That's an error." page (a Broken Preview). Permanent: every download returns the same bytes."""
+    t = (text or "").replace("’", "'").lower()
+    return "that's an error" in t and "please try again later" in t
+
+
 def needs_vision(r: OcrResult, copy: AdCopy | None) -> bool:
     return (not r.lines or r.confidence < MIN_CONFIDENCE or copy is None
             or (copy.confidence is not None and copy.confidence < MIN_CONFIDENCE))
@@ -517,15 +569,26 @@ def extract_image(
             r = load_ocr()
         except OcrUnavailable as e:
             no_ocr = e
+    if r is None and no_ocr is None:  # forced vision: an OCR read from an earlier run may know the image is broken
+        r_cached = next((_ocr_from_dict(hit) for m in OCR_METHODS if (hit := cache.get(key, m)) is not None), None)
+        if r_cached is not None and is_broken_preview(r_cached.text):
+            return AdCopy(preview_broken=True)
+    if r is not None and is_broken_preview(r.text):
+        return AdCopy(preview_broken=True)  # before Codex: it would only read the error page again
     copy = parse(r) if r is not None else None
     pending = False
     if force_vision or no_ocr is not None or needs_vision(r, copy):
         fields, pending = _vision(path, key, cache, codex, warn)
         if fields is not None:
+            if is_broken_preview(" ".join(
+                    str(fields.get(k) or "") for k in ("brand", "headline", "description", "full_text"))):
+                return AdCopy(preview_broken=True)
             return _vision_copy(fields, codex.model)
         if r is None and no_ocr is None:  # forced vision yielded nothing: fall back to OCR
             try:
                 r = load_ocr()
+                if is_broken_preview(r.text):
+                    return AdCopy(preview_broken=True)
                 copy = parse(r)
             except OcrUnavailable as e:
                 no_ocr = e
@@ -541,3 +604,31 @@ def extract_image(
     copy = copy or AdCopy()
     copy.vision_pending = pending
     return copy
+
+
+_BROKEN_TEXT_KEYS = ("brand", "headline", "description", "full_text")
+COPY_STATUSES = ("read", "not_sampled", "pending", "no_copy", "preview_broken", "unreadable")
+
+
+def copy_status(extract_status: str | None, result: dict | None, held: bool = False, exhausted: bool = False) -> str:
+    """Why a row has or lacks copy. `extract_status` is the extract item's status (None: no item yet);
+    `held` is a Creative left out of the sample; `exhausted`: reading it failed on every retry, in any stage.
+    `result["format"]` is the Creative's format, when known."""
+    if held:
+        return "not_sampled"
+    if extract_status != "done":
+        return "unreadable" if exhausted else "pending"
+    r = result or {}
+    if r.get("preview_broken") or is_broken_preview(" ".join(str(r.get(k) or "") for k in _BROKEN_TEXT_KEYS)):
+        return "preview_broken"  # stored text of the error page: a row read before Broken Previews were detected
+    if r.get("content_unparsed"):
+        return "unreadable"
+    if any(r.get(k) for k in ("brand", "headline", "description", "display_url")):
+        return "read"
+    if r.get("vision_pending"):
+        return "pending"  # the Codex read was deferred (cap or breaker), so "no copy" is not known yet
+    if r.get("preview_kind") == "content_js":
+        return "no_copy"
+    if r.get("preview_kind") == "image" and not r.get("full_text") and r.get("format") in ("image", "video"):
+        return "no_copy"
+    return "unreadable"

@@ -3,6 +3,7 @@ import json
 import sqlite3
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,18 +23,20 @@ class Item:
     result: dict | None
     status: str
     error: str | None
+    attempts: int = 0  # claims so far; a failed item with `max_attempts` of them is never retried
 
 
-_COLS = "stage, key, payload, result, status, error"
+_COLS = "stage, key, payload, result, status, error, attempts"
 
 
 def _item(row) -> Item:
     return Item(row[0], row[1], json.loads(row[2]), json.loads(row[3]) if row[3] is not None else None,
-                row[4], row[5])
+                row[4], row[5], row[6])
 
 
 class WorkQueue:
     def __init__(self, path: Path, *, max_attempts: int = 3):
+        self.max_attempts = max_attempts
         self._lock = threading.Lock()
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.execute("PRAGMA journal_mode=WAL")
@@ -101,6 +104,20 @@ class WorkQueue:
                 "WHERE stage=? AND key=?",
                 [(stage, k) for k in keys])
 
+    def move(self, stage_from: str, stage_to: str, keys: Iterable[str]) -> None:
+        """Move items to another stage as fresh pending work, in one transaction. A key the target stage already
+        has keeps the target's item; the source item is dropped either way."""
+        rows = [(stage_to, stage_from, k) for k in keys]
+        with self._lock, self._db:
+            self._db.executemany(
+                "UPDATE OR IGNORE items SET stage=?, status='pending', result=NULL, error=NULL, attempts=0 "
+                "WHERE stage=? AND key=?", rows)
+            self._db.executemany("DELETE FROM items WHERE stage=? AND key=?", [(s, k) for _, s, k in rows])
+
+    def has(self, stage: str, key: str) -> bool:
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM items WHERE stage=? AND key=?", (stage, key)).fetchone() is not None
+
     def backlog(self, *stages: str) -> int:
         if not stages:
             return 0
@@ -127,6 +144,18 @@ class WorkQueue:
             rows = self._db.execute("SELECT key, result FROM items WHERE stage=? AND status=? ORDER BY id",
                                     (stage, status)).fetchall()
         return [(k, json.loads(r) if r is not None else None) for k, r in rows]
+
+    def exhausted(self, stage: str) -> set[str]:
+        """Keys of failed items that used up their attempts: no run retries them (only a requeue does)."""
+        with self._lock:
+            rows = self._db.execute("SELECT key FROM items WHERE stage=? AND status='failed' AND attempts>=?",
+                                    (stage, self.max_attempts)).fetchall()
+        return {r[0] for r in rows}
+
+    def item(self, stage: str, key: str) -> Item | None:
+        with self._lock:
+            row = self._db.execute(f"SELECT {_COLS} FROM items WHERE stage=? AND key=?", (stage, key)).fetchone()
+        return None if row is None else _item(row)
 
     def items(self, stage: str, status: str | None = None) -> list[Item]:
         sql, args = f"SELECT {_COLS} FROM items WHERE stage=?", [stage]
@@ -157,7 +186,8 @@ class Stage:
     worker: Callable[[Item, WorkQueue], dict | None]
     concurrency: int = 1
     throttle_on: tuple[str, ...] = ()
-    max_ahead: int = 0
+    # backlog the stage may run ahead of `throttle_on` by; a callable is asked again before every claim
+    max_ahead: int | Callable[[], int] = 0
     # called after the item is marked done; errors are logged and never fail the item
     on_done: Callable[[Item, dict | None], None] | None = None
 
@@ -168,11 +198,14 @@ class RunResult:
     # all failed items in the queue, including ones exhausted in earlier runs
     failed: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # per stage: `busy` (time in workers, summed across threads) and `waiting` (throttle and empty-queue waits)
+    stage_seconds: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 class Pipeline:
     def __init__(self, queue: WorkQueue, stages: Sequence[Stage], *, poll: float = 0.2,
-                 log: Callable[[str], None] = print_to_stderr):
+                 log: Callable[[str], None] = print_to_stderr,
+                 clock: Callable[[], float] = time.monotonic):
         names = [s.name for s in stages]
         if len(set(names)) != len(names):
             raise ValueError(f"stage names must be unique: {names}")
@@ -181,6 +214,7 @@ class Pipeline:
             if unknown:
                 raise ValueError(f"stage {s.name!r} throttles on unknown stage(s) {unknown}")
         self.queue, self.stages, self.poll, self.log = queue, list(stages), poll, log
+        self.clock = clock
 
     def run(self) -> RunResult:
         q, poll = self.queue, self.poll
@@ -189,6 +223,8 @@ class Pipeline:
         live = {s.name: s.concurrency for s in self.stages}
         live_lock = threading.Lock()
         result = RunResult()
+        result.stage_seconds = {s.name: {"busy": 0.0, "waiting": 0.0} for s in self.stages}
+        clock = self.clock
         state_lock = threading.Lock()
         upstream = {s.name: [p.name for p in self.stages[:i]] for i, s in enumerate(self.stages)}
         halted: set[str] = set()  # blocked stages and the stages stopped because they wait on one
@@ -211,22 +247,38 @@ class Pipeline:
 
         def throttled(stage: Stage) -> bool:
             live_targets = tuple(n for n in stage.throttle_on if not finished[n].is_set())
-            return bool(live_targets) and q.backlog(*live_targets) > stage.max_ahead
+            if not live_targets:
+                return False
+            ahead = stage.max_ahead() if callable(stage.max_ahead) else stage.max_ahead
+            return q.backlog(*live_targets) > ahead
+
+        def add_seconds(name: str, kind: str, t0: float) -> None:
+            with state_lock:
+                result.stage_seconds[name][kind] += clock() - t0
+
+        def idle(name: str) -> None:
+            t0 = clock()
+            stopped[name].wait(poll)
+            add_seconds(name, "waiting", t0)
 
         def loop(stage: Stage) -> None:
             name = stage.name
             while not stopped[name].is_set():
                 if throttled(stage):
-                    stopped[name].wait(poll)
+                    idle(name)
                     continue
                 item = q.claim(name)
                 if item is None:
                     if all(finished[u].is_set() for u in upstream[name]) and q.backlog(name) == 0:
                         return
-                    stopped[name].wait(poll)
+                    idle(name)
                     continue
+                t0 = clock()
                 try:
-                    out = stage.worker(item, q)
+                    try:
+                        out = stage.worker(item, q)
+                    finally:
+                        add_seconds(name, "busy", t0)
                     q.complete(name, item.key, out)
                 except Blocked as exc:
                     q.release(name, item.key)

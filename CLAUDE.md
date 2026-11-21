@@ -41,6 +41,6 @@ Code lives in `src/adrenalin/` in three layers:
 
 **Refactor shared logic into `common/` aggressively.** When a second tool needs logic that already exists inside another tool, move it into `common/` instead of duplicating it. Check `common/` before writing a new helper inside a tool.
 
-`ads-transparency` (`tools/ads_transparency/`): `rpc.py` (Google's internal RPCs over plain HTTP), `stages.py` (the queue stages List, Detail, Fetch (images), Script (`content.js`) and Extract), `copy.py` (ad copy: `content.js` Previews, OCR layout rules for `simgad` images, the Codex fallback and the OCR domain check), `api.py` (`scrape()`, `ScrapeOptions`, and Export: CSV columns and rows).
+`ads-transparency` (`tools/ads_transparency/`): `rpc.py` (Google's internal RPCs over plain HTTP), `stages.py` (the queue stages List, Sample, Detail, Fetch (images), Script (`content.js`) and Extract; see ADR 0003 for Sample), `sampling.py` (pure Copy sample rules: Messages, Coverage, buckets, allocation, weights), `sample_queue.py` (the Copy sample on the queue: `held` Creatives, groups and per-Creative weights, and the Sample stage's rounds), `copy.py` (ad copy and Copy status: `content.js` Previews, OCR layout rules for `simgad` images, the Codex fallback and the OCR domain check), `api.py` (`scrape()`, `ScrapeOptions`, and Export: CSV columns and rows).
 
 Output goes to `out/<tool>/<entity>/runs/<run>/` (git-ignored).

@@ -85,6 +85,25 @@ def _run(q, stages):
     return result
 
 
+def test_stage_seconds_reported(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "seed", {})
+    now = [0.0]
+
+    def a(item, queue):
+        now[0] += 2.0
+        queue.put("B", "1", {})
+
+    def b(item, queue):
+        now[0] += 3.0
+
+    result = Pipeline(q, [Stage("A", a), Stage("B", b)], poll=0.01, log=quiet, clock=lambda: now[0]).run()
+    assert set(result.stage_seconds) == {"A", "B"}
+    assert result.stage_seconds["A"]["busy"] > 0 and result.stage_seconds["B"]["busy"] > 0
+    assert all("waiting" in v for v in result.stage_seconds.values())
+    q.close()
+
+
 def test_items_flow_through_stages_in_order(tmp_path):
     q = WorkQueue(tmp_path / "q.sqlite3")
     q.put("A", "seed", {})
@@ -289,4 +308,64 @@ def test_on_done_runs_after_complete_and_its_errors_do_not_fail_the_item(tmp_pat
     assert sorted(seen) == [("1", {"k": "1"}), ("2", {"k": "2"})]
     assert res.failed == {} and q.count("A", "done") == 2
     assert any("cleanup failed" in m for m in logs)
+    q.close()
+
+
+def test_move_changes_stage_and_resets_status(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("held", "1", {"v": 1})
+    q.put("held", "2", {"v": 2})
+    q.put("held", "3", {"v": 3})
+    q.put("fetch", "3", {"v": 30})
+    q.move("held", "fetch", ["1", "3", "missing"])
+    assert [i.key for i in q.items("held")] == ["2"]
+    got = {i.key: i for i in q.items("fetch")}
+    assert got["1"].payload == {"v": 1} and got["1"].status == "pending"
+    assert got["3"].payload == {"v": 30}  # the target's item wins; the source copy is dropped
+    assert q.backlog("fetch") == 2 and q.claim("fetch").key == "1"
+    q.close()
+
+
+def test_has(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "1", {})
+    assert q.has("A", "1") and not q.has("A", "2") and not q.has("B", "1")
+    q.close()
+
+
+def test_exhausted_lists_failed_items_out_of_attempts(tmp_path):
+    p = tmp_path / "q.sqlite3"
+    q = WorkQueue(p, max_attempts=2)
+    q.put("A", "1", {})
+    q.put("A", "2", {})
+    for _ in range(2):
+        q.claim("A")
+        q.fail("A", "1", "boom")
+        assert q.claim("A").key == "2"
+        q.release("A", "2")
+        q.close()
+        q = WorkQueue(p, max_attempts=2)
+    q.claim("A")
+    q.fail("A", "2", "boom")  # failed once: retried on the next run
+    assert q.exhausted("A") == {"1"}
+    assert [i.attempts for i in q.items("A")] == [2, 1]
+    q.close()
+
+
+def test_max_ahead_can_be_decided_per_claim(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(10):
+        q.put("A", str(i), {})
+    limit = {"n": 0}
+    seen = []
+
+    def a(item, queue):
+        queue.put("B", item.key, {})
+
+    def b(item, queue):
+        seen.append(queue.backlog("B"))
+        time.sleep(0.01)
+
+    _run(q, [Stage("A", a, throttle_on=("B",), max_ahead=lambda: limit["n"]), Stage("B", b)])
+    assert len(q.items("B", "done")) == 10 and max(seen) <= 1
     q.close()

@@ -85,3 +85,27 @@ def test_cli_scrape_error_exits_1(monkeypatch, capsys):
     monkeypatch.setattr(api, "scrape", boom)
     assert main(["ads-transparency", "AR1"]) == 1
     assert "No creatives found for AR1" in capsys.readouterr().err
+
+
+def test_cli_stage_export_of_incomplete_run_exits_3(monkeypatch, capsys):
+    capture(monkeypatch, ScrapeResult(Path("out/x/ads.csv"), 3, None, {}, 0, listing_complete=False,
+                                      listed=3, estimate=10))
+    assert main(["ads-transparency", "AR1", "--stage", "export"]) == 3
+    assert "INCOMPLETE" in capsys.readouterr().err
+
+
+def test_cli_sampling_options(monkeypatch):
+    seen = capture(monkeypatch)
+    assert main(["ads-transparency", "AR1"]) == 0
+    assert (seen[0].read_all, seen[0].coverage, seen[0].max_ads) == (False, 0.95, None)
+    assert main(["ads-transparency", "AR1", "--all", "--coverage", "0.9", "--max-ads", "100"]) == 0
+    assert (seen[1].read_all, seen[1].coverage, seen[1].max_ads) == (True, 0.9, 100)
+
+
+@pytest.mark.parametrize("args", [["--coverage", "1.5"], ["--coverage", "0"], ["--coverage", "1"],
+                                  ["--max-ads", "0"]])
+def test_cli_rejects_bad_coverage_and_max_ads(monkeypatch, args):
+    capture(monkeypatch)
+    with pytest.raises(SystemExit) as e:
+        main(["ads-transparency", "AR1", *args])
+    assert e.value.code == 2

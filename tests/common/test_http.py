@@ -278,3 +278,69 @@ def test_derived_session_keeps_the_log(tmp_path):
     with pytest.raises(Blocked):
         e.session.derive(max_retries=0).get("https://a.com/x")
     assert "Location=" + SORRY in logs[0]
+
+
+from adrenalin.common.http import AdaptivePace  # noqa: E402
+
+
+def _adaptive_env(tmp_path, start=1.0, replies=(), **kw):
+    return Env(tmp_path, replies=replies, intervals={"fixed.com": (1.0, 0.0)},
+               adaptive={"img.com": AdaptivePace(start, 0.2, 4.0)}, **kw)
+
+
+def test_adaptive_speeds_up_after_clean_streak(tmp_path):
+    e = _adaptive_env(tmp_path)
+    for _ in range(19):
+        e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == 1.0
+    e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == pytest.approx(0.9)
+    for _ in range(400):
+        e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == pytest.approx(0.2)
+
+
+def test_adaptive_slows_on_429_and_5xx(tmp_path):
+    e = _adaptive_env(tmp_path, start=0.5, replies=[resp(503)])
+    assert e.session.get("https://img.com/x").status_code == 503
+    assert e.session.interval("img.com") == 1.0
+    for _ in range(5):
+        e.replies.append(resp(500))
+        e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == 4.0
+    e2 = _adaptive_env(tmp_path / "b", start=0.5, replies=[resp(429, headers={"Retry-After": "1"})])
+    e2.session.get("https://img.com/x")
+    assert e2.session.interval("img.com") == 1.0
+
+
+def test_adaptive_slows_on_block(tmp_path):
+    e = _adaptive_env(tmp_path, start=0.5, replies=[resp(302, headers={"Location": SORRY})])
+    with pytest.raises(Blocked):
+        e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == 1.0
+
+
+def test_non_adaptive_hosts_unchanged(tmp_path):
+    e = _adaptive_env(tmp_path, replies=[resp(503), resp(500)] + [resp()] * 60)
+    for _ in range(62):
+        e.session.get("https://fixed.com/x")
+    assert e.session.interval("fixed.com") == 1.0
+
+
+def test_derive_keeps_adaptive_config_with_fresh_state(tmp_path):
+    e = _adaptive_env(tmp_path, start=0.5, replies=[resp(503)])
+    e.session.get("https://img.com/x")
+    assert e.session.derive().interval("img.com") == 0.5
+
+
+def test_adaptive_slows_on_connection_errors_and_timeouts(tmp_path):
+    for exc in (requests.ConnectionError("reset"), requests.Timeout("read timed out")):
+        e = _adaptive_env(tmp_path / type(exc).__name__, start=0.5)
+
+        def broken(method, url, exc=exc, **kwargs):
+            raise exc
+
+        e.session._transport = broken
+        with pytest.raises(type(exc)):
+            e.session.get("https://img.com/x")
+        assert e.session.interval("img.com") == 1.0

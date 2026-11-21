@@ -13,6 +13,7 @@ from adrenalin.common.http import Blocked
 from adrenalin.common.ocr import OcrUnavailable
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL
 from adrenalin.common.output import EntityCollision
+from adrenalin.common.pipeline import print_to_stderr
 from adrenalin.common.tool import Tool
 from adrenalin.tools.ads_transparency import api
 
@@ -37,6 +38,14 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--vision-model", default=DEFAULT_VISION_MODEL,
                    help=f"Codex model for vision (default {DEFAULT_VISION_MODEL}, or $ADRENALIN_VISION_MODEL)")
     p.add_argument("--vision-limit", type=int, default=200, help="max Codex calls per run (default 200)")
+    p.add_argument("--all", action="store_true", dest="read_all",
+                   help="read every Creative's copy, even when the Inventory is large enough to sample")
+    p.add_argument("--coverage", type=float, default=0.95,
+                   help="sampled runs: read until this share of Messages is found, 0 < x < 1 (default 0.95)")
+    p.add_argument("--max-ads", type=int, metavar="N",
+                   help="read copy for about N Creatives, even for a small Inventory, plus up to 3 per launch-week x "
+                        "running/stopped x Ads account group (no effect without Google's count estimate; a rerun "
+                        "keeps the first run's head start)")
     p.add_argument("--wait-on-block", action="store_true", help="wait out Google blocks instead of exiting")
     p.add_argument("--stage", choices=("list", "fetch", "extract", "export"), help="run one stage only")
     p.add_argument("--out", type=Path, default=Path("out"), help="output root (default out/)")
@@ -68,15 +77,24 @@ def run(args: argparse.Namespace) -> int:
         parser.error(str(e))
     if args.vision_limit < 0:
         parser.error("--vision-limit must be 0 or more")
+    if not 0 < args.coverage < 1:
+        parser.error("--coverage must be between 0 and 1 (exclusive)")
+    if args.max_ads is not None and args.max_ads < 1:
+        parser.error("--max-ads must be at least 1")
 
     options = api.ScrapeOptions(
         advertiser_id=args.advertiser_id, region=args.region, start=start, end=end,
         variations=args.variations, vision=args.vision, vision_model=args.vision_model,
         vision_limit=args.vision_limit, wait_on_block=args.wait_on_block, stage=args.stage,
         out=args.out, proxies=tuple(args.proxies), progress=args.progress,
+        read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
     )
+    def log(message: str) -> None:
+        if not api.is_outcome_line(message):  # printed below, once, with what to do next
+            print_to_stderr(message)
+
     try:
-        res = api.scrape(options)
+        res = api.scrape(options, log=log)
     except Blocked as e:
         print(f"blocked until {_hhmm(e.until)}; rerun the same command to continue", file=sys.stderr)
         return 2
@@ -93,8 +111,11 @@ def run(args: argparse.Namespace) -> int:
         print(f"failed items ({counts}); rerun to retry", file=sys.stderr)
         code = 1
     if res.blocked_until is not None:
-        print(f"blocked until {_hhmm(res.blocked_until)}; rerun the same command to continue", file=sys.stderr)
+        print(f"{api.blocked_message(res.blocked_until)}; rerun the same command to continue", file=sys.stderr)
         code = 2
+    if not res.listing_complete:
+        print(api.incomplete_message(res), file=sys.stderr)
+        code = code or 3
     return code
 
 
