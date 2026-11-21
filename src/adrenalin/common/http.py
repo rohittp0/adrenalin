@@ -11,11 +11,14 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from math import isfinite
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+from adrenalin.common.playwright_http import PlaywrightTransport
 from urllib3.exceptions import NameResolutionError
 
 from adrenalin.common.cache import ExtractionCache
@@ -27,8 +30,9 @@ DEFAULT_UA = (
 
 
 class Blocked(Exception):
-    def __init__(self, host: str, until: float):
-        super().__init__(f"{host} blocked until {_clock_time(until)}")
+    def __init__(self, host: str, until: float, *, saved_cooldown: bool = False):
+        detail = " (request skipped during saved cooldown)" if saved_cooldown else ""
+        super().__init__(f"{host} blocked until {_clock_time(until)}{detail}")
         self.host = host
         self.until = until
 
@@ -110,6 +114,22 @@ def describe_response(resp: requests.Response, read_body: bool = True) -> str:
     return " ".join(parts)
 
 
+def _retry_after_seconds(value: str, now: float) -> float:
+    value = value.strip()
+    if value.isascii() and value.isdecimal():
+        seconds = float(value)
+        return seconds if isfinite(seconds) else 0.0
+    if value:
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            return max(0.0, retry_at.timestamp() - now)
+        except (ValueError, OverflowError, OSError):
+            pass
+    return 0.0
+
+
 @dataclass(frozen=True)
 class AdaptivePace:
     """A host's pace that adapts: `speedup` x after `clean_streak` clean responses in a row (down to
@@ -140,7 +160,10 @@ class PacedSession:
         rng: Callable[[], float] = random.random,
         log: Callable[[str], None] | None = None,
         adaptive: Mapping[str, AdaptivePace] = {},
+        playwright_hosts: Sequence[str] = (),
     ):
+        self._playwright_hosts = frozenset(playwright_hosts)
+        self._playwright_session = PlaywrightTransport() if playwright_hosts else None
         self._adaptive = dict(adaptive)
         self._adaptive_state: dict[str, list[float]] = {h: [a.start, 0] for h, a in self._adaptive.items()}
         self._cooldown = cooldown
@@ -161,10 +184,15 @@ class PacedSession:
         self._session.headers.update(
             {"User-Agent": DEFAULT_UA, "Accept-Language": "en-US,en;q=0.9"}
         )
-        self._transport = transport or self._session.request
+        self._transport = transport or self._request_transport
         self._locks: dict[str, threading.Lock] = {}
         self._locks_guard = threading.Lock()
         self._last: dict[str, float] = {}
+
+    def _request_transport(self, method: str, url: str, **kwargs):
+        if urlparse(url).hostname not in self._playwright_hosts:
+            return self._session.request(method, url, **kwargs)
+        return self._playwright_session.request(method, url, **kwargs)
 
     def _host_lock(self, host: str) -> threading.Lock:
         with self._locks_guard:
@@ -207,15 +235,18 @@ class PacedSession:
 
     def _wait_or_raise(self, host: str) -> None:
         while True:
-            remaining = self._cooldown.remaining(host, now=self._clock())
+            until = self._cooldown.until(host)
+            remaining = until - self._clock()
             if remaining <= 0:
                 return
             if not self._wait_on_block:
-                raise Blocked(host, self._cooldown.until(host))
+                raise Blocked(host, until, saved_cooldown=True)
+            if self._log is not None:
+                self._log(f"{host}: waiting for cooldown until {_clock_time(until)}")
             self._sleep(remaining)
 
-    def _block(self, host: str) -> float:
-        return self._cooldown.block(host, self._block_seconds, now=self._clock())
+    def _block(self, host: str, retry_after: float) -> float:
+        return self._cooldown.block(host, max(self._block_seconds, retry_after), now=self._clock())
 
     def request(self, method: str, url: str, **kwargs) -> requests.Response:
         host = urlparse(url).hostname or ""
@@ -241,7 +272,8 @@ class PacedSession:
             read_body = not kwargs.get("stream")
             if is_block_response(resp, read_body=read_body):
                 self._record(host, clean=False)
-                until = self._block(host)
+                retry_after = _retry_after_seconds(resp.headers.get("Retry-After", ""), self._clock())
+                until = self._block(host, retry_after)
                 self._warn(f"{host} sent a block page ({describe_response(resp, read_body)})")
                 if self._wait_on_block and block_waits < self._max_retries:
                     block_waits += 1
@@ -250,14 +282,11 @@ class PacedSession:
 
             self._record(host, clean=resp.status_code != 429 and resp.status_code < 500)
             if resp.status_code == 429:
+                retry_after = _retry_after_seconds(resp.headers.get("Retry-After", ""), self._clock())
                 if attempt >= self._max_retries:
                     self._warn(f"{host} still rate-limits after {attempt} backoffs ({describe_response(resp)})")
-                    raise Blocked(host, self._block(host))
-                backoff = min(60 * 2**attempt, 900)
-                try:
-                    backoff = max(backoff, float(resp.headers.get("Retry-After", 0)))
-                except ValueError:
-                    pass
+                    raise Blocked(host, self._block(host, retry_after))
+                backoff = max(min(60 * 2**attempt, 900), retry_after)
                 self._sleep(backoff)
                 attempt += 1
                 continue
@@ -273,7 +302,7 @@ class PacedSession:
             max_retries=self._max_retries if max_retries is None else max_retries,
             block_seconds=self._block_seconds, transport=self._custom_transport,
             sleep=self._sleep, clock=self._clock, rng=self._rng, log=self._log,
-            adaptive=self._adaptive,
+            adaptive=self._adaptive, playwright_hosts=self._playwright_hosts,
         )
 
     def _warn(self, message: str) -> None:
@@ -288,6 +317,8 @@ class PacedSession:
 
     def close(self) -> None:
         self._session.close()
+        if self._playwright_session is not None:
+            self._playwright_session.close()
 
 
 def _dns_failure(e: BaseException) -> bool:

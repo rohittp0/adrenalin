@@ -538,10 +538,14 @@ def test_block_mid_list_exports_partial_and_reports(tmp_path):
     assert {r["creative_id"] for r in rows} == {c["2"] for c in p1["1"]}
     assert all(r["extraction_method"] for r in rows)
     state["blocked"] = False
-    # still cooling down: nothing more is listed
+    # A restart during the cooldown must leave the saved page pending without sending another request.
+    session = make_session(tmp_path, fake, clock)
+    before = len(fake.search_bodies)
     assert run_scrape(tmp_path, fake, session=session).blocked_until is not None
+    assert len(fake.search_bodies) == before
     clock.now += 1000
     res2 = run_scrape(tmp_path, fake, session=session)
+    assert [body.get("4") for body in fake.search_bodies[before:]] == ["CUR1"]
     assert res2.blocked_until is None and res2.rows == 40 and res2.failed == {}
 
 

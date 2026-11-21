@@ -70,6 +70,26 @@ def test_429_exhausting_retries_raises_blocked_and_persists(tmp_path):
     assert Cooldown(tmp_path / "cd.sqlite").remaining("a.com", now=e.now) > 0
 
 
+@pytest.mark.parametrize("retry_after", ["1200", "Thu, 01 Jan 1970 00:20:00 GMT"])
+def test_final_429_preserves_retry_after_across_runs(tmp_path, retry_after):
+    e = Env(tmp_path, [resp(429, headers={"Retry-After": retry_after})], max_retries=0)
+    with pytest.raises(Blocked) as error:
+        e.session.get("https://a.com/1")
+    assert error.value.until == 1200
+
+    rerun = Env(tmp_path)
+    with pytest.raises(Blocked, match="saved cooldown"):
+        rerun.session.get("https://a.com/1")
+    assert rerun.calls == []
+
+
+def test_429_retry_after_http_date_delays_retry(tmp_path):
+    e = Env(tmp_path, [resp(429, headers={"Retry-After": "Thu, 01 Jan 1970 00:02:30 GMT"}), resp()])
+    e.now = 30
+    assert e.session.get("https://a.com/1").status_code == 200
+    assert e.sleeps == [120]
+
+
 def test_sorry_redirect_blocks_for_900s_without_retry(tmp_path):
     e = Env(tmp_path, [resp(302, headers={"Location": SORRY})])
     e.now = 1000.0

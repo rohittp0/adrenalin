@@ -6,3 +6,25 @@ The Ads Transparency site is an empty JS shell that loads data from internal RPC
 
 - **Playwright:** looks more like a real user, but is slower and its memory grows during long scrolls. Revisit only if plain HTTP starts getting blocked despite pacing.
 - **Playwright to render `content.js` Previews that fail to parse:** rejected; those rows are left blank with a warning instead.
+
+## Revision: Playwright-controlled Chrome transport
+
+The user approved Playwright after Python requests and curl-cffi continued to
+receive `/sorry/`. The inspection tool's HTTP client worked, but the installed
+local Playwright APIRequestContext was also blocked. Fresh local headless Chrome
+loaded the site successfully.
+
+Transparency RPCs now use `fetch` inside a fresh Playwright-controlled Chrome
+context. This does not scroll or scrape the UI, or import browser-profile cookies.
+RPC fetches explicitly omit cookies. Chrome supplies its own network fingerprint
+and browser headers. Other hosts retain requests. Pacing, proxies, persisted
+cooldowns and block handling remain in PacedSession.
+
+A dedicated owner thread serializes Playwright calls because pipeline stages
+run on different threads. Browser contexts are reused per proxy, with a page per
+origin. The origin is loaded once to establish a same-origin fetch context.
+Closing the session closes browser contexts and Chrome, stops Playwright and
+joins its owner thread. Derived sessions own separate lazy transports.
+
+Google Chrome must be installed. The earlier curl-cffi experiment is removed;
+it did not unblock the endpoint.

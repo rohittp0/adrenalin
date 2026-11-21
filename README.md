@@ -55,3 +55,5 @@ out/.cache/                      cooldown and extraction caches
 ```
 
 See `CONTEXT.md` for terminology and `docs/adr/` for design decisions. Tests: `uv run pytest`.
+
+Transparency RPCs use a fresh headless Google Chrome session controlled by Playwright. Install Google Chrome before running the tool; no signed-in profile is required. The browser sends RPC requests directly and closes at the end of each run. Other downloads use Python requests. All HTTP transports retain the configured pacing and block cooldowns.

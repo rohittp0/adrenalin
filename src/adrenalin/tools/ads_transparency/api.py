@@ -128,7 +128,7 @@ def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool =
     return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"),
                         {HOST: RPC_INTERVAL, SCRIPT_HOST: SCRIPT_INTERVAL},
                         proxies=proxies, wait_on_block=wait_on_block, log=log,
-                        adaptive={IMAGE_HOST: IMAGE_PACE})
+                        adaptive={IMAGE_HOST: IMAGE_PACE}, playwright_hosts=(HOST,))
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:

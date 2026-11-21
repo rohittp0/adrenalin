@@ -222,6 +222,10 @@ class TransparencyClient:
             data={"f.req": json.dumps(body, separators=(",", ":"))},
             headers={
                 "X-Same-Domain": "1",
+                "Accept": "*/*",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
                 "Origin": f"https://{HOST}",
                 "Referer": f"https://{HOST}/advertiser/{advertiser_id}",
             },
