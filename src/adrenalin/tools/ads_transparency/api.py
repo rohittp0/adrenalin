@@ -188,7 +188,7 @@ def _prepare_sampling(q: WorkQueue, options: ScrapeOptions, log: Callable[[str],
     meta = sampling_meta(q)
     meta.update(target=options.coverage, max_ads=options.max_ads)
     q.set_meta("sampling", json.dumps(meta))
-    estimate = int(q.get_meta("count_estimate") or 0) or None
+    estimate = meta.get("estimate", int(q.get_meta("count_estimate") or 0) or None)
     if "p" in meta and options.max_ads is not None and not options.read_all and estimate:
         would = sampling.admit_probability(estimate, max_ads=options.max_ads)
         if not math.isclose(would, meta["p"]):
@@ -236,6 +236,13 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
     if options.stage not in (None, "extract"):
         return
     done = q.results("extract")
+    # Before any requeue, which clears results: the count of runs whose detail response for a Broken Preview was
+    # unparsable moves to the payload.
+    if checks := {k: r["unparsable_checks"] for k, r in done
+                  if (r or {}).get("broken_unverified") and r.get("unparsable_checks")}:
+        for it in q.items("extract", "done"):
+            if it.key in checks:
+                q.put("extract", it.key, {**it.payload, "unparsable_checks": checks[it.key]}, update_payload=True)
     if options.vision:
         # Every --vision run retries image rows Codex hasn't read yet (first --vision, Codex errors).
         q.requeue("extract", [k for k, r in done
@@ -246,12 +253,6 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], No
     q.requeue("extract", [k for k, r in done if (r or {}).get("vision_pending")])
     # Rows read before Broken Previews were detected still hold the error page as copy; and a Broken Preview whose
     # other Variations could not be checked (block, network) is checked again.
-    # requeue clears the result: the count of runs whose detail response was unparsable moves to the payload
-    if checks := {k: r["unparsable_checks"] for k, r in done
-                  if (r or {}).get("broken_unverified") and r.get("unparsable_checks")}:
-        for it in q.items("extract", "done"):
-            if it.key in checks:
-                q.put("extract", it.key, {**it.payload, "unparsable_checks": checks[it.key]}, update_payload=True)
     q.requeue("extract", [k for k, r in done if (r or {}).get("preview_kind") == "image"
                           and ((r or {}).get("broken_unverified")
                                or is_broken_preview(f"{r.get('headline') or ''} {r.get('full_text') or ''}"))])

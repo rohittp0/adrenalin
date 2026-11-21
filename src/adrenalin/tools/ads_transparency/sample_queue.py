@@ -145,8 +145,8 @@ def _rounds(q: WorkQueue) -> int:
 
 
 def sampling_meta(q: WorkQueue) -> dict:
-    """The `sampling` meta: admission probability `p` (written once), and the run's Coverage `target` and
-    `max_ads`."""
+    """The `sampling` meta: admission probability `p` and the `estimate` it was sized from (written once), and the
+    run's Coverage `target` and `max_ads`."""
     return json.loads(q.get_meta("sampling") or "{}")
 
 

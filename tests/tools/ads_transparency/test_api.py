@@ -1090,7 +1090,7 @@ def test_large_inventory_samples_and_stops_at_coverage(tmp_path, small_limits):
     res = run_scrape(tmp_path, fake)
     rows = read_rows(res)
     meta, held = stored_sampling(tmp_path)
-    assert meta == {"p": 5 / 600, "target": 0.95, "max_ads": None}
+    assert meta == {"p": 5 / 600, "estimate": 600, "target": 0.95, "max_ads": None}
     assert len(rows) == 40 == len({r["creative_id"] for r in rows})
     sampled = processed(rows)
     assert 0 < len(sampled) < 40 and held == 40 - len(sampled)
@@ -1501,7 +1501,8 @@ def test_old_unparsed_and_store_badge_rows_are_reextracted_once(tmp_path):
     old_unparsed, old_badge = js[0], js[1]
     # rows of a run from before the content.js parser fixes (no parser version stored)
     q.complete("extract", old_unparsed, {"preview_kind": "content_js", "content_unparsed": True})
-    stale = {k: v for k, v in good[old_badge].items() if k != "content_version"}
+    # a row from before preview_kind was stored
+    stale = {k: v for k, v in good[old_badge].items() if k not in ("content_version", "preview_kind")}
     q.complete("extract", old_badge, {**stale, "headline": "Google Play"})
     q.close()
     before = fake.calls["content_js"]
@@ -1611,12 +1612,25 @@ def test_scrape_options_reject_bad_coverage_and_max_ads(opts):
         ScrapeOptions(AR, **opts)
 
 
-def test_broken_preview_with_unparsable_detail_is_confirmed_after_3_runs(tmp_path):
+class BrokenOnlyCodexRun(FakeCodexRun):
+    """Codex reading the Broken Preview as Google's error page and every other image as ad copy."""
+
+    def __call__(self, argv, **kwargs):
+        super().__call__(argv, **kwargs)
+        if Path(argv[argv.index("-i") + 1]).stem == BROKEN_ID:
+            Path(argv[argv.index("-o") + 1]).write_text(json.dumps({
+                "headline": "500. That's an error.", "full_text": "There was an error. Please try again later.",
+                "confidence": 0.9}))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+
+@pytest.mark.parametrize("vision", [False, True])
+def test_broken_preview_with_unparsable_detail_is_confirmed_after_3_runs(tmp_path, vision):
     BROKEN_IDS.add(BROKEN_ID)
     fake = FakeGoogle()
     fake.detail_reply = response(body={"1": {}})  # permanently unparsable
-    for _ in range(4):
-        assert run_scrape(tmp_path, fake).failed == {}
+    for _ in range(4):  # --vision reruns requeue unverified Broken Previews first: the count must survive that
+        assert run_scrape(tmp_path, fake, vision=vision, codex_runner=codex(run=BrokenOnlyCodexRun())).failed == {}
     assert fake.calls["detail"] == 3
     got = extract_results(tmp_path)[broken_key(tmp_path)]
     assert got["preview_broken"] and not got["broken_unverified"]
@@ -1649,3 +1663,10 @@ def test_rerun_with_a_different_max_ads_notes_the_kept_head_start(tmp_path, smal
            codex=codex(), log=logs.append, poll=POLL)
     assert stored_sampling(tmp_path)[0]["p"] == 5 / 600
     assert any(m.startswith("note: the head start was set by this run folder's first run") for m in logs)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    q.set_meta("count_estimate", "700")  # Google's estimate drifted; `p` was sized from 600
+    q.close()
+    logs.clear()
+    scrape(ScrapeOptions(AR, out=tmp_path, max_ads=5), session=make_session(tmp_path, fake), ocr=fake_ocr,
+           codex=codex(), log=logs.append, poll=POLL)
+    assert not any(m.startswith("note:") for m in logs)  # the same cap as the first run: nothing to note

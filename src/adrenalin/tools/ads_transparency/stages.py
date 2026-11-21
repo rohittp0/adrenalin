@@ -260,6 +260,7 @@ class AdsStages:
                 if estimate:
                     q.set_meta("count_estimate", str(estimate))
             meta["p"] = sampling.admit_probability(estimate, self.ctx.read_all, self.ctx.max_ads)
+            meta["estimate"] = estimate  # the estimate `p` was sized from (`count_estimate` follows each listing)
             q.set_meta("sampling", json.dumps(meta))
         return meta["p"]
 

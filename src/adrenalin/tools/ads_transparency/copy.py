@@ -217,7 +217,8 @@ CONTENT_JS_VERSION = 2
 def stale_content_read(r: dict) -> bool:
     """A content.js read from before the current parser that it would now get right: not parsed at all, or the
     store badge ("Google Play") taken as the headline."""
-    return (r.get("preview_kind") == "content_js" and (r.get("content_version") or 1) < CONTENT_JS_VERSION
+    from_js = r.get("preview_kind") == "content_js" or r.get("method") == "content_js"  # older rows: no preview_kind
+    return (from_js and (r.get("content_version") or 1) < CONTENT_JS_VERSION
             and bool(r.get("content_unparsed") or r.get("headline") in _STORE_NAMES))
 
 
