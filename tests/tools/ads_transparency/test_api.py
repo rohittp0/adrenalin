@@ -17,6 +17,7 @@ from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.output import EntityCollision
 from adrenalin.common.pipeline import WorkQueue
 from adrenalin.tools.ads_transparency.api import (
+    COPY_STATUSES,
     CSV_FIELDS,
     ScrapeOptions,
     copy_status,
@@ -784,6 +785,8 @@ COPY = {"headline": "Buy now"}
     ("done", {"headline": "H"}, False, "read"),
     ("done", {"description": "D"}, False, "read"),
     ("done", {"display_url": "a.com"}, False, "read"),
+    ("done", {"preview_kind": "image", "full_text": "", "format": "image", "vision_pending": True}, False, "pending"),
+    ("done", {"preview_kind": "image", "full_text": "", "format": "video", "vision_pending": True}, False, "pending"),
     ("done", {"preview_kind": "content_js"}, False, "no_copy"),
     ("done", {"preview_kind": "image", "full_text": "", "format": "image"}, False, "no_copy"),
     ("done", {"preview_kind": "image", "full_text": "", "format": "video"}, False, "no_copy"),
@@ -809,8 +812,7 @@ def test_scrape_rows_have_status_and_account_columns(tmp_path):
     with res.csv_path.open(encoding="utf-8") as f:
         assert tuple(next(csv.reader(f)))[-5:] == CSV_FIELDS[-5:]
     rows = read_rows(res)
-    allowed = {"read", "not_sampled", "pending", "no_copy", "preview_broken", "unreadable"}
-    assert rows and all(r["copy_status"] in allowed for r in rows)
+    assert rows and all(r["copy_status"] in COPY_STATUSES for r in rows)
     assert all(r["sample_weight"] == "1.0" for r in rows if r["copy_status"] not in ("not_sampled", "pending"))
     assert all(r["ads_account_source"] in ("exposed", "inferred", "") for r in rows)
 
@@ -824,4 +826,5 @@ def test_export_of_pre_change_run_dir(tmp_path):
                                     if k not in ("preview_kind", "content_unparsed", "preview_broken")})
     q.close()
     rows = read_rows(run_scrape(tmp_path, fake, stage="export"))
-    assert rows and all(r["copy_status"] for r in rows)
+    assert rows and all(r["copy_status"] in COPY_STATUSES for r in rows)
+    assert any(r["headline"] and r["copy_status"] == "read" for r in rows)

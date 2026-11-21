@@ -212,6 +212,8 @@ def copy_status(extract_status: str | None, result: dict | None, held: bool = Fa
         return "unreadable"
     if any(r.get(k) for k in ("brand", "headline", "description", "display_url")):
         return "read"
+    if r.get("vision_pending"):
+        return "pending"  # the Codex read was deferred (cap or breaker), so "no copy" is not known yet
     if r.get("preview_kind") == "content_js":
         return "no_copy"
     if r.get("preview_kind") == "image" and not r.get("full_text") and r.get("format") in ("image", "video"):
