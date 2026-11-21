@@ -1404,3 +1404,14 @@ def test_round_during_a_failed_listing_is_deferred_and_seeded_again(tmp_path):
     sample_queue.seed_round(q)
     assert [i.key for i in q.items("sample", "pending")] == ["round:1"]
     q.close()
+
+
+def test_max_ads_samples_an_inventory_within_the_full_read_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(sampling, "FULL_READ_LIMIT", 2000)  # the estimate (600) alone would mean a full read
+    res = run_scrape(tmp_path, FakeGoogle(), max_ads=10)
+    rows = read_rows(res)
+    meta, held = stored_sampling(tmp_path)
+    assert meta["p"] == 10 / 600 and held > 0
+    assert any(r["copy_status"] == "not_sampled" for r in rows)
+    floor = sum(min(sampling.MIN_PER_BUCKET, b["inventory"]) for b in summary_of(res)["buckets"])
+    assert len(processed(rows)) <= 10 + floor

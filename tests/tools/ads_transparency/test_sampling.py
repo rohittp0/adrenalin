@@ -105,4 +105,7 @@ def test_sample_weight():
 def test_admit_probability_caps_head_start_at_max_ads():
     assert admit_probability(80000, max_ads=500) == pytest.approx(500 / 80000)
     assert admit_probability(80000, max_ads=5000) == pytest.approx(0.025)
-    assert admit_probability(1500, max_ads=5) == 1.0
+    assert admit_probability(1500, max_ads=5) == pytest.approx(5 / 1500)  # --max-ads overrides the full read
+    assert admit_probability(1500, max_ads=1500) == 1.0
+    assert admit_probability(None, max_ads=5) == 1.0
+    assert admit_probability(80000, read_all=True, max_ads=5) == 1.0
