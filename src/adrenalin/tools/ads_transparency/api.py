@@ -12,7 +12,7 @@ from typing import Literal
 
 from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.geo import region_to_geo_id
-from adrenalin.common.http import Cooldown, HostChecker, PacedSession
+from adrenalin.common.http import AdaptivePace, Cooldown, HostChecker, PacedSession
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
@@ -76,7 +76,8 @@ def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool =
                  log: Callable[[str], None] | None = print_to_stderr) -> PacedSession:
     return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"),
                         {HOST: RPC_INTERVAL, SCRIPT_HOST: SCRIPT_INTERVAL, IMAGE_HOST: IMAGE_INTERVAL},
-                        proxies=proxies, wait_on_block=wait_on_block, log=log)
+                        proxies=proxies, wait_on_block=wait_on_block, log=log,
+                        adaptive={IMAGE_HOST: AdaptivePace(1.0, 0.2, 4.0)})
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:

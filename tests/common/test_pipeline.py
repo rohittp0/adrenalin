@@ -85,6 +85,25 @@ def _run(q, stages):
     return result
 
 
+def test_stage_seconds_reported(tmp_path):
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    q.put("A", "seed", {})
+    now = [0.0]
+
+    def a(item, queue):
+        now[0] += 2.0
+        queue.put("B", "1", {})
+
+    def b(item, queue):
+        now[0] += 3.0
+
+    result = Pipeline(q, [Stage("A", a), Stage("B", b)], poll=0.01, log=quiet, clock=lambda: now[0]).run()
+    assert set(result.stage_seconds) == {"A", "B"}
+    assert result.stage_seconds["A"]["busy"] > 0 and result.stage_seconds["B"]["busy"] > 0
+    assert all("waiting" in v for v in result.stage_seconds.values())
+    q.close()
+
+
 def test_items_flow_through_stages_in_order(tmp_path):
     q = WorkQueue(tmp_path / "q.sqlite3")
     q.put("A", "seed", {})

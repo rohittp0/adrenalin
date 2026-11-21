@@ -39,7 +39,7 @@ CONTENT_DIR = "content"
 _STAGE_CONFIG = {
     "list": (1, ("detail", "fetch", "script", "extract"), 200),
     "detail": (1, ("fetch", "script", "extract"), 50),
-    "fetch": (2, ("extract",), 50),
+    "fetch": (4, ("extract",), 50),
     "script": (1, ("extract",), 50),
     "extract": (2, (), 0),
 }
