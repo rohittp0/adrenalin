@@ -1390,3 +1390,16 @@ def test_rerun_of_a_full_read_stays_a_full_read(tmp_path, monkeypatch):
     assert meta["p"] == 1.0 and held == 0
     assert len(processed(rows)) == 40 and all(r["sample_weight"] == "1.0" for r in rows)
     assert summary_of(res)["sampling"] is None
+
+
+def test_round_during_a_failed_listing_is_deferred_and_seeded_again(tmp_path):
+    q = _queue_with_groups(tmp_path)
+    q.set_meta("list_done", "")  # the listing did not finish this run
+    item = Item("sample", "round:0", {}, None, "running", None)
+    assert sample_queue.run_round(q, item, _settings(), lambda m: None) == {"deferred": True}
+    q.complete("sample", "round:0", {"deferred": True})
+    assert q.count("held", "pending") == 5 and q.backlog("sample") == 0
+    q.set_meta("list_done", "2026-11-20")  # a later run finishes the listing, and list_page seeds a round
+    sample_queue.seed_round(q)
+    assert [i.key for i in q.items("sample", "pending")] == ["round:1"]
+    q.close()

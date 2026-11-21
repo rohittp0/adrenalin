@@ -32,7 +32,7 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `--variations` | One row per variation, not just the first |
 | `--vision`, `--vision-limit N` | Send every image to Codex; cap Codex calls (default 200) |
 | `--coverage X` | Large Inventories (Google estimates over 2,000 Creatives) read copy for a Copy sample only: every bucket (launch week (month before the Shown period) × running/stopped, split by Ads account where Google exposes it) gets at least 3 reads, then sampling continues where new Messages turn up until Coverage reaches X (default 0.95, 0 < X < 1), or stops when no readable Messages turn up. Unread Creatives get `copy_status` `not_sampled`; read rows carry a `sample_weight` (their bucket's Inventory / Creatives read). With `--variations` the weight is per Creative: all its rows carry it, and Variation 1 rows' weights sum to the Inventory. Rerun with a higher X to read more |
-| `--max-ads N` | Read copy for at most N Creatives (this also shrinks the random head start); the cap may be exceeded only by the per-bucket minimum of 3 |
+| `--max-ads N` | Sampled runs only: read copy for at most N Creatives (this also shrinks the random head start); the cap may be exceeded only by the per-bucket minimum of 3. A full read (Inventory within the limit) ignores it |
 | `--all` | Read every Creative's copy, however large the Inventory |
 | `--wait-on-block` | Wait out a Google block instead of exiting |
 | `--stage list\|fetch\|extract\|export` | Run one stage only |
