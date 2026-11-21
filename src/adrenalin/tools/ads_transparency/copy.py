@@ -117,7 +117,8 @@ def _app_install_data(s: str) -> dict[str, str]:
     keys are absent."""
     if not re.search(r"'layout':\s*'uac_youtube_video_v2'", s):
         return {}
-    out = {k: (m.group(1) if (m := re.search(r"'" + k + r"':\s*'([^']*)'", s)) else "") for k in _APP_KEYS}
+    # a value ends at a quote followed by the next key or the dict's end, so "Rio's" stays whole
+    out = {k: (m.group(1) if (m := re.search(r"'" + k + r"':\s*'(.*?)'(?=\s*[,}])", s)) else "") for k in _APP_KEYS}
     return out if out["shortAppName"] or out["appName"] or out["shortDescription"] else {}
 
 
@@ -207,6 +208,18 @@ def _video_headline_description(strings: list[str], brand: str) -> tuple[str, st
     before = body[:body.index(description)]
     headline = next((t for t in reversed(before) if t not in description), "")
     return headline, description
+
+
+# Bumped when content.js parsing improves, so reads of an earlier version that failed are read again, once.
+CONTENT_JS_VERSION = 2
+
+
+def stale_content_read(r: dict) -> bool:
+    """A content.js read from before the current parser that it would now get right: not parsed at all, or the
+    store badge ("Google Play") taken as the headline."""
+    from_js = r.get("preview_kind") == "content_js" or r.get("method") == "content_js"  # older rows: no preview_kind
+    return (from_js and (r.get("content_version") or 1) < CONTENT_JS_VERSION
+            and bool(r.get("content_unparsed") or r.get("headline") in _STORE_NAMES))
 
 
 def parse_content_preview(js: str, url: str) -> AdCopy | None:
@@ -587,19 +600,21 @@ def extract_image(
     return copy
 
 
+_BROKEN_TEXT_KEYS = ("brand", "headline", "description", "full_text")
 COPY_STATUSES = ("read", "not_sampled", "pending", "no_copy", "preview_broken", "unreadable")
 
 
-def copy_status(extract_status: str | None, result: dict | None, held: bool = False) -> str:
+def copy_status(extract_status: str | None, result: dict | None, held: bool = False, exhausted: bool = False) -> str:
     """Why a row has or lacks copy. `extract_status` is the extract item's status (None: no item yet);
-    `held` is a Creative left out of the sample. `result["format"]` is the Creative's format, when known."""
+    `held` is a Creative left out of the sample; `exhausted`: reading it failed on every retry, in any stage.
+    `result["format"]` is the Creative's format, when known."""
     if held:
         return "not_sampled"
     if extract_status != "done":
-        return "pending"
+        return "unreadable" if exhausted else "pending"
     r = result or {}
-    if r.get("preview_broken"):
-        return "preview_broken"
+    if r.get("preview_broken") or is_broken_preview(" ".join(str(r.get(k) or "") for k in _BROKEN_TEXT_KEYS)):
+        return "preview_broken"  # stored text of the error page: a row read before Broken Previews were detected
     if r.get("content_unparsed"):
         return "unreadable"
     if any(r.get(k) for k in ("brand", "headline", "description", "display_url")):

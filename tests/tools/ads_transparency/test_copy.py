@@ -769,3 +769,11 @@ def test_broken_codex_result_checked_in_brand_and_description(tmp_path, field):
     finally:
         cache.close()
     assert c.preview_broken and not getattr(c, field)
+
+
+def test_app_install_values_keep_apostrophes():
+    js = ("'layout': 'uac_youtube_video_v2', 'shortAppName': 'Rio's Hotels', 'appName': 'Rio's Hotels: "
+          "Book Now', 'shortDescription': 'Don't miss Rio's best deals', 'developer': 'Rio'}")
+    c = parse_content_js(js)
+    assert (c.brand, c.headline) == ("Rio's Hotels", "Rio's Hotels: Book Now")
+    assert c.description == "Don't miss Rio's best deals"
