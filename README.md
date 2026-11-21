@@ -31,6 +31,9 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `--days N` / `--start` / `--end` | Shown period (ads shown at any point in it). `--days N` becomes concrete dates when you run it, so rerunning after midnight starts a new run folder (downloaded images and the extraction cache are reused) |
 | `--variations` | One row per variation, not just the first |
 | `--vision`, `--vision-limit N` | Send every image to Codex; cap Codex calls (default 200) |
+| `--coverage X` | Large Inventories (Google estimates over 2,000 Creatives) read copy for a Copy sample only: every launch week × running/stopped bucket gets at least 3 reads, then sampling continues where new Messages turn up until Coverage reaches X (default 0.95, 0 < X < 1). Unread Creatives get `copy_status` `not_sampled`; read rows carry a `sample_weight`. Rerun with a higher X to read more |
+| `--max-ads N` | Read copy for at most N Creatives (each bucket's minimum still comes first) |
+| `--all` | Read every Creative's copy, however large the Inventory |
 | `--wait-on-block` | Wait out a Google block instead of exiting |
 | `--stage list\|fetch\|extract\|export` | Run one stage only |
 | `--proxy URL` | Proxy, repeatable to rotate |

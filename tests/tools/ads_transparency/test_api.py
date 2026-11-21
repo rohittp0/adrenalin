@@ -1,5 +1,6 @@
 import copy
 import csv
+import hashlib
 import json
 import socket
 import subprocess
@@ -16,6 +17,7 @@ from adrenalin.common.ocr import OcrLine, OcrResult, OcrUnavailable
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.output import EntityCollision
 from adrenalin.common.pipeline import WorkQueue
+from adrenalin.tools.ads_transparency import sampling
 from adrenalin.tools.ads_transparency.api import (
     COPY_STATUSES,
     CSV_FIELDS,
@@ -25,6 +27,7 @@ from adrenalin.tools.ads_transparency.api import (
     list_creatives,
     scrape,
 )
+from adrenalin.tools.ads_transparency.rpc import preview_ids
 
 FIX = Path(__file__).parents[2] / "fixtures" / "ads_transparency"
 AR = "AR04752318142645010433"
@@ -858,3 +861,176 @@ def test_export_of_pre_change_run_dir(tmp_path):
     rows = read_rows(run_scrape(tmp_path, fake, stage="export"))
     assert rows and all(r["copy_status"] in COPY_STATUSES for r in rows)
     assert any(r["headline"] and r["copy_status"] == "read" for r in rows)
+
+
+# -- sampled runs (Copy sample) ---------------------------------------------
+
+@pytest.fixture
+def small_limits(monkeypatch):
+    """The fixture's 40 Creatives (Google's estimate: 600) count as a large Inventory."""
+    monkeypatch.setattr(sampling, "FULL_READ_LIMIT", 10)
+    monkeypatch.setattr(sampling, "HEAD_START", 5)
+
+
+def summary_of(res):
+    return json.loads(res.summary_path.read_text(encoding="utf-8"))
+
+
+def stored_sampling(tmp_path, name="anywhere_all_all"):
+    q = WorkQueue(run_dir(tmp_path, name) / "state.sqlite3")
+    try:
+        return json.loads(q.get_meta("sampling") or "null"), q.count("held", "pending")
+    finally:
+        q.close()
+
+
+def group_of(row):
+    account = preview_ids(row["preview_url"])[0] if "content.js" in row["preview_url"] else ""
+    b = sampling.bucket_key(date.fromisoformat(row["first_shown"]), date.fromisoformat(row["last_shown"]),
+                            None, None, date.today())
+    return f"{b}|{account}"
+
+
+def processed(rows):
+    return [r for r in rows if r["copy_status"] not in ("not_sampled", "pending")]
+
+
+def ocr_with_messages(pool=None):
+    """An OCR fake whose headline differs per image (or per image modulo `pool`), so Messages don't all repeat."""
+    def ocr(path):
+        n = int(hashlib.sha1(Path(path).stem.encode()).hexdigest()[:8], 16)
+        tag = n % pool if pool else n
+        return OcrResult([
+            OcrLine("Lascade", 0.95, (0.05, 0.05, 0.3, 0.05)),
+            OcrLine("www.lascade.com", 0.95, (0.05, 0.12, 0.4, 0.05)),
+            OcrLine(f"Headline number {tag}", 0.95, (0.05, 0.2, 0.8, 0.1)),
+            OcrLine("A smaller description line.", 0.95, (0.05, 0.35, 0.45, 0.05)),
+        ], "apple_vision")
+    return ocr
+
+
+def test_small_inventory_reads_everything(tmp_path):
+    res = run_scrape(tmp_path, FakeGoogle())
+    rows = read_rows(res)
+    meta, held = stored_sampling(tmp_path)
+    assert meta["p"] == 1.0 and held == 0
+    assert len(rows) == 40 and len(processed(rows)) == 40
+    assert not any(r["copy_status"] == "not_sampled" for r in rows)
+    summary = summary_of(res)
+    assert summary["listing_complete"] is True and "not_sampled" not in summary["copy_status"]
+
+
+def test_large_inventory_samples_and_stops_at_coverage(tmp_path, small_limits):
+    fake = FakeGoogle()
+    res = run_scrape(tmp_path, fake)
+    rows = read_rows(res)
+    meta, held = stored_sampling(tmp_path)
+    assert meta == {"p": 5 / 600, "target": 0.95, "max_ads": None}
+    assert len(rows) == 40 == len({r["creative_id"] for r in rows})
+    sampled = processed(rows)
+    assert 0 < len(sampled) < 40 and held == 40 - len(sampled)
+    assert {r["copy_status"] for r in rows} - {"read", "no_copy", "not_sampled"} == set()
+    summary = summary_of(res)
+    assert summary["coverage"] is not None and summary["coverage"] >= 0.95
+    assert res.coverage == summary["coverage"]
+    assert summary["sampling"]["p"] == 5 / 600
+    groups = Counter(group_of(r) for r in rows)
+    assert {b["bucket"]: b["inventory"] for b in summary["buckets"]} == dict(groups)
+    for b in summary["buckets"]:
+        assert b["read"] >= min(sampling.MIN_PER_BUCKET, b["inventory"])
+        assert set(b) == {"bucket", "inventory", "read", "messages", "coverage"}
+    assert fake.calls["simgad"] < SIMGAD_CREATIVES
+
+
+def test_max_ads_caps_reads(tmp_path, small_limits):
+    fake = FakeGoogle()
+    res = scrape(ScrapeOptions(AR, out=tmp_path, max_ads=32), session=make_session(tmp_path, fake),
+                 ocr=ocr_with_messages(), codex=codex(), log=lambda m: None, poll=POLL)
+    rows = read_rows(res)
+    # every bucket's minimum (29 Creatives here) comes first, then reads stop at the cap
+    assert len(processed(rows)) == 32
+    assert summary_of(res)["coverage"] < 0.95
+
+
+def test_read_all_flag_overrides_sampling(tmp_path, small_limits):
+    res = run_scrape(tmp_path, FakeGoogle(), read_all=True)
+    rows = read_rows(res)
+    meta, held = stored_sampling(tmp_path)
+    assert meta["p"] == 1.0 and held == 0
+    assert len(processed(rows)) == 40
+    assert all(r["sample_weight"] == "1.0" for r in rows)
+
+
+def test_read_all_rerun_reads_the_held_creatives(tmp_path, small_limits):
+    fake = FakeGoogle()
+    first = read_rows(run_scrape(tmp_path, fake))
+    assert any(r["copy_status"] == "not_sampled" for r in first)
+    rows = read_rows(run_scrape(tmp_path, fake, read_all=True))
+    meta, held = stored_sampling(tmp_path)
+    assert meta["p"] == 5 / 600 and held == 0
+    assert len(rows) == 40 and len(processed(rows)) == 40
+
+
+def test_rerun_with_higher_coverage_continues(tmp_path, small_limits):
+    fake = FakeGoogle()
+    ocr = ocr_with_messages(pool=20)
+
+    def run(target):
+        return scrape(ScrapeOptions(AR, out=tmp_path, coverage=target), session=make_session(tmp_path, fake),
+                      ocr=ocr, codex=codex(), log=lambda m: None, poll=POLL)
+
+    first = read_rows(res1 := run(0.3))
+    coverage1 = summary_of(res1)["coverage"]  # the rerun rewrites summary.json
+    meta1, _ = stored_sampling(tmp_path)
+    simgad1 = fake.calls["simgad"]
+    second = read_rows(res2 := run(0.99))
+    meta2, _ = stored_sampling(tmp_path)
+    assert meta2["p"] == meta1["p"] == 5 / 600 and meta2["target"] == 0.99
+    assert len(second) == 40 == len({r["creative_id"] for r in second})  # the relist re-held nothing
+    read1 = {r["creative_id"]: r for r in processed(first)}
+    read2 = {r["creative_id"]: r for r in processed(second)}
+    assert set(read1) < set(read2)
+    assert all(read2[c]["headline"] == r["headline"] for c, r in read1.items())
+    new_images = sum(1 for c in set(read2) - set(read1) if read2[c]["image_file"])
+    assert fake.calls["simgad"] - simgad1 == new_images
+    assert 0.3 <= coverage1 < summary_of(res2)["coverage"]
+
+
+def test_missing_estimate_reads_everything(tmp_path, small_limits):
+    page = single_page()
+    del page["4"], page["5"]
+    res = run_scrape(tmp_path, FakeGoogle(search=lambda req: page))
+    meta, held = stored_sampling(tmp_path)
+    assert meta["p"] == 1.0 and held == 0
+    assert len(processed(read_rows(res))) == 40
+
+
+def test_variations_with_sampling(tmp_path, small_limits):
+    fake = FakeGoogle()
+    res = run_scrape(tmp_path, fake, variations=True)
+    rows = read_rows(res)
+    by_creative: dict[str, list[dict]] = {}
+    for r in rows:
+        by_creative.setdefault(r["creative_id"], []).append(r)
+    assert len(by_creative) == 40
+    admitted = {c for c, rs in by_creative.items() if rs[0]["copy_status"] != "not_sampled"}
+    assert 0 < len(admitted) < 40 and fake.calls["detail"] == len(admitted)
+    for c, rs in by_creative.items():
+        assert len(rs) == (2 if c in admitted else 1)
+        assert len({r["copy_status"] for r in rs}) == 1 and len({r["sample_weight"] for r in rs}) == 1
+    summary = summary_of(res)
+    assert sum(b["inventory"] for b in summary["buckets"]) == 40
+    assert sum(b["read"] for b in summary["buckets"]) == len(admitted)
+
+
+def test_sample_weight_per_bucket(tmp_path, small_limits):
+    res = run_scrape(tmp_path, FakeGoogle())
+    rows = read_rows(res)
+    assert all(r["sample_weight"] == "" for r in rows if r["copy_status"] == "not_sampled")
+    weights: Counter = Counter()
+    for r in processed(rows):
+        weights[group_of(r)] += float(r["sample_weight"])
+    buckets = summary_of(res)["buckets"]
+    assert buckets
+    for b in buckets:
+        assert weights[b["bucket"]] == pytest.approx(b["inventory"], abs=1e-6)

@@ -19,6 +19,7 @@ from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
 from adrenalin.common.progress import Bar, QueueProgress, stage_bar
+from adrenalin.tools.ads_transparency import sampling
 from adrenalin.tools.ads_transparency.rpc import (
     HOST,
     ListedCreative,
@@ -29,10 +30,17 @@ from adrenalin.tools.ads_transparency.rpc import (
 )
 from adrenalin.tools.ads_transparency.stages import (
     CONTENT_DIR,
+    COPY_STATUSES,  # noqa: F401 - re-exported
+    HELD,
     STAGE_NAMES,
     AdsStages,
+    SampleGroup,
     StageContext,
     content_file,
+    copy_status,  # re-exported too
+    sample_groups,
+    sampling_meta,
+    seed_round,
     watch_url,
 )
 
@@ -51,8 +59,6 @@ CSV_FIELDS: tuple[str, ...] = (
     "extraction_confidence", "copy_status", "sample_weight", "ads_account_id", "ads_account_source", "ad_group_id",
 )
 
-COPY_STATUSES = ("read", "not_sampled", "pending", "no_copy", "preview_broken", "unreadable")
-
 
 @dataclass(frozen=True)
 class ScrapeOptions:
@@ -69,6 +75,11 @@ class ScrapeOptions:
     out: Path = Path("out")
     proxies: tuple[str, ...] = ()
     progress: bool = False  # tqdm progress bars on stderr
+    # Copy sample (ADR 0003): a large Inventory is read until Coverage reaches `coverage`; `read_all` reads every
+    # Creative; `max_ads` caps the Creatives read (each bucket's minimum still comes first).
+    read_all: bool = False
+    coverage: float = 0.95
+    max_ads: int | None = None
 
 
 @dataclass
@@ -147,6 +158,17 @@ def _advertiser_name(client: TransparencyClient, query: Query, out: Path) -> str
     return name
 
 
+def _prepare_sampling(q: WorkQueue, options: ScrapeOptions) -> None:
+    """Refresh the Coverage target and cap from this run's options (`p` is kept), and on a full run queue a
+    sampling round if held Creatives remain from an earlier, finished listing (e.g. a rerun with a higher
+    `--coverage`, or `--all`). The round itself decides whether to admit more."""
+    meta = sampling_meta(q)
+    meta.update(target=options.coverage, max_ads=options.max_ads)
+    q.set_meta("sampling", json.dumps(meta))
+    if options.stage is None and q.get_meta("list_done") and q.count(HELD, "pending"):
+        seed_round(q)
+
+
 def _region_label(region: str) -> str:
     return "anywhere" if region.lower() == "anywhere" else region.upper()
 
@@ -206,29 +228,6 @@ def _blank(v) -> object:
     return "" if v is None else v
 
 
-def copy_status(extract_status: str | None, result: dict | None, held: bool = False) -> str:
-    """Why a row has or lacks copy. `extract_status` is the extract item's status (None: no item yet);
-    `held` is a Creative left out of the sample. `result["format"]` is the Creative's format, when known."""
-    if held:
-        return "not_sampled"
-    if extract_status != "done":
-        return "pending"
-    r = result or {}
-    if r.get("preview_broken"):
-        return "preview_broken"
-    if r.get("content_unparsed"):
-        return "unreadable"
-    if any(r.get(k) for k in ("brand", "headline", "description", "display_url")):
-        return "read"
-    if r.get("vision_pending"):
-        return "pending"  # the Codex read was deferred (cap or breaker), so "no copy" is not known yet
-    if r.get("preview_kind") == "content_js":
-        return "no_copy"
-    if r.get("preview_kind") == "image" and not r.get("full_text") and r.get("format") in ("image", "video"):
-        return "no_copy"
-    return "unreadable"
-
-
 def infer_accounts(rows: list[dict]) -> None:
     """Fill `ads_account_id` and `ads_account_source` in place. Only content.js Previews expose an Ads account;
     a row without one gets the account of its website when every exposed row of that website agrees."""
@@ -247,7 +246,15 @@ def infer_accounts(rows: list[dict]) -> None:
             r["ads_account_id"], r["ads_account_source"] = "", ""
 
 
-def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
+def is_sampled(q: WorkQueue) -> bool:
+    """Whether the run reads a Copy sample (admission probability below 1) rather than the whole Inventory."""
+    return sampling_meta(q).get("p", 1.0) < 1.0
+
+
+def _rows(q: WorkQueue, options: ScrapeOptions, groups: dict[str, SampleGroup] | None = None,
+          of_creative: dict[str, str] | None = None) -> list[dict]:
+    """CSV rows: every Variation that reached fetch, plus one `not_sampled` row per held Creative. With `groups`
+    (a Copy sample), read rows weigh their group's Inventory / Creatives read; otherwise 1.0."""
     region = _region_label(options.region)
     listing: dict[str, dict] = {}
     if options.variations:
@@ -255,12 +262,20 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
         listing = {i.key: {k: v for k, v in i.payload.items() if k != "preview"} for i in q.items("detail")}
     extracts = {i.key: i for i in q.items("extract")}
     rows = []
-    for f in q.items("fetch"):
+    held = [(i, True) for i in q.items(HELD)]
+    for f, is_held in [(i, False) for i in q.items("fetch")] + held:
         pl = {**f.payload, **listing.get(f.payload["creative_id"], {})}
+        pl.setdefault("variation", 1)  # a held Creative's Variations aren't listed yet
         p = pl.get("preview") or {}
-        item = extracts.get(f.key)
+        item = None if is_held else extracts.get(f.key)
         c = (item.result if item and item.status == "done" else None) or {}
-        status = copy_status(item.status if item else None, {**c, "format": pl.get("format", "")})
+        status = copy_status(item.status if item else None, {**c, "format": pl.get("format", "")}, held=is_held)
+        weight: object = ""
+        if status not in ("not_sampled", "pending"):
+            weight = 1.0
+            if groups is not None and of_creative is not None:
+                g = groups[of_creative[pl["creative_id"]]]
+                weight = sampling.sample_weight(g.inventory, g.processed) if g.processed else ""
         account, ad_group = preview_ids(p.get("url", "")) if p.get("kind") == "content_js" else ("", "")
         cr = pl["creative_id"]
         conf = c.get("confidence")
@@ -290,7 +305,7 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
             "extraction_model": c.get("model", ""),
             "extraction_confidence": "" if conf is None else round(float(conf), 3),
             "copy_status": status,
-            "sample_weight": "" if status in ("not_sampled", "pending") else 1.0,  # Task 7 replaces the weight
+            "sample_weight": weight,
             "ads_account_id": account,
             "ads_account_source": "",
             "ad_group_id": ad_group,
@@ -301,8 +316,8 @@ def _rows(q: WorkQueue, options: ScrapeOptions) -> list[dict]:
     return rows
 
 
-_STAGE_LABELS = {"list": ("list", "page"), "detail": ("detail", "creative"), "fetch": ("fetch", "ad"),
-                 "script": ("scripts", "script"), "extract": ("extract", "ad")}
+_STAGE_LABELS = {"list": ("list", "page"), "sample": ("sample", "round"), "detail": ("detail", "creative"),
+                 "fetch": ("fetch", "ad"), "script": ("scripts", "script"), "extract": ("extract", "ad")}
 
 
 def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
@@ -331,8 +346,10 @@ def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
     return bars
 
 
-def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult) -> dict:
-    """The run's summary.json content. Sampling fields stay empty until a sampled run fills them."""
+def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult,
+                  groups: dict[str, SampleGroup] | None = None) -> dict:
+    """The run's summary.json content. Coverage, sampling and buckets are filled for a Copy sample (`groups`)
+    and stay empty for a full read."""
     accounts: dict[tuple[str, str], dict] = {}
     for r in rows:
         if not r.get("ads_account_id"):
@@ -350,9 +367,16 @@ def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult) -> dict:
         "listed": len({r["creative_id"] for r in rows}),
         "google_estimate": estimate,
         "copy_status": dict(Counter(r["copy_status"] for r in rows)),
-        "coverage": None,
-        "sampling": None,
-        "buckets": [],
+        "coverage": None if groups is None else sampling.coverage([m for g in groups.values() for m in g.messages]),
+        "sampling": None if groups is None else {
+            **sampling_meta(q),
+            "inventory": sum(g.inventory for g in groups.values()),
+            "read": sum(g.processed for g in groups.values()),
+        },
+        "buckets": [] if groups is None else [
+            {"bucket": k, "inventory": g.inventory, "read": g.processed,
+             "messages": len({m for m in g.messages if m}), "coverage": sampling.coverage(g.messages)}
+            for k, g in sorted(groups.items())],
         "ads_accounts": [{"ads_account_id": a["ads_account_id"], "source": a["source"],
                           "websites": dict(a["websites"]), "formats": dict(a["formats"])} for a in ranked],
         "stage_seconds": {s: {k: round(v, 1) for k, v in t.items()} for s, t in rr.stage_seconds.items()},
@@ -390,10 +414,12 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         q = WorkQueue(run / "state.sqlite3")
         _remove_done_content(q, run)
         _prepare_queue(q, options, emit)
+        _prepare_sampling(q, options)
 
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
                            codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=emit,
-                           oembed=oembed, host_exists=HostChecker(oembed, cache, log=emit))
+                           oembed=oembed, host_exists=HostChecker(oembed, cache, log=emit),
+                           read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads)
         ads = AdsStages(ctx)
         if options.stage in (None, "extract"):
             ads.retry_titles(q)  # transient oEmbed failures of earlier runs
@@ -408,9 +434,11 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
                 progress = None
 
         csv_path = run / "ads.csv"
-        rows = _rows(q, options)
+        groups, of_creative = (sample_groups(q, options.variations, query, ctx.today()) if is_sampled(q)
+                               else (None, None))
+        rows = _rows(q, options, groups, of_creative)
         n = write_csv_atomic(csv_path, CSV_FIELDS, rows)
-        summary = build_summary(rows, q, rr)
+        summary = build_summary(rows, q, rr, groups)
         summary_path = run / "summary.json"
         _write_json_atomic(summary_path, summary)
         failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
@@ -440,6 +468,8 @@ def _log_summary(r: ScrapeResult, codex: CodexRunner, log: Callable[[str], None]
         log(f"error: {e}")
     if r.blocked_until is not None:
         log(f"blocked until {datetime.fromtimestamp(r.blocked_until):%H:%M}")
+    if r.coverage is not None:
+        log(f"Coverage {r.coverage:.3f} of the Copy sample's Messages")
     if not r.listing_complete:
         log(incomplete_message(r))
 
