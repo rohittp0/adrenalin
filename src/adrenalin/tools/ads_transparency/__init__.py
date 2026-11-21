@@ -43,8 +43,9 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--coverage", type=float, default=0.95,
                    help="sampled runs: read until this share of Messages is found, 0 < x < 1 (default 0.95)")
     p.add_argument("--max-ads", type=int, metavar="N",
-                   help="read copy for at most N Creatives, even for a small Inventory; the cap may be exceeded "
-                        "only by the per-bucket minimum of 3 (no effect without Google's count estimate)")
+                   help="read copy for about N Creatives, even for a small Inventory, plus up to 3 per launch-week x "
+                        "running/stopped x Ads account group (no effect without Google's count estimate; a rerun "
+                        "keeps the first run's head start)")
     p.add_argument("--wait-on-block", action="store_true", help="wait out Google blocks instead of exiting")
     p.add_argument("--stage", choices=("list", "fetch", "extract", "export"), help="run one stage only")
     p.add_argument("--out", type=Path, default=Path("out"), help="output root (default out/)")

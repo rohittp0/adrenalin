@@ -65,7 +65,7 @@ _Avoid_: Sample (unqualified)
 The estimated share of the Advertiser's Messages the Copy sample has already found (Good–Turing: one minus the share of sampled Creatives whose Message was seen only once). Low-confidence reads don't count, because OCR misreads would look like new Messages.
 
 **Copy status**:
-What happened to a Creative's copy in a run: `read`; `not_sampled` (in the Inventory but outside the Copy sample); `pending` (chosen for the sample but not read yet); `no_copy` (the Preview carries no ad text, as with most video and app-install ads; expected, not an error); `preview_broken` (every Variation is a Broken Preview); `unreadable` (the Preview's format isn't understood, or OCR and Codex both failed).
+What happened to a Creative's copy in a run: `read`; `not_sampled` (in the Inventory but outside the Copy sample); `pending` (chosen for the sample but not read yet); `no_copy` (the Preview carries no ad text, as with most video and app-install ads; expected, not an error); `preview_broken` (every Variation is a Broken Preview); `unreadable` (the Preview's format isn't understood, OCR and Codex both failed, or reading failed on every retry). A read that failed but will be retried on the next run stays `pending`.
 _Avoid_: Blank copy (as a catch-all)
 
 **Incomplete run**:
