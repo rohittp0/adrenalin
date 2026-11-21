@@ -49,6 +49,7 @@ class AdCopy:
     image_urls: list[str] = field(default_factory=list)
     confidence: float | None = None
     vision_pending: bool = False
+    preview_broken: bool = False  # the image is Google's own "500. That's an error." page, not the ad
 
     @property
     def has_copy(self) -> bool:
@@ -425,6 +426,13 @@ def verify_hosts(c: AdCopy, host_exists) -> None:
         _doubt(c)
 
 
+def is_broken_preview(text: str) -> bool:
+    """Whether text read from an image is Google's error page: the Creative was archived as a picture of its own
+    "500. That's an error." page (a Broken Preview). Permanent: every download returns the same bytes."""
+    t = (text or "").replace("’", "'").lower()
+    return "that's an error" in t and "please try again later" in t
+
+
 def needs_vision(r: OcrResult, copy: AdCopy | None) -> bool:
     return (not r.lines or r.confidence < MIN_CONFIDENCE or copy is None
             or (copy.confidence is not None and copy.confidence < MIN_CONFIDENCE))
@@ -542,15 +550,26 @@ def extract_image(
             r = load_ocr()
         except OcrUnavailable as e:
             no_ocr = e
+    if r is None and no_ocr is None:  # forced vision: an OCR read from an earlier run may know the image is broken
+        r_cached = next((_ocr_from_dict(hit) for m in OCR_METHODS if (hit := cache.get(key, m)) is not None), None)
+        if r_cached is not None and is_broken_preview(r_cached.text):
+            return AdCopy(preview_broken=True)
+    if r is not None and is_broken_preview(r.text):
+        return AdCopy(preview_broken=True)  # before Codex: it would only read the error page again
     copy = parse(r) if r is not None else None
     pending = False
     if force_vision or no_ocr is not None or needs_vision(r, copy):
         fields, pending = _vision(path, key, cache, codex, warn)
         if fields is not None:
+            if is_broken_preview(" ".join(
+                    str(fields.get(k) or "") for k in ("brand", "headline", "description", "full_text"))):
+                return AdCopy(preview_broken=True)
             return _vision_copy(fields, codex.model)
         if r is None and no_ocr is None:  # forced vision yielded nothing: fall back to OCR
             try:
                 r = load_ocr()
+                if is_broken_preview(r.text):
+                    return AdCopy(preview_broken=True)
                 copy = parse(r)
             except OcrUnavailable as e:
                 no_ocr = e

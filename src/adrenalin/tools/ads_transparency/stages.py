@@ -103,6 +103,13 @@ def write_atomic(path: Path, data: bytes) -> None:
 
 
 @dataclass
+class _Recovered:
+    n: int  # 1-based index of the Variation in the detail response
+    alt: Preview
+    rel: str  # run-relative image path
+
+
+@dataclass
 class StageContext:
     client: TransparencyClient
     session: PacedSession
@@ -283,6 +290,7 @@ class AdsStages:
         p = preview_from_dict(pl.get("preview"))
         title, title_pending = "", False
         unparsed = False
+        extra: dict = {}
         if p is None:
             self.warn(f"no preview for {item.key}; copy left blank")
             copy = AdCopy()
@@ -296,13 +304,43 @@ class AdsStages:
             if copy.video_id:
                 title, title_pending = self._video_title(copy.video_id)
         else:
-            copy = extract_image(
-                ctx.entity / pl["image_file"], image_name(p), pl.get("format", ""),
-                cache=ctx.cache, codex=ctx.codex, force_vision=ctx.vision, ocr=ctx.ocr, warn=self.warn,
-                host_exists=ctx.host_exists,
-            )
+            copy = self._read_image(ctx.entity / pl["image_file"], p, pl.get("format", ""))
+            if copy.preview_broken and not ctx.variations:  # with variations, sibling rows carry their own copy
+                copy, used, unverified = self._recover_broken(item, p, pl.get("format", ""), copy)
+                extra = {"variation_used": used.n if used else 0, "broken_unverified": unverified}
+                if used:  # the row shows the Variation that was read
+                    extra |= {"preview_url": used.alt.url, "image_file": used.rel}
         return {**copy.to_dict(), "video_title": title, "title_pending": title_pending,
-                "preview_kind": p.kind if p else "", "content_unparsed": unparsed}
+                "preview_kind": p.kind if p else "", "content_unparsed": unparsed, **extra}
+
+    def _read_image(self, path: Path, p: Preview, fmt: str) -> AdCopy:
+        ctx = self.ctx
+        return extract_image(path, image_name(p), fmt, cache=ctx.cache, codex=ctx.codex, force_vision=ctx.vision,
+                             ocr=ctx.ocr, warn=self.warn, host_exists=ctx.host_exists)
+
+    def _recover_broken(self, item: Item, p: Preview, fmt: str,
+                        broken: AdCopy) -> tuple[AdCopy, _Recovered | None, bool]:
+        """The Preview is Google's error page. Read the Creative's other image Variations and use the first that
+        is not broken. Returns (copy, the Variation used or None, whether the Variations could not be checked:
+        a block, network or RPC error, retried on the next run)."""
+        ctx = self.ctx
+        try:
+            previews = ctx.client.variations(ctx.query.advertiser_id, item.key.split("#")[0])
+            for n, alt in enumerate(previews, 1):
+                if alt.kind != "image" or image_name(alt) == image_name(p):
+                    continue
+                rel = f"images/{image_name(alt)}.png"
+                path = ctx.entity / rel
+                if not path.exists():
+                    write_atomic(path, self._get_ok(alt.url).content)
+                copy = self._read_image(path, alt, fmt)
+                if not copy.preview_broken:
+                    return copy, _Recovered(n, alt, rel), False
+        except (Blocked, requests.RequestException, ValueError) as e:  # ValueError: RpcError, unparsable detail
+            self.warn(f"Broken Preview for {item.key}: could not check its other Variations "
+                      f"({type(e).__name__}: {e}); retrying on the next run")
+            return broken, None, True
+        return broken, None, False
 
     def retry_titles(self, q: WorkQueue) -> None:
         """Fetch the video titles that failed temporarily on an earlier run, from the stored video ID. Only the
