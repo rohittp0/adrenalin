@@ -104,12 +104,30 @@ def _template_data(raw: str) -> dict[str, str]:
     return {k: _decode_escapes(v) for k, v in pair.findall("{" + block)}
 
 
+_APP_KEYS = ("shortAppName", "appName", "shortDescription", "appIconHighRes", "developer", "appStoreName")
+
+
+def _app_install_data(s: str) -> dict[str, str]:
+    """The second video renderer (layout `uac_youtube_video_v2`, ~145 KB, no `adData` block and no
+    `ytimg.com/vi/` URL; it is the app-install video Preview of a Play Store app). Investigated on six real
+    Previews: the ad text sits in a flat, JS-object-literal dict of `'key': 'value'` pairs: `video_videoId`
+    (the YouTube ID), `shortAppName`, `appName` (the store title), `shortDescription`, `developer`,
+    `appStoreName`, `appIconHighRes`. The markup carries no other copy. `s` is the decoded text. Empty when the
+    keys are absent."""
+    if not re.search(r"'layout':\s*'uac_youtube_video_v2'", s):
+        return {}
+    out = {k: (m.group(1) if (m := re.search(r"'" + k + r"':\s*'([^']*)'", s)) else "") for k in _APP_KEYS}
+    return out if out["shortAppName"] or out["appName"] or out["shortDescription"] else {}
+
+
 def parse_content_js(js: str) -> AdCopy | None:
     c = AdCopy()
     found = False
     s = _decode_escapes(js)
 
     if m := re.search(r"ytimg\.com/vi/([\w-]+)/", s):
+        c.video_id, found = m.group(1), True
+    elif m := re.search(r"'video_videoId':\s*'([\w-]+)'", s):
         c.video_id, found = m.group(1), True
 
     if m := re.search(r"adurl=(https?%3A[^&\"'\s\\<>]+)", s, re.I):
@@ -124,7 +142,13 @@ def parse_content_js(js: str) -> AdCopy | None:
         c.image_urls = [tpl[k] for k in _IMAGE_KEYS if tpl.get(k)]
         found = found or bool(c.headline or c.description or c.brand or c.logo_url or c.image_urls)
 
-    strings = _markup_strings(s)
+    app = _app_install_data(s)
+    if app:
+        c.brand, c.headline, c.description = app["shortAppName"], app["appName"], app["shortDescription"]
+        c.logo_url = app["appIconHighRes"]
+        found = True
+
+    strings = [] if app else _markup_strings(s)
     if not c.video_id:
         if len(strings) >= 3 and not (c.headline or c.brand or c.description):
             c.brand = strings[0]
@@ -154,6 +178,7 @@ def parse_content_js(js: str) -> AdCopy | None:
 
 # Play Store info labels in app-install Previews; each is followed by its value. Matched exactly: other
 # all-caps strings ("BIG SALE") are ad copy.
+_STORE_NAMES = {"Google Play", "App Store"}  # the store badge shown on app-install ads: never copy
 _STORE_LABELS = {"DOWNLOADS", "CATEGORY", "DEVELOPER", "RATING", "RATINGS", "REVIEWS", "INSTALLS", "SIZE", "PRICE"}
 
 
@@ -167,7 +192,7 @@ def _video_headline_description(strings: list[str], brand: str) -> tuple[str, st
     for t in strings[:cta]:
         if label:
             label = False  # the value after a store-info label
-        elif t == brand:
+        elif t == brand or t in _STORE_NAMES:
             continue
         elif t in _STORE_LABELS:
             label = True
