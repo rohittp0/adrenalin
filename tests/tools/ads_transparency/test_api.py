@@ -16,7 +16,15 @@ from adrenalin.common.ocr import OcrLine, OcrResult, OcrUnavailable
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.output import EntityCollision
 from adrenalin.common.pipeline import WorkQueue
-from adrenalin.tools.ads_transparency.api import CSV_FIELDS, ScrapeOptions, list_creatives, scrape
+from adrenalin.tools.ads_transparency.api import (
+    COPY_STATUSES,
+    CSV_FIELDS,
+    ScrapeOptions,
+    copy_status,
+    infer_accounts,
+    list_creatives,
+    scrape,
+)
 
 FIX = Path(__file__).parents[2] / "fixtures" / "ads_transparency"
 AR = "AR04752318142645010433"
@@ -475,7 +483,7 @@ def test_permanent_oembed_failure_is_not_retried(tmp_path):
     assert fake.calls["oembed"] == before["oembed"] and fake.calls["content_js"] == before["content_js"]
 
 
-def test_content_js_without_copy_warns(tmp_path):
+def test_content_js_without_copy_is_no_copy(tmp_path):
     fake = FakeGoogle()
     fake.content_video = (b"var a = {'adData': [{'squareImage': "
                           b"'https://tpc.googlesyndication.com/simgad/12147114744176439645'}]};")
@@ -485,7 +493,8 @@ def test_content_js_without_copy_warns(tmp_path):
     videos = [r for r in read_rows(res) if r["format"] == "video"]
     assert videos and all(r["image_urls"].endswith("/12147114744176439645") for r in videos)
     assert all(r["extraction_confidence"] == "" and r["brand"] == "" for r in videos)
-    assert sum("no ad copy" in m for m in logs) == len(videos)
+    assert not any("no ad copy" in m for m in logs)
+    assert all(r["copy_status"] == "no_copy" for r in videos)
 
 
 def test_oembed_failure_blanks_title_without_failing(tmp_path):
@@ -830,3 +839,63 @@ def test_broken_preview_detail_blocked_retries_next_run(tmp_path):
     assert res.failed == {}
     got = extract_results(tmp_path)[key]
     assert got["variation_used"] == 2 and not got.get("preview_broken") and not got.get("broken_unverified")
+
+
+COPY = {"headline": "Buy now"}
+
+
+@pytest.mark.parametrize("status, result, held, want", [
+    ("done", COPY, True, "not_sampled"),
+    (None, None, False, "pending"),
+    ("pending", None, False, "pending"),
+    ("running", None, False, "pending"),
+    ("failed", None, False, "pending"),
+    ("done", {"preview_broken": True}, False, "preview_broken"),
+    ("done", {"content_unparsed": True}, False, "unreadable"),
+    ("done", {"brand": "A"}, False, "read"),
+    ("done", {"headline": "H"}, False, "read"),
+    ("done", {"description": "D"}, False, "read"),
+    ("done", {"display_url": "a.com"}, False, "read"),
+    ("done", {"preview_kind": "image", "full_text": "", "format": "image", "vision_pending": True}, False, "pending"),
+    ("done", {"preview_kind": "image", "full_text": "", "format": "video", "vision_pending": True}, False, "pending"),
+    ("done", {"preview_kind": "content_js"}, False, "no_copy"),
+    ("done", {"preview_kind": "image", "full_text": "", "format": "image"}, False, "no_copy"),
+    ("done", {"preview_kind": "image", "full_text": "", "format": "video"}, False, "no_copy"),
+    ("done", {"preview_kind": "image", "full_text": "", "format": "text"}, False, "unreadable"),
+    ("done", {"preview_kind": "image", "full_text": "stray words", "format": "image"}, False, "unreadable"),
+])
+def test_copy_status_rules(status, result, held, want):
+    assert copy_status(status, result, held) == want
+
+
+def test_infer_accounts_only_when_website_maps_to_one_account():
+    rows = [{"website": w, "ads_account_id": a, "ad_group_id": "g" if a else ""}
+            for w, a in [("a.com", "X"), ("a.com", ""), ("b.com", "X"), ("b.com", "Y"), ("b.com", "")]]
+    infer_accounts(rows)
+    assert [(r["ads_account_id"], r["ads_account_source"]) for r in rows] == [
+        ("X", "exposed"), ("X", "inferred"), ("X", "exposed"), ("Y", "exposed"), ("", "")]
+    assert [r["ad_group_id"] for r in rows] == ["g", "", "g", "g", ""]
+
+
+def test_scrape_rows_have_status_and_account_columns(tmp_path):
+    res = run_scrape(tmp_path, FakeGoogle())
+    assert CSV_FIELDS[-5:] == ("copy_status", "sample_weight", "ads_account_id", "ads_account_source", "ad_group_id")
+    with res.csv_path.open(encoding="utf-8") as f:
+        assert tuple(next(csv.reader(f)))[-5:] == CSV_FIELDS[-5:]
+    rows = read_rows(res)
+    assert rows and all(r["copy_status"] in COPY_STATUSES for r in rows)
+    assert all(r["sample_weight"] == "1.0" for r in rows if r["copy_status"] not in ("not_sampled", "pending"))
+    assert all(r["ads_account_source"] in ("exposed", "inferred", "") for r in rows)
+
+
+def test_export_of_pre_change_run_dir(tmp_path):
+    fake = FakeGoogle()
+    run_scrape(tmp_path, fake)
+    q = WorkQueue(run_dir(tmp_path) / "state.sqlite3")
+    for key, r in q.results("extract"):
+        q.complete("extract", key, {k: v for k, v in (r or {}).items()
+                                    if k not in ("preview_kind", "content_unparsed", "preview_broken")})
+    q.close()
+    rows = read_rows(run_scrape(tmp_path, fake, stage="export"))
+    assert rows and all(r["copy_status"] in COPY_STATUSES for r in rows)
+    assert any(r["headline"] and r["copy_status"] == "read" for r in rows)

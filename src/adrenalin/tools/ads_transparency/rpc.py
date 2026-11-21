@@ -205,6 +205,12 @@ def transparency_url(advertiser_id: str, creative_id: str, region: str) -> str:
     return f"https://{HOST}/advertiser/{advertiser_id}/creative/{creative_id}?region={region}"
 
 
+def preview_ids(url: str) -> tuple[str, str]:
+    """(Ads account ID, Ad group ID) a content.js Preview URL exposes; `""` for each that is absent."""
+    q = dict(parse_qsl(urlparse(url).query))
+    return q.get("obfuscatedCustomerId", ""), q.get("adGroupId", "")
+
+
 class TransparencyClient:
     def __init__(self, session: PacedSession):
         self._s = session

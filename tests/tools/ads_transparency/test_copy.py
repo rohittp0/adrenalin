@@ -724,3 +724,24 @@ def test_broken_codex_result_is_a_broken_preview(tmp_path):
     finally:
         cache.close()
     assert c.preview_broken and codex.calls == 1 and not c.headline and not c.full_text
+
+
+@pytest.mark.parametrize("store", ["Google Play", "App Store"])
+def test_store_badge_is_not_a_headline(store):
+    from adrenalin.tools.ads_transparency.copy import _video_headline_description
+
+    strings = ["Hotels70", store, "Cheap hotel deals tonight", "Install"]
+    headline, description = _video_headline_description(strings, "Hotels70")
+    assert headline != store
+    assert store not in description
+    assert description == "Cheap hotel deals tonight"
+
+
+def test_video_renderer2_parsed():
+    c = parse_content_js((FIX / "content_video_renderer2.js").read_text(encoding="utf-8"))
+    assert c is not None
+    assert c.video_id == "fvu_CcMOAc4"
+    assert c.brand == "Hotels70"
+    assert c.headline == "Cheap Hotels・Hotels70"
+    assert c.description.startswith("Cheap hotels anytime!")
+    assert c.method == "content_js"

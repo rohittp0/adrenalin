@@ -39,7 +39,7 @@ CONTENT_DIR = "content"
 _STAGE_CONFIG = {
     "list": (1, ("detail", "fetch", "script", "extract"), 200),
     "detail": (1, ("fetch", "script", "extract"), 50),
-    "fetch": (2, ("extract",), 50),
+    "fetch": (4, ("extract",), 50),
     "script": (1, ("extract",), 50),
     "extract": (2, (), 0),
 }
@@ -294,8 +294,6 @@ class AdsStages:
                 self.warn(f"content.js not parsed for {item.key}; copy left blank{kept}")
                 copy = AdCopy()
                 unparsed = True
-            elif not copy.has_copy:
-                self.warn(f"no ad copy in content.js for {item.key}; brand, headline and description left blank")
             if copy.video_id:
                 title, title_pending = self._video_title(copy.video_id)
         else:
