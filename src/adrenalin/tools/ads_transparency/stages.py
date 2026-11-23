@@ -61,7 +61,7 @@ _STAGE_CONFIG = {
     "sample": (1, ("list", "detail", "fetch", "script", "extract"), None),
     "detail": (1, ("fetch", "script", "extract"), 50),
     "fetch": (4, ("extract",), 50),
-    "script": (1, ("extract",), 50),
+    "script": (3, ("extract",), 50),
     "extract": (2, (), 0),
 }
 
@@ -288,8 +288,8 @@ class AdsStages:
 
     # -- fetch --------------------------------------------------------------
 
-    def _get_ok(self, url: str) -> requests.Response:
-        resp = self.ctx.session.get(url, allow_redirects=True)
+    def _get_ok(self, url: str, *, retry_network: int = 0) -> requests.Response:
+        resp = self.ctx.session.get(url, allow_redirects=True, retry_network=retry_network)
         if resp.status_code != 200:
             raise requests.HTTPError(f"HTTP {resp.status_code} for {url}", response=resp)
         return resp
@@ -319,7 +319,7 @@ class AdsStages:
         p = preview_from_dict(item.payload.get("preview"))
         reread = bool(item.payload.get(REREAD))
         try:
-            data = self._get_ok(p.url).content
+            data = self._get_ok(p.url, retry_network=2).content
         except requests.RequestException as e:
             if not reread or item.attempts + 1 < q.max_attempts:  # `attempts` counts earlier claims
                 raise
@@ -446,7 +446,7 @@ class AdsStages:
         except FileNotFoundError:
             # An in-flight item's file was lost (crash, cleanup): download it again. Stale reads of done rows never
             # get here without their file (see `api._reread_stale_content`).
-            data = self._get_ok(p.url).content
+            data = self._get_ok(p.url, retry_network=2).content
         return data.decode("utf-8", errors="replace")
 
     def extract_done(self, item: Item, result: dict | None) -> None:

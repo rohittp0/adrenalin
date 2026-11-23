@@ -57,3 +57,25 @@ out/.cache/                      cooldown and extraction caches
 See `CONTEXT.md` for terminology and `docs/adr/` for design decisions. Tests: `uv run pytest`.
 
 Transparency RPCs use a fresh headless Google Chrome session controlled by Playwright. Install Google Chrome before running the tool; no signed-in profile is required. The browser sends RPC requests directly and closes at the end of each run. Other downloads use Python requests. All HTTP transports retain the configured pacing and block cooldowns.
+
+If Google requires a CAPTCHA, rerun with `--solve-captcha --wait-on-block`.
+Chrome opens a visible window only when a challenge is encountered. Complete
+the challenge manually in that scraper-owned window; when it returns to Ads Transparency, the blocked RPC is
+retried automatically with the same cursor. The window closes after completion;
+headless Chrome continues using the session cookies held in memory and opens a
+visible window again only if needed. The handoff waits up to 10 minutes.
+Existing saved cooldowns are still honored before requests are sent.
+Session cookies are reused only in that browser context and are not saved to disk
+or imported from your regular Chrome profile. Closing the run closes the browser;
+a later run may require another challenge.
+
+Script downloads use three concurrent workers with shared adaptive host pacing:
+a 2.5-second base interval decreases toward 1.5 seconds after clean responses and
+increases immediately on HTTP 429/CAPTCHA, or after three consecutive network
+failures/5xx responses, up to 15 seconds (with jitter). Clean responses reset the
+failure streak. Isolated disconnects and timeouts get two paced retries with
+per-request backoff without slowing the entire host; blocks still trigger cooldowns.
+
+Progress separates `inventory` (Creatives listed) from `creatives queued` (copy
+work currently admitted). The queued-copy ETA covers only that queue; later
+sampling rounds may add work. Sampling targets and limits are unchanged.

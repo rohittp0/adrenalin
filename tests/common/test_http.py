@@ -320,14 +320,12 @@ def test_adaptive_speeds_up_after_clean_streak(tmp_path):
     assert e.session.interval("img.com") == pytest.approx(0.2)
 
 
-def test_adaptive_slows_on_429_and_5xx(tmp_path):
-    e = _adaptive_env(tmp_path, start=0.5, replies=[resp(503)])
-    assert e.session.get("https://img.com/x").status_code == 503
-    assert e.session.interval("img.com") == 1.0
-    for _ in range(5):
-        e.replies.append(resp(500))
-        e.session.get("https://img.com/x")
-    assert e.session.interval("img.com") == 4.0
+def test_adaptive_slows_immediately_on_429_but_requires_three_5xx(tmp_path):
+    e = _adaptive_env(tmp_path, start=0.5)
+    for expected in (0.5, 0.5, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 4.0):
+        e.replies.append(resp(503))
+        assert e.session.get("https://img.com/x").status_code == 503
+        assert e.session.interval("img.com") == expected
     e2 = _adaptive_env(tmp_path / "b", start=0.5, replies=[resp(429, headers={"Retry-After": "1"})])
     e2.session.get("https://img.com/x")
     assert e2.session.interval("img.com") == 1.0
@@ -353,7 +351,7 @@ def test_derive_keeps_adaptive_config_with_fresh_state(tmp_path):
     assert e.session.derive().interval("img.com") == 0.5
 
 
-def test_adaptive_slows_on_connection_errors_and_timeouts(tmp_path):
+def test_isolated_connection_errors_and_timeouts_do_not_slow_host(tmp_path):
     for exc in (requests.ConnectionError("reset"), requests.Timeout("read timed out")):
         e = _adaptive_env(tmp_path / type(exc).__name__, start=0.5)
 
@@ -363,7 +361,7 @@ def test_adaptive_slows_on_connection_errors_and_timeouts(tmp_path):
         e.session._transport = broken
         with pytest.raises(type(exc)):
             e.session.get("https://img.com/x")
-        assert e.session.interval("img.com") == 1.0
+        assert e.session.interval("img.com") == 0.5
 
 
 def test_host_checker_handles_string_error_reason(tmp_path):
@@ -375,3 +373,102 @@ def test_host_checker_handles_string_error_reason(tmp_path):
         assert check('tls.test')  # inconclusive connection errors are not DNS misses
     finally:
         cache.close()
+
+
+@pytest.mark.parametrize('method, failures, expected_calls', [('GET', 1, 2), ('GET', 9, 3), ('POST', 1, 1)])
+def test_network_retries_are_bounded_paced_and_read_only(tmp_path, method, failures, expected_calls):
+    e = Env(tmp_path, intervals={'a.com': (3, 0)})
+    times = []
+    def transport(method, url, **kwargs):
+        assert 'retry_network' not in kwargs
+        times.append(e.now)
+        if len(times) <= failures:
+            raise requests.ConnectionError('remote disconnected')
+        return resp()
+    e.session._transport = transport
+    if failures >= expected_calls:
+        with pytest.raises(requests.ConnectionError):
+            e.session.request(method, 'https://a.com/x', retry_network=2)
+    else:
+        assert e.session.request(method, 'https://a.com/x', retry_network=2).status_code == 200
+    assert len(times) == expected_calls
+    assert all(b - a >= 3 for a, b in zip(times, times[1:]))
+
+
+def test_network_retry_still_honors_block(tmp_path):
+    e = Env(tmp_path)
+    calls = []
+    def transport(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.Timeout('slow')
+        return resp(302, headers={'Location': SORRY})
+    e.session._transport = transport
+    with pytest.raises(Blocked):
+        e.session.get('https://a.com/x', retry_network=2)
+    assert len(calls) == 2
+
+
+def test_pacing_sleep_does_not_block_completed_response(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    from adrenalin.common.http import AdaptivePace
+    sleeping, release = Event(), Event()
+    e = Env(tmp_path, adaptive={'a.com': AdaptivePace(2.5, 1.5, 15)})
+    def sleep(seconds):
+        sleeping.set()
+        assert release.wait(3)
+    e.session._sleep = sleep
+    e.session._pace('a.com')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(e.session._pace, 'a.com')
+        try:
+            assert sleeping.wait(1)
+            completed = pool.submit(e.session._record, 'a.com', True)
+            completed.result(timeout=0.5)
+        finally:
+            release.set()
+            pending.result(timeout=1)
+
+
+def test_transient_failure_streak_resets_on_success_and_recovers(tmp_path):
+    logs = []
+    e = _adaptive_env(tmp_path, start=0.5, log=logs.append)
+    def timeout(*args, **kwargs):
+        raise requests.Timeout("read timed out")
+    e.session._transport = timeout
+    for _ in range(2):
+        with pytest.raises(requests.Timeout):
+            e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == 0.5
+    e.session._transport = lambda *a, **kw: resp()
+    e.session.get("https://img.com/x")
+    e.session._transport = timeout
+    for _ in range(2):
+        with pytest.raises(requests.Timeout):
+            e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == 0.5
+    # Network failures and server errors share one consecutive-failure streak.
+    e.session._transport = lambda *a, **kw: resp(503)
+    e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == 1.0
+    assert "3 consecutive" in logs[-1] and "HTTP 503" in logs[-1]
+    e.session._transport = lambda *a, **kw: resp()
+    for _ in range(20):
+        e.session.get("https://img.com/x")
+    assert e.session.interval("img.com") == pytest.approx(0.9)
+
+
+def test_isolated_disconnect_retry_does_not_change_shared_pace(tmp_path):
+    e = _adaptive_env(tmp_path, start=0.5)
+    calls = []
+    def flaky(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.ConnectionError("reset")
+        return resp()
+    e.session._transport = flaky
+    assert e.session.get("https://img.com/x", retry_network=2).status_code == 200
+    assert len(calls) == 2
+    assert e.session.interval("img.com") == 0.5
+    assert 1 in e.sleeps  # per-request backoff remains

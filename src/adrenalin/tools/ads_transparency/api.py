@@ -61,8 +61,9 @@ from adrenalin.tools.ads_transparency.stages import (
 
 TOOL_NAME = "ads-transparency"
 RPC_INTERVAL = (6.0, 2.0)
-# content.js Previews: this host blocked a run within minutes at 0.5 s, so it is paced like a page view.
+# content.js previously blocked at 0.5 s: accelerate cautiously and back off on errors.
 SCRIPT_HOST, SCRIPT_INTERVAL = "displayads-formats.googleusercontent.com", (2.5, 0.5)
+SCRIPT_PACE = AdaptivePace(2.5, 1.5, 15.0, clean_streak=30)
 # simgad images: never blocked so far. Paced adaptively: from one a second, faster while responses stay clean,
 # slower on errors (see `AdaptivePace`).
 IMAGE_HOST, IMAGE_PACE = "tpc.googlesyndication.com", AdaptivePace(1.0, 0.2, 4.0)
@@ -86,6 +87,7 @@ class ScrapeOptions:
     vision: bool = False
     vision_model: str = DEFAULT_VISION_MODEL
     vision_limit: int = 200
+    solve_captcha: bool = False
     wait_on_block: bool = False
     stage: Literal["list", "fetch", "extract", "export"] | None = None
     out: Path = Path("out")
@@ -124,11 +126,11 @@ class ScrapeResult:
 
 
 def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False,
-                 log: Callable[[str], None] | None = print_to_stderr) -> PacedSession:
+                 log: Callable[[str], None] | None = print_to_stderr, *, solve_captcha: bool = False) -> PacedSession:
     return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"),
                         {HOST: RPC_INTERVAL, SCRIPT_HOST: SCRIPT_INTERVAL},
                         proxies=proxies, wait_on_block=wait_on_block, log=log,
-                        adaptive={IMAGE_HOST: IMAGE_PACE}, playwright_hosts=(HOST,))
+                        adaptive={IMAGE_HOST: IMAGE_PACE, SCRIPT_HOST: SCRIPT_PACE}, playwright_hosts=(HOST,), solve_captcha=solve_captcha)
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:
@@ -400,26 +402,30 @@ _STAGE_LABELS = {"list": ("list", "page"), "sample": ("sample", "round"), "detai
 
 
 def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
-    """A creatives bar (Google's estimated total until the listing finishes, then the exact count) and one bar per
-    running stage."""
+    """Separate listed Inventory from copy work currently admitted, plus stage bars."""
     def listed(c: dict) -> int:
-        if is_sampled(q):  # the listed Inventory: admitted Creatives (fetch, or detail with --variations) and held
-            stage = listing_stage(any(s == "detail" for s, _ in c))
-            return sum(n for (s, _), n in c.items() if s in (stage, HELD))
-        return sum(n for (s, _), n in c.items() if s == "fetch")
+        # Detail items represent Creatives when variations are requested; fetch
+        # items then represent Variations and must not inflate the Inventory.
+        stage = listing_stage("detail" in stage_names or any(s == "detail" for s, _ in c))
+        return sum(n for (s, _), n in c.items() if s in (stage, HELD))
 
     def list_finished() -> bool:
         return bool(q.get_meta("list_done"))
 
-    def creatives(c: dict) -> tuple[int, int | None]:
+    def inventory(c: dict) -> tuple[int, int | None]:
+        n = listed(c)
+        estimate = int(q.get_meta("count_estimate") or 0)
+        return n, n if list_finished() else max(estimate, n) or None
+
+    def copy_queued(c: dict) -> tuple[int, int | None]:
         done = c.get(("extract", "done"), 0) + c.get(("extract", "failed"), 0)
         failed_before = sum(c.get((s, "failed"), 0) for s in ("fetch", "script"))
-        if list_finished():
-            return done + failed_before, listed(c)
-        estimate = int(q.get_meta("count_estimate") or 0)
-        return done + failed_before, max(estimate, listed(c)) or None
+        queued = sum(n for (s, _), n in c.items() if s == "fetch")
+        return done + failed_before, queued
 
-    bars = [Bar("creatives", creatives, "ad")]
+    # Copy's total grows as sampling admits more work; its ETA is only for the
+    # current queue, never an estimate of time to reach Coverage.
+    bars = [Bar("inventory", inventory, "ad"), Bar("creatives queued", copy_queued, "copy")]
     for name in stage_names:
         label, unit = _STAGE_LABELS.get(name, (name, "it"))
         total = (lambda c, n=name: sum(k for (s, _), k in c.items() if s == n) if list_finished() else None) \
@@ -490,7 +496,8 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
 
     own_session = session is None
     if own_session:
-        session = make_session(options.out, options.proxies, options.wait_on_block, emit)
+        session = make_session(options.out, options.proxies, options.wait_on_block, emit,
+                               solve_captcha=options.solve_captcha)
     # oEmbed and the OCR domain check are optional: they must never wait out a block or back off,
     # whatever --wait-on-block says.
     oembed = session.derive(wait_on_block=False, max_retries=0)

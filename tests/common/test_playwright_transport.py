@@ -113,3 +113,71 @@ def test_javascript_fetch_error_classification(message, expected):
             transport.request('POST', 'https://example.test/rpc', data={'f.req': '{}'})
     finally:
         transport.close()
+
+
+@pytest.mark.parametrize('solved', [True, False])
+def test_captcha_handoff_replays_same_request_only_after_return(monkeypatch, solved):
+    from types import SimpleNamespace
+    from adrenalin.common.playwright_http import PlaywrightTransport
+    transport = PlaywrightTransport(solve_captcha=True)
+    blocked = requests.Response()
+    blocked.status_code = 429
+    blocked.url = 'https://www.google.com/sorry/index'
+    blocked._content = b'challenge'
+    success = requests.Response()
+    success.status_code = 200
+    success.url = 'https://example.test/rpc'
+    success._content = b'{}'
+    calls = []
+    def request(method, url, kwargs):
+        calls.append((method, url, kwargs))
+        return blocked if len(calls) == 1 else success
+    page = SimpleNamespace(url=blocked.url, goto=lambda *a, **k: None,
+                           bring_to_front=lambda: None, is_closed=lambda: not solved)
+    def tick(ms):
+        page.url = 'https://example.test/?google_abuse=temporary'
+    page.wait_for_timeout = tick
+    page.wait_for_load_state = lambda *a: None
+    switches = []
+    monkeypatch.setattr(transport, '_switch_browser', lambda **kw: switches.append(kw['headed']))
+    monkeypatch.setattr(transport, '_ensure_context', lambda proxy: None)
+    transport._pages[(None, 'https://example.test')] = page
+    monkeypatch.setattr(transport, '_request', request)
+    try:
+        result = transport.request('POST', 'https://example.test/rpc', data={'f.req': 'cursor'})
+        assert result is (success if solved else blocked)
+        assert len(calls) == (2 if solved else 1)
+        assert switches == [True, False]
+        if solved:
+            assert calls[0] == calls[1]
+    finally:
+        transport.close()
+
+
+def test_browser_switch_preserves_proxy_sessions_in_memory():
+    from types import SimpleNamespace
+    from adrenalin.common.playwright_http import PlaywrightTransport
+    transport = PlaywrightTransport(solve_captcha=True)
+    launches, restored, closed = [], [], []
+    state = {'cookies': [{'name': 'exemption', 'value': 'test'}], 'origins': []}
+    def context(**options):
+        restored.append(options)
+        return SimpleNamespace(storage_state=lambda: state, close=lambda: None)
+    def launch(**options):
+        launches.append(options)
+        return SimpleNamespace(new_context=context, close=lambda: closed.append(True))
+    transport._playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch), stop=lambda: None)
+    try:
+        transport._ensure_context('http://proxy.test:8080')
+        transport._switch_browser(headed=True)
+        transport._ensure_context('http://proxy.test:8080')
+        transport._switch_browser(headed=False)
+        transport._ensure_context('http://proxy.test:8080')
+        assert [x['headless'] for x in launches] == [True, False, True]
+        assert restored[1]['storage_state'] == restored[2]['storage_state'] == state
+        assert restored[2]['proxy'] == {'server': 'http://proxy.test:8080'}
+        assert len(closed) == 2
+    finally:
+        transport.close()
+    assert len(closed) == 3
+    assert not transport._storage

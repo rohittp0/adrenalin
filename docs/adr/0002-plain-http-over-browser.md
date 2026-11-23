@@ -16,7 +16,7 @@ loaded the site successfully.
 
 Transparency RPCs now use `fetch` inside a fresh Playwright-controlled Chrome
 context. This does not scroll or scrape the UI, or import browser-profile cookies.
-RPC fetches explicitly omit cookies. Chrome supplies its own network fingerprint
+RPC fetches use same-origin cookies from the scraper-owned context. Chrome supplies its own network fingerprint
 and browser headers. Other hosts retain requests. Pacing, proxies, persisted
 cooldowns and block handling remain in PacedSession.
 
@@ -28,3 +28,12 @@ joins its owner thread. Derived sessions own separate lazy transports.
 
 Google Chrome must be installed. The earlier curl-cffi experiment is removed;
 it did not unblock the endpoint.
+
+## Manual CAPTCHA handoff
+
+`--solve-captcha` normally runs Chrome headlessly and opens a visible browser
+only for a challenge. After completion it closes that window and restarts
+headlessly, transferring per-proxy cookies and local storage in memory. A `/sorry/` response triggers a service-root navigation and a
+bounded ten-minute wait for the browser to return to the original origin. The
+same RPC is retried once; if still blocked, normal cooldown handling applies.
+No CAPTCHA is solved automatically, and cookies are not persisted to disk.

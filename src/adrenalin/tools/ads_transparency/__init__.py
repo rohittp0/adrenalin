@@ -46,6 +46,7 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
                    help="read copy for about N Creatives, even for a small Inventory, plus up to 3 per launch-week x "
                         "running/stopped x Ads account group (no effect without Google's count estimate; a rerun "
                         "keeps the first run's head start)")
+    p.add_argument("--solve-captcha", action="store_true", help="show Chrome only when you need to solve a Google CAPTCHA")
     p.add_argument("--wait-on-block", action="store_true", help="wait out Google blocks instead of exiting")
     p.add_argument("--stage", choices=("list", "fetch", "extract", "export"), help="run one stage only")
     p.add_argument("--out", type=Path, default=Path("out"), help="output root (default out/)")
@@ -86,6 +87,7 @@ def run(args: argparse.Namespace) -> int:
         advertiser_id=args.advertiser_id, region=args.region, start=start, end=end,
         variations=args.variations, vision=args.vision, vision_model=args.vision_model,
         vision_limit=args.vision_limit, wait_on_block=args.wait_on_block, stage=args.stage,
+        solve_captcha=args.solve_captcha,
         out=args.out, proxies=tuple(args.proxies), progress=args.progress,
         read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
     )

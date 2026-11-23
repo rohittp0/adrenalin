@@ -1374,7 +1374,12 @@ def test_progress_total_is_the_listed_inventory_on_sampled_runs(tmp_path):
     q.set_meta("list_done", "2026-11-20")
     q.set_meta("sampling", json.dumps({"p": 0.1}))
     creatives = _progress_bars(q, ["list", "sample", "fetch"])[0]
-    assert creatives.count(q.counts()) == (0, 5)
+    assert creatives.label == "inventory"
+    assert creatives.count(q.counts()) == (5, 5)
+    copy = _progress_bars(q, ["list", "sample", "fetch"])[1]
+    assert copy.count(q.counts()) == (0, 2)
+    q.put("fetch", "F#1", {})
+    assert copy.count(q.counts()) == (0, 3)
     q.close()
 
 
@@ -1781,3 +1786,53 @@ def test_rerun_with_a_different_max_ads_notes_the_kept_head_start(tmp_path, smal
     scrape(ScrapeOptions(AR, out=tmp_path, max_ads=5), session=make_session(tmp_path, fake), ocr=fake_ocr,
            codex=codex(), log=logs.append, poll=POLL)
     assert not any(m.startswith("note:") for m in logs)  # the same cap as the first run: nothing to note
+
+
+def test_script_workers_overlap_downloads(tmp_path):
+    barrier = threading.Barrier(3)
+    lock = threading.Lock()
+    started = 0
+    class ParallelGoogle(FakeGoogle):
+        def __call__(self, method, url, **kwargs):
+            nonlocal started
+            if 'content.js' in url:
+                with lock:
+                    started += 1
+                    first = started <= 3
+                if first:
+                    barrier.wait(timeout=5)
+            return super().__call__(method, url, **kwargs)
+    result = run_scrape(tmp_path, ParallelGoogle())
+    assert started >= 3
+    assert not result.failed
+
+
+def test_script_disconnect_recovers_during_run(tmp_path):
+    lock = threading.Lock()
+    disconnected = False
+    class FlakyGoogle(FakeGoogle):
+        def __call__(self, method, url, **kwargs):
+            nonlocal disconnected
+            if 'content.js' in url:
+                with lock:
+                    if not disconnected:
+                        disconnected = True
+                        raise requests.ConnectionError('Remote end closed connection without response')
+            return super().__call__(method, url, **kwargs)
+    result = run_scrape(tmp_path, FlakyGoogle())
+    assert disconnected
+    assert not result.failed
+
+
+def test_progress_counts_variations_as_copy_not_inventory(tmp_path):
+    q = WorkQueue(tmp_path / 'progress.sqlite3')
+    try:
+        q.put('detail', 'A', {})
+        q.put('fetch', 'A#1', {})
+        q.put('fetch', 'A#2', {})
+        q.set_meta('list_done', '2026-11-24')
+        bars = _progress_bars(q, ['list', 'detail', 'fetch'])
+        assert bars[0].count(q.counts()) == (1, 1)
+        assert bars[1].count(q.counts()) == (0, 2)
+    finally:
+        q.close()
