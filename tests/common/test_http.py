@@ -364,3 +364,14 @@ def test_adaptive_slows_on_connection_errors_and_timeouts(tmp_path):
         with pytest.raises(type(exc)):
             e.session.get("https://img.com/x")
         assert e.session.interval("img.com") == 1.0
+
+
+def test_host_checker_handles_string_error_reason(tmp_path):
+    from urllib3.exceptions import MaxRetryError
+    check, cache, session, calls = _checker_env(tmp_path, {
+        'tls.test': requests.ConnectionError(MaxRetryError(None, '/', 'TLS handshake failed')),
+    })
+    try:
+        assert check('tls.test')  # inconclusive connection errors are not DNS misses
+    finally:
+        cache.close()

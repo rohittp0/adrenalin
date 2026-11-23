@@ -326,7 +326,7 @@ def _dns_failure(e: BaseException) -> bool:
     stack, seen = [e], set()
     while stack:
         x = stack.pop()
-        if x is None or id(x) in seen:
+        if not isinstance(x, BaseException) or id(x) in seen:
             continue
         seen.add(id(x))
         if isinstance(x, (socket.gaierror, NameResolutionError)):

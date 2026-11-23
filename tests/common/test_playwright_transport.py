@@ -88,3 +88,28 @@ def test_cleanup_stops_browser_even_when_context_close_fails():
         transport.close()
     assert closed == ['browser', 'playwright']
     assert transport._executor._shutdown
+
+
+@pytest.mark.parametrize('message, expected', [
+    ('Page.evaluate: TimeoutError: signal timed out', requests.Timeout),
+    ('Page.evaluate: TypeError: Failed to fetch', requests.ConnectionError),
+])
+def test_javascript_fetch_error_classification(message, expected):
+    from types import SimpleNamespace
+    from contextlib import nullcontext
+    from playwright.sync_api import Error
+    from adrenalin.common.playwright_http import PlaywrightTransport
+
+    def evaluate(*args):
+        raise Error(message)
+    transport = PlaywrightTransport()
+    transport._playwright = SimpleNamespace(stop=lambda: None)
+    transport._browser = SimpleNamespace(close=lambda: None)
+    transport._contexts[None] = SimpleNamespace(close=lambda: None)
+    transport._pages[(None, 'https://example.test')] = SimpleNamespace(
+        expect_response=lambda *args, **kwargs: nullcontext(), evaluate=evaluate)
+    try:
+        with pytest.raises(expected):
+            transport.request('POST', 'https://example.test/rpc', data={'f.req': '{}'})
+    finally:
+        transport.close()

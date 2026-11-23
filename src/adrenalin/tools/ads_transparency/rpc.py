@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+
+import requests
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -216,20 +218,28 @@ class TransparencyClient:
         self._s = session
 
     def _post(self, url: str, body: dict, advertiser_id: str) -> dict:
-        resp = self._s.post(
-            url,
-            params={"authuser": "0"},
-            data={"f.req": json.dumps(body, separators=(",", ":"))},
-            headers={
-                "X-Same-Domain": "1",
-                "Accept": "*/*",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "same-origin",
-                "Origin": f"https://{HOST}",
-                "Referer": f"https://{HOST}/advertiser/{advertiser_id}",
-            },
-        )
+        # These RPCs only read data. Retrying preserves the same page cursor and
+        # passes through PacedSession again, including pacing and cooldown checks.
+        for attempt in range(3):
+            try:
+                resp = self._s.post(
+                    url,
+                    params={"authuser": "0"},
+                    data={"f.req": json.dumps(body, separators=(",", ":"))},
+                    headers={
+                        "X-Same-Domain": "1",
+                        "Accept": "*/*",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
+                        "Origin": f"https://{HOST}",
+                        "Referer": f"https://{HOST}/advertiser/{advertiser_id}",
+                    },
+                )
+                break
+            except requests.Timeout:
+                if attempt == 2:
+                    raise
         if resp.status_code != 200:
             # A JSON error body would otherwise parse as an empty last page and truncate the listing.
             raise RpcError(f"HTTP {resp.status_code} from {url}")

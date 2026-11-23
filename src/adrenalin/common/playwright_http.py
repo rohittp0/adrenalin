@@ -85,6 +85,10 @@ class PlaywrightTransport:
         except TimeoutError as exc:
             raise requests.Timeout(str(exc)) from exc
         except Error as exc:
+            # AbortSignal.timeout rejects inside evaluate as a JS DOMException,
+            # which Playwright wraps in Error rather than its TimeoutError class.
+            if "TimeoutError: signal timed out" in str(exc):
+                raise requests.Timeout(str(exc)) from exc
             raise requests.ConnectionError(str(exc)) from exc
 
     def _dispose(self):

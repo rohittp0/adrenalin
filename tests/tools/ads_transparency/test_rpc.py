@@ -203,3 +203,28 @@ def test_preview_ids_reads_account_and_ad_group():
            "&obfuscatedCustomerId=6119286040&creativeId=1&adGroupId=196658869119&overlay=x")
     assert preview_ids(url) == ("6119286040", "196658869119")
     assert preview_ids("https://tpc.googlesyndication.com/simgad/123") == ("", "")
+
+
+@pytest.mark.parametrize('failures', [1, 3])
+def test_rpc_timeout_retries_same_cursor_bounded(failures):
+    class Session:
+        def __init__(self):
+            self.calls = []
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if len(self.calls) <= failures:
+                raise requests.Timeout('signal timed out')
+            r = requests.Response()
+            r.status_code = 200
+            r._content = b'{"1": []}'
+            return r
+    session = Session()
+    client = TransparencyClient(session)
+    query = Query('AR123', None, None, None)
+    if failures == 3:
+        with pytest.raises(requests.Timeout):
+            client.search(query, 'saved-cursor')
+    else:
+        assert client.search(query, 'saved-cursor').creatives == []
+    assert len(session.calls) == min(failures + 1, 3)
+    assert all(call == session.calls[0] for call in session.calls)
