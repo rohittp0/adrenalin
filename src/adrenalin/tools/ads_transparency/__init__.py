@@ -40,12 +40,12 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--vision-limit", type=int, default=200, help="max Codex calls per run (default 200)")
     p.add_argument("--all", action="store_true", dest="read_all",
                    help="read every Creative's copy, even when the Inventory is large enough to sample")
+    p.add_argument("--sampling", choices=("stratified", "novelty"), default="stratified",
+                   help="representative stratified sample (default), or separate novelty discovery")
     p.add_argument("--coverage", type=float, default=0.95,
-                   help="sampled runs: read until this share of Messages is found, 0 < x < 1 (default 0.95)")
+                   help="novelty mode only: legacy repetition-score stopping threshold, not population Coverage")
     p.add_argument("--max-ads", type=int, metavar="N",
-                   help="read copy for about N Creatives, even for a small Inventory, plus up to 3 per launch-week x "
-                        "running/stopped x Ads account group (no effect without Google's count estimate; a rerun "
-                        "keeps the first run's head start)")
+                   help="representative sample size (default 2000), minimum 3 per group may increase it; novelty mode: read cap")
     p.add_argument("--solve-captcha", action="store_true", help="show Chrome only when you need to solve a Google CAPTCHA")
     p.add_argument("--wait-on-block", action="store_true", help="wait out Google blocks instead of exiting")
     p.add_argument("--stage", choices=("list", "fetch", "extract", "export"), help="run one stage only")
@@ -89,7 +89,7 @@ def run(args: argparse.Namespace) -> int:
         vision_limit=args.vision_limit, wait_on_block=args.wait_on_block, stage=args.stage,
         solve_captcha=args.solve_captcha,
         out=args.out, proxies=tuple(args.proxies), progress=args.progress,
-        read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
+        sampling_mode=args.sampling, read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
     )
     def log(message: str) -> None:
         if not api.is_outcome_line(message):  # printed below, once, with what to do next

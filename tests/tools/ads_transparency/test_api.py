@@ -183,6 +183,7 @@ def codex(limit=200, run=None):
 
 
 def run_scrape(tmp_path, fake, session=None, codex_runner=None, **opts):
+    opts.setdefault("sampling_mode", "novelty")  # Existing tests exercise the legacy discovery mode.
     return scrape(ScrapeOptions(AR, out=tmp_path, **opts), session=session or make_session(tmp_path, fake),
                   ocr=fake_ocr, codex=codex_runner or codex(), log=lambda m: None, poll=POLL)
 
@@ -310,7 +311,7 @@ def test_unresolvable_ocr_domain_sends_row_to_codex(tmp_path):
     fake = FakeGoogle()
     fake.missing_hosts = {"lascade.com"}
     logs = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
                  codex=codex(), log=logs.append, poll=POLL)
     texts = [r for r in read_rows(res) if r["image_file"] and r["format"] == "text"]
     assert texts and {r["extraction_method"] for r in texts} == {"codex"}
@@ -407,7 +408,7 @@ def test_cursor_page_with_no_creatives_warns(tmp_path):
     p1, _ = two_pages()
     fake = FakeGoogle(search=lambda req: {"1": []} if req.get("4") == "CUR1" else p1)
     logs = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
                  codex=codex(), log=logs.append, poll=POLL)
     assert res.rows == 20 and res.failed == {}
     assert any("page:CUR1" in m and "no creatives" in m for m in logs)
@@ -474,7 +475,7 @@ def test_title_retry_stops_at_first_failure(tmp_path):
 def test_codex_limit_warns_once_per_run(tmp_path):
     fake = FakeGoogle()
     logs = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path, vision=True), session=make_session(tmp_path, fake),
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, vision=True), session=make_session(tmp_path, fake),
                  ocr=fake_ocr, codex=codex(limit=1), log=logs.append, poll=POLL)
     assert res.vision_skipped == SIMGAD_CREATIVES - 1
     limit_lines = [m for m in logs if "vision limit" in m]
@@ -495,7 +496,7 @@ def test_content_js_without_copy_is_no_copy(tmp_path):
     fake.content_video = (b"var a = {'adData': [{'squareImage': "
                           b"'https://tpc.googlesyndication.com/simgad/12147114744176439645'}]};")
     logs = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
                  codex=codex(), log=logs.append, poll=POLL)
     videos = [r for r in read_rows(res) if r["format"] == "video"]
     assert videos and all(r["image_urls"].endswith("/12147114744176439645") for r in videos)
@@ -570,7 +571,7 @@ def test_block_mid_list_marks_incomplete(tmp_path):
     sorry = response(302, b"", {"Location": "https://www.google.com/sorry/index?continue=x"})
     fake = FakeGoogle(search=lambda req: sorry if req.get("4") == "CUR1" else p1)
     lines = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
                  codex=codex(), log=lines.append, poll=POLL)
     assert res.listing_complete is False and res.listed == 20
     summary = json.loads(res.summary_path.read_text(encoding="utf-8"))
@@ -717,7 +718,7 @@ def test_no_ocr_engine_and_no_codex_fails_image_items(tmp_path, codex_run):
             raise FileNotFoundError("codex")
         return subprocess.CompletedProcess(argv, 1, "", "codex down")
 
-    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=no_ocr,
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, fake), ocr=no_ocr,
                  codex=codex(run=run), log=lambda m: None, poll=POLL)
     assert res.failed == {"extract": SIMGAD_CREATIVES} and res.rows == 40
     rows = read_rows(res)
@@ -793,7 +794,7 @@ def test_unparsed_content_js_is_kept_for_inspection(tmp_path):
     fake = FakeGoogle()
     fake.content_override = b"(function(){var nothing=1;})();"
     warnings = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
                  codex=codex(), log=warnings.append, poll=POLL)
     kept = list((res.csv_path.parent / "content").glob("*.js"))
     unparsed = [w for w in warnings if "not parsed" in w]
@@ -809,7 +810,7 @@ def test_progress_bars_show_creatives_and_stages_and_carry_the_log(tmp_path, cap
     fake = FakeGoogle()
     fake.oembed_status = 401  # makes the run log a warning while the bars show
     messages = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path, progress=True), session=make_session(tmp_path, fake),
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, progress=True), session=make_session(tmp_path, fake),
                  ocr=fake_ocr, codex=codex(), log=messages.append, poll=POLL)
     err = capsys.readouterr().err
     n = len(SEARCH["1"])
@@ -1013,7 +1014,7 @@ def test_infer_accounts_only_when_website_maps_to_one_account():
 
 def test_scrape_rows_have_status_and_account_columns(tmp_path):
     res = run_scrape(tmp_path, FakeGoogle())
-    assert CSV_FIELDS[-5:] == ("copy_status", "sample_weight", "ads_account_id", "ads_account_source", "ad_group_id")
+    assert CSV_FIELDS[-6:] == ("copy_status", "sample_weight", "sample_role", "ads_account_id", "ads_account_source", "ad_group_id")
     with res.csv_path.open(encoding="utf-8") as f:
         assert tuple(next(csv.reader(f)))[-5:] == CSV_FIELDS[-5:]
     rows = read_rows(res)
@@ -1116,7 +1117,7 @@ def test_large_inventory_samples_and_stops_at_coverage(tmp_path, small_limits):
 
 def test_max_ads_caps_reads(tmp_path, small_limits):
     fake = FakeGoogle()
-    res = scrape(ScrapeOptions(AR, out=tmp_path, max_ads=32), session=make_session(tmp_path, fake),
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, max_ads=32), session=make_session(tmp_path, fake),
                  ocr=ocr_with_messages(), codex=codex(), log=lambda m: None, poll=POLL)
     rows = read_rows(res)
     # every bucket's minimum (29 Creatives here) comes first, then reads stop at the cap
@@ -1148,7 +1149,7 @@ def test_rerun_with_higher_coverage_continues(tmp_path, small_limits):
     ocr = ocr_with_messages(pool=20)
 
     def run(target):
-        return scrape(ScrapeOptions(AR, out=tmp_path, coverage=target), session=make_session(tmp_path, fake),
+        return scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, coverage=target), session=make_session(tmp_path, fake),
                       ocr=ocr, codex=codex(), log=lambda m: None, poll=POLL)
 
     first = read_rows(res1 := run(0.3))
@@ -1257,7 +1258,7 @@ def test_no_readable_messages_stops_after_the_minimums(tmp_path, small_limits):
     page = single_page()
     page["1"] = [c for c in page["1"] if "simgad" in json.dumps(c["3"])]  # image Previews only
     logs = []
-    res = scrape(ScrapeOptions(AR, out=tmp_path), session=make_session(tmp_path, FakeGoogle(search=lambda r: page)),
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, FakeGoogle(search=lambda r: page)),
                  ocr=no_copy_ocr, codex=empty_codex(), log=logs.append, poll=POLL)
     rows = read_rows(res)
     assert len(rows) == SIMGAD_CREATIVES and not any(r["headline"] for r in rows)
@@ -1304,7 +1305,7 @@ def test_round_stops_when_last_novelty_round_found_no_message(tmp_path):
 def test_max_ads_caps_the_head_start(tmp_path, monkeypatch):
     monkeypatch.setattr(sampling, "FULL_READ_LIMIT", 10)
     monkeypatch.setattr(sampling, "HEAD_START", 600)  # alone, it would admit all 40 while listing
-    res = scrape(ScrapeOptions(AR, out=tmp_path, max_ads=32), session=make_session(tmp_path, FakeGoogle()),
+    res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, max_ads=32), session=make_session(tmp_path, FakeGoogle()),
                  ocr=ocr_with_messages(), codex=codex(), log=lambda m: None, poll=POLL)
     meta, _ = stored_sampling(tmp_path)
     assert meta["p"] == 32 / 600
@@ -1350,7 +1351,7 @@ def test_round_left_pending_waits_for_the_relist(tmp_path, small_limits):
     ocr = ocr_with_messages(pool=20)
 
     def run(target):
-        return scrape(ScrapeOptions(AR, out=tmp_path, coverage=target), session=make_session(tmp_path, fake),
+        return scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, coverage=target), session=make_session(tmp_path, fake),
                       ocr=ocr, codex=codex(), log=lambda m: None, poll=POLL)
 
     first = len(processed(read_rows(run(0.3))))
@@ -1725,7 +1726,7 @@ def test_stage_export_keeps_the_sampling_options_and_stage_times(tmp_path, small
 @pytest.mark.parametrize("opts", [{"coverage": 0}, {"coverage": 1}, {"coverage": 1.5}, {"max_ads": 0}])
 def test_scrape_options_reject_bad_coverage_and_max_ads(opts):
     with pytest.raises(ValueError):
-        ScrapeOptions(AR, **opts)
+        ScrapeOptions(AR, sampling_mode="novelty", **opts)
 
 
 class BrokenOnlyCodexRun(FakeCodexRun):
@@ -1766,7 +1767,7 @@ def test_broken_preview_blocked_detail_does_not_use_up_the_checks(tmp_path):
 
 def test_max_ads_below_the_group_minimums_warns(tmp_path, small_limits):
     logs = []
-    scrape(ScrapeOptions(AR, out=tmp_path, max_ads=5), session=make_session(tmp_path, FakeGoogle()),
+    scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, max_ads=5), session=make_session(tmp_path, FakeGoogle()),
            ocr=fake_ocr, codex=codex(), log=logs.append, poll=POLL)
     assert any(m.startswith("warning: --max-ads 5 is below the group minimums") for m in logs)
 
@@ -1775,7 +1776,7 @@ def test_rerun_with_a_different_max_ads_notes_the_kept_head_start(tmp_path, smal
     fake = FakeGoogle()
     run_scrape(tmp_path, fake)
     logs = []
-    scrape(ScrapeOptions(AR, out=tmp_path, max_ads=3), session=make_session(tmp_path, fake), ocr=fake_ocr,
+    scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, max_ads=3), session=make_session(tmp_path, fake), ocr=fake_ocr,
            codex=codex(), log=logs.append, poll=POLL)
     assert stored_sampling(tmp_path)[0]["p"] == 5 / 600
     assert any(m.startswith("note: the head start was set by this run folder's first run") for m in logs)
@@ -1783,7 +1784,7 @@ def test_rerun_with_a_different_max_ads_notes_the_kept_head_start(tmp_path, smal
     q.set_meta("count_estimate", "700")  # Google's estimate drifted; `p` was sized from 600
     q.close()
     logs.clear()
-    scrape(ScrapeOptions(AR, out=tmp_path, max_ads=5), session=make_session(tmp_path, fake), ocr=fake_ocr,
+    scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path, max_ads=5), session=make_session(tmp_path, fake), ocr=fake_ocr,
            codex=codex(), log=logs.append, poll=POLL)
     assert not any(m.startswith("note:") for m in logs)  # the same cap as the first run: nothing to note
 

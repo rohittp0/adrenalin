@@ -31,8 +31,10 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `--days N` / `--start` / `--end` | Shown period (ads shown at any point in it). `--days N` becomes concrete dates when you run it, so rerunning after midnight starts a new run folder (downloaded images and the extraction cache are reused) |
 | `--variations` | One row per variation, not just the first |
 | `--vision`, `--vision-limit N` | Send every image to Codex; cap Codex calls (default 200) |
-| `--coverage X` | Large Inventories (Google estimates over 2,000 Creatives) read copy for a Copy sample only: every bucket (launch week (month before the Shown period) × running/stopped, split by Ads account where Google exposes it) gets at least 3 reads, then sampling continues where new Messages turn up until Coverage reaches X (default 0.95, 0 < X < 1), or stops when no readable Messages turn up. Unread Creatives get `copy_status` `not_sampled`; processed rows (copy reading finished, whether or not copy was found) carry a `sample_weight` (their bucket's Inventory / Creatives processed). With `--variations` the weight is per Creative: all its rows carry it, and Variation 1 rows' weights sum to the Inventory. Rerun with a higher X to read more |
-| `--max-ads N` | Read copy for about N Creatives, even when the Inventory is small enough to read in full (this also shrinks the random head start). Every launch week × running/stopped × Ads account group still gets up to 3 reads, which can exceed N by a lot: Rio's first 3,200 listed Creatives fall into 110 groups, so at least 258 reads (the run warns when this happens). Recommended for very large Advertisers, where reading to the Coverage target can take many hours. If Google gives no count estimate, every listed Creative is read anyway. `--all` wins over it. The head start is fixed by a run folder's first run: a rerun with another N or `--coverage` changes only the reads after it |
+| `--sampling stratified` | Default: representative random Copy sample across Ads account × launch period × running/stopped. Default target 2,000 Creatives, minimum 3 per group; waits for complete Inventory before selection |
+| `--sampling novelty` | Explicit exploratory discovery using the legacy novelty allocator. Its repetition score is not population Coverage |
+| `--coverage X` | Novelty mode only: legacy repetition-score threshold; ignored for stratified selection |
+| `--max-ads N` | Stratified target size (default 2,000); minimum representation can exceed it. Novelty mode: approximate copy-read cap |
 | `--all` | Read every Creative's copy, however large the Inventory |
 | `--wait-on-block` | Wait out a Google block instead of exiting |
 | `--stage list\|fetch\|extract\|export` | Run one stage only |
@@ -79,3 +81,28 @@ per-request backoff without slowing the entire host; blocks still trigger cooldo
 Progress separates `inventory` (Creatives listed) from `creatives queued` (copy
 work currently admitted). The queued-copy ETA covers only that queue; later
 sampling rounds may add work. Sampling targets and limits are unchanged.
+
+### Representative sample and existing runs
+
+The default `stratified` mode allocates three slots per group (or its full size
+if smaller), then allocates the remaining slots proportionally to group Inventory.
+Unknown Ads accounts stay in an explicit unknown-account group; accounts are
+not inferred from copy after selection. A stored random seed ranks every
+Creative within its group. Repeating the same run and target keeps selection
+stable. Failed reads remain selected and are retried, never replaced with easier
+reads. `--all` still reads every Creative.
+
+CSV `sample_role` separates `representative`, `exploratory`, `not_sampled`, and
+`census`. On migration, existing copy is retained; only missing selected reads
+are added. Old novelty-selected reads outside the representative design get no
+representative weight. The default target is not a 95% confidence or messaging
+completeness guarantee. There is no Coverage stopping threshold in this mode.
+
+For representative rows, `sample_weight` is group Inventory / selected Creatives,
+including selected rows with missing copy. This is a design weight, not an
+adjustment for unreadable copy. Keep missing-copy outcomes explicit. Each
+Variation has its Creative's weight; use Variation 1 when counting Creatives.
+Legacy novelty weights are descriptive expansion ratios only, not probability
+sample weights. Summary JSON records the selected IDs, quotas, seed, pending
+reads, and retained exploratory reads. Stop/restart the current process with the
+same command to adopt the new default and resume the existing run.

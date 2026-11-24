@@ -58,11 +58,11 @@ A Creative's headline and description pair, normalised for case, spacing and pun
 _Avoid_: Copy (when you mean the unit of novelty), full text
 
 **Copy sample**:
-The Creatives in a run whose copy has been read. Chosen to find as many new Messages as possible while covering every launch date and both still-running and stopped Creatives.
+The Creatives selected for copy reading. By default a stratified random sample covers observable Ads accounts, launch periods, and running/stopped groups. Existing reads outside the representative design remain exploratory. Explicit novelty mode hunts for new Messages separately.
 _Avoid_: Sample (unqualified)
 
 **Coverage**:
-The estimated share of the Advertiser's Messages the Copy sample has already found (Good–Turing: one minus the share of sampled Creatives whose Message was seen only once). Low-confidence reads don't count, because OCR misreads would look like new Messages.
+A legacy field containing one minus the singleton fraction of countable Messages in novelty mode. Because those reads are adaptively selected, it is a repetition diagnostic, not a validated population Coverage estimate or percentage of distinct Messages discovered. Representative sampling leaves Coverage unset and stops after its saved design is processed.
 
 **Copy status**:
 What happened to a Creative's copy in a run: `read`; `not_sampled` (in the Inventory but outside the Copy sample); `pending` (chosen for the sample but not read yet); `no_copy` (the Preview carries no ad text, as with most video and app-install ads; expected, not an error); `preview_broken` (every Variation is a Broken Preview); `unreadable` (the Preview's format isn't understood, OCR and Codex both failed, or reading failed on every retry). A read that failed but will be retried on the next run stays `pending`.

@@ -73,7 +73,7 @@ CSV_FIELDS: tuple[str, ...] = (
     "days_shown", "website", "landing_url", "display_url", "brand", "headline", "description", "cta",
     "sitelinks", "full_text", "video_id", "video_url", "video_title", "preview_url", "image_file",
     "image_width", "image_height", "logo_url", "image_urls", "extraction_method", "extraction_model",
-    "extraction_confidence", "copy_status", "sample_weight", "ads_account_id", "ads_account_source", "ad_group_id",
+    "extraction_confidence", "copy_status", "sample_weight", "sample_role", "ads_account_id", "ads_account_source", "ad_group_id",
 )
 
 
@@ -93,15 +93,16 @@ class ScrapeOptions:
     out: Path = Path("out")
     proxies: tuple[str, ...] = ()
     progress: bool = False  # tqdm progress bars on stderr
-    # Copy sample (ADR 0003): a large Inventory is read until Coverage reaches `coverage`; `read_all` reads every
-    # Creative; `max_ads` caps the Creatives read at about N, head start included, and samples even a small Inventory
-    # (plus up to 3 per launch-week x running/stopped x Ads account group, which can exceed N by far; without
-    # Google's estimate every Creative is admitted). `p` is kept from a run folder's first run.
+    # Representative sampling uses Inventory-only strata and a saved random seed.
+    # Novelty mode retains its legacy score/cap; --all bypasses sampling.
+    sampling_mode: Literal["stratified", "novelty"] = "stratified"
     read_all: bool = False
     coverage: float = 0.95
     max_ads: int | None = None
 
     def __post_init__(self) -> None:
+        if self.sampling_mode not in {"stratified", "novelty"}:
+            raise ValueError("sampling_mode must be stratified or novelty")
         if not 0 < self.coverage < 1:
             raise ValueError(f"coverage must be between 0 and 1 (exclusive), not {self.coverage}")
         if self.max_ads is not None and self.max_ads < 1:
@@ -192,15 +193,24 @@ def _prepare_sampling(q: WorkQueue, options: ScrapeOptions, log: Callable[[str],
     if options.stage == "export":
         return
     meta = sampling_meta(q)
-    meta.update(target=options.coverage, max_ads=options.max_ads)
+    if options.sampling_mode == "stratified" and not options.read_all:
+        meta.update(mode="stratified", target=None, max_ads=options.max_ads, p=0.0)
+        log(f"sample: representative target {options.max_ads or sampling.DEFAULT_SAMPLE_SIZE:,}, "
+            "with at least 3 per group; prior reads outside the design remain exploratory.")
+    else:
+        if meta.get("mode") == "stratified":
+            meta["p"] = 1.0 if options.read_all or not q.count(HELD, "pending") else 0.0
+            meta.pop("cohort", None)
+        meta.pop("mode", None)
+        meta.update(target=options.coverage, max_ads=options.max_ads)
     q.set_meta("sampling", json.dumps(meta))
     estimate = meta.get("estimate", int(q.get_meta("count_estimate") or 0) or None)
-    if "p" in meta and options.max_ads is not None and not options.read_all and estimate:
+    if options.sampling_mode == "novelty" and "p" in meta and options.max_ads is not None and not options.read_all and estimate:
         would = sampling.admit_probability(estimate, max_ads=options.max_ads)
         if not math.isclose(would, meta["p"]):
             log(f"note: the head start was set by this run folder's first run (p={meta['p']:.4g}); --max-ads "
                 f"{options.max_ads:,} only caps the reads that follow it")
-    if options.stage is None and q.get_meta("list_done") and q.count(HELD, "pending"):
+    if options.stage is None and q.get_meta("list_done") and (q.count(HELD, "pending") or options.sampling_mode == "stratified"):
         seed_round(q)
 
 
@@ -387,6 +397,9 @@ def _rows(q: WorkQueue, options: ScrapeOptions, tally: SampleTally, sampled: boo
             "extraction_confidence": "" if conf is None else round(float(conf), 3),
             "copy_status": status,
             "sample_weight": weight,
+            "sample_role": ("representative" if cr in tally.representative else "exploratory"
+                            if cr in tally.processed else "not_sampled") if tally.representative is not None
+                           else "exploratory" if sampled else "census",
             "ads_account_id": account,
             "ads_account_source": "",
             "ad_group_id": ad_group,
@@ -465,7 +478,14 @@ def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult, tally: SampleTa
         "listed": len(tally.group_of),
         "google_estimate": estimate,
         "copy_status": dict(Counter(r["copy_status"] for r in rows)),
-        "coverage": None if groups is None else sampling.coverage([m for g in groups.values() for m in g.messages]),
+        "representative_sample": None if tally.representative is None else {
+            "selected": len(tally.representative),
+            "processed": len(tally.representative & tally.processed),
+            "pending": len(tally.representative - tally.processed),
+            "exploratory_processed": len(tally.processed - tally.representative),
+            "weight_basis": "stratum Inventory / selected Creatives; not adjusted for unreadable copy",
+        },
+        "coverage": None if groups is None or tally.representative is not None else sampling.coverage([m for g in groups.values() for m in g.messages]),
         "sampling": None if groups is None else {
             **sampling_meta(q),
             "inventory": sum(g.inventory for g in groups.values()),
@@ -475,7 +495,7 @@ def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult, tally: SampleTa
         # finished (read, no copy, broken or unreadable)
         "groups": [] if groups is None else [
             {"bucket": k, "inventory": g.inventory, "processed": g.processed,
-             "messages": len({m for m in g.messages if m}), "coverage": sampling.coverage(g.messages)}
+             "messages": len({m for m in g.messages if m}), "coverage": None if tally.representative is not None else sampling.coverage(g.messages)}
             for k, g in sorted(groups.items())],
         "ads_accounts": [{"ads_account_id": a["ads_account_id"], "source": a["source"],
                           "websites": dict(a["websites"]), "formats": dict(a["formats"])} for a in ranked],
@@ -520,7 +540,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
                            codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=emit,
                            oembed=oembed, host_exists=HostChecker(oembed, cache, log=emit),
-                           read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads)
+                           read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads, sampling_mode=options.sampling_mode)
         ads = AdsStages(ctx)
         if options.stage in (None, "extract"):
             ads.retry_titles(q)  # transient oEmbed failures of earlier runs
@@ -545,6 +565,10 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         summary = build_summary(rows, q, rr, tally, sampled)
         _write_json_atomic(summary_path, summary)
         failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
+        if summary["representative_sample"] is not None:
+            representative = summary["representative_sample"]
+            emit(f"Representative sample: {representative['processed']:,}/{representative['selected']:,} processed; "
+                 f"{representative['exploratory_processed']:,} additional exploratory reads retained")
         result = ScrapeResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, codex.skipped,
                               list(rr.errors), summary["listing_complete"], summary["listed"],
                               summary["google_estimate"], summary["coverage"], summary_path)
@@ -572,7 +596,7 @@ def _log_summary(r: ScrapeResult, codex: CodexRunner, log: Callable[[str], None]
     if r.blocked_until is not None:
         log(blocked_message(r.blocked_until))
     if r.coverage is not None:
-        log(f"Coverage {r.coverage:.3f} of the Copy sample's Messages")
+        log(f"Novelty repetition score {r.coverage:.3f} (not population Coverage)")
     if not r.listing_complete:
         log(incomplete_message(r))
 

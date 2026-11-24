@@ -152,6 +152,7 @@ class StageContext:
     read_all: bool = False
     coverage: float = 0.95
     max_ads: int | None = None
+    sampling_mode: str = "novelty"
 
 
 class AdsStages:
@@ -245,13 +246,17 @@ class AdsStages:
             self._put_page(q, nxt)
         else:
             q.set_meta("list_done", ctx.today().isoformat())
-            if q.count(HELD, "pending"):
+            if q.count(HELD, "pending") or (ctx.sampling_mode == "stratified" and not ctx.read_all):
                 seed_round(q)  # before this page completes, so the sample stage can't finish first
         return {"creatives": len(page.creatives), "next_cursor": nxt}
 
     def _admit_probability(self, q: WorkQueue, estimate: int | None, cursor: str | None) -> float:
         """The run's admission probability: set from the first listed page's estimate, never recomputed."""
         meta = sampling_meta(q)
+        if self.ctx.sampling_mode == "stratified" and not self.ctx.read_all:
+            meta["p"] = 0.0
+            q.set_meta("sampling", json.dumps(meta))
+            return 0.0
         if "p" not in meta:
             # Cursor pages may carry no estimate: fall back to one stored from an earlier page.
             estimate = estimate or int(q.get_meta("count_estimate") or 0) or None
@@ -272,7 +277,7 @@ class AdsStages:
     def sample(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
         return sample_queue.run_round(q, item, sample_queue.RoundSettings(
-            ctx.variations, ctx.query, ctx.today(), ctx.read_all, ctx.coverage, ctx.max_ads), ctx.log)
+            ctx.variations, ctx.query, ctx.today(), ctx.read_all, ctx.coverage, ctx.max_ads, ctx.sampling_mode), ctx.log)
 
     # -- detail -------------------------------------------------------------
 

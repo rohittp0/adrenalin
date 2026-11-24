@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -111,12 +112,16 @@ class SampleTally:
     groups: dict[str, SampleGroup] = field(default_factory=dict)
     group_of: dict[str, str] = field(default_factory=dict)  # Creative -> group
     processed: set[str] = field(default_factory=set)  # Creatives whose Variation 1 copy reading finished
+    representative: set[str] | None = None
+    design_weights: dict[str, float] = field(default_factory=dict)
     message: dict[str, str] = field(default_factory=dict)  # processed Creative -> countable Message ("" if none)
 
     def weight(self, creative_id: str, sampled: bool) -> float | str:
         """A Creative's sample weight, for all its rows: its group's Inventory / Creatives read (1.0 on a full
         read), or "" while its Variation 1 is unread. Per group, the weights of Variation 1 rows sum to the
         Inventory."""
+        if self.representative is not None:
+            return self.design_weights.get(self.group_of[creative_id], "") if creative_id in self.representative else ""
         if creative_id not in self.processed:
             return ""
         if not sampled:
@@ -156,6 +161,11 @@ def sample_groups(q: WorkQueue, variations: bool, query: Query, today: date) -> 
         group = tally.group_of.setdefault(cr, sample_group(it.payload, query, today))
         g = tally.groups.setdefault(group, SampleGroup())
         g.held.append(it.key)
+    meta = sampling_meta(q)
+    if meta.get("mode") == "stratified":
+        cohort = meta.get("cohort", {})
+        tally.representative = set(cohort.get("selected", []))
+        tally.design_weights = cohort.get("weights", {})
     return tally
 
 
@@ -184,6 +194,7 @@ class RoundSettings:
     read_all: bool
     coverage: float
     max_ads: int | None
+    sampling_mode: str = "novelty"
 
 
 def round_lead(q: WorkQueue) -> int:
@@ -225,6 +236,35 @@ def _unjudged(payload: dict) -> list[list[str]]:
     return [last] if payload.get("novelty") and last else []
 
 
+def stratified_round(q: WorkQueue, s: RoundSettings, log: Callable[[str], None]) -> dict:
+    meta = sampling_meta(q)
+    seed = meta.setdefault("seed", secrets.token_hex(16))
+    grouped: dict[str, dict[str, str]] = {}
+    for stage in (HELD, listing_stage(s.variations)):
+        for it in q.items(stage):
+            grouped.setdefault(sample_group(it.payload, s.query, s.today), {})[it.payload["creative_id"]] = it.key
+    sizes = {k: len(v) for k, v in grouped.items()}
+    quotas = sampling.stratified_allocation(sizes, s.max_ads or sampling.DEFAULT_SAMPLE_SIZE)
+    selected = []
+    chosen = []
+    target = listing_stage(s.variations)
+    for group, members in sorted(grouped.items()):
+        ranked = sorted(members, key=lambda cr: hashlib.sha256(f"{seed}:{cr}".encode()).hexdigest())
+        for cr in ranked[:quotas[group]]:
+            selected.append(cr)
+            key = members[cr]
+            if not q.has(target, key):
+                chosen.append(key)
+    meta["cohort"] = {"selected": selected, "quotas": quotas,
+                      "weights": {k: sizes[k] / quotas[k] for k in quotas if quotas[k]},
+                      "inventory": sum(sizes.values())}
+    q.set_meta("sampling", json.dumps(meta))  # persist design before admitting work
+    q.move(HELD, target, chosen)
+    log(f"sample: stratified design selects {len(selected):,} of {sum(sizes.values()):,} Creatives "
+        f"across {len(sizes):,} groups; {len(chosen):,} additional reads. No Coverage stopping target.")
+    return {"admitted": len(chosen), "selected": len(selected), "mode": "stratified"}
+
+
 def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], None]) -> dict:
     """One sampling round (the `sample` stage's worker). It runs once the listing is done and the admitted Creatives
     have been read (all of them, or all but the last novelty round: see `round_lead`). Once every group has its
@@ -234,6 +274,8 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
     if not q.get_meta("list_done"):
         # The listing failed this run, so the Inventory is incomplete: list_page queues a round when it finishes.
         return {"deferred": True}
+    if s.sampling_mode == "stratified" and not s.read_all:
+        return stratified_round(q, s, log)
     tally = sample_groups(q, s.variations, s.query, s.today)
     groups = tally.groups
     read = sum(g.admitted for g in groups.values())

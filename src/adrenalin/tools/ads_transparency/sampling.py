@@ -16,6 +16,7 @@ from datetime import date, timedelta
 
 FULL_READ_LIMIT = 2000
 HEAD_START = 2000
+DEFAULT_SAMPLE_SIZE = 2000
 MIN_PER_BUCKET = 3
 RUNNING_SLACK_DAYS = 2
 CHUNK = 25
@@ -152,3 +153,28 @@ def sample_weight(inventory: int, read: int) -> float:
     if read <= 0:
         raise ValueError("read must be positive")
     return inventory / read
+
+
+def stratified_allocation(inventory: Mapping[str, int], target: int) -> dict[str, int]:
+    """Minimum representation, then proportional allocation of remaining slots.
+
+    Minimums may exceed target. Allocation is deterministic and never exceeds a
+    stratum's Inventory. It depends on Inventory only, never observed copy.
+    """
+    quotas = {k: min(MIN_PER_BUCKET, n) for k, n in sorted(inventory.items())}
+    remaining = min(sum(inventory.values()), max(target, sum(quotas.values()))) - sum(quotas.values())
+    while remaining:
+        active = {k: n for k, n in inventory.items() if quotas[k] < n}
+        total = sum(active.values())
+        shares = {k: remaining * n / total for k, n in active.items()}
+        added = 0
+        for k, share in shares.items():
+            take = min(inventory[k] - quotas[k], int(share))
+            quotas[k] += take
+            added += take
+        remaining -= added
+        for k in sorted(active, key=lambda k: (-(shares[k] % 1), k)):
+            if remaining and quotas[k] < inventory[k]:
+                quotas[k] += 1
+                remaining -= 1
+    return quotas

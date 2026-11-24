@@ -29,3 +29,10 @@ not hold the adaptive-state lock: doing so delays completed requests while other
 workers wait for their next start. Response feedback takes only the short state
 lock, and changes to the pacing base are logged to distinguish backoff from slow
 network transfers.
+
+HTTP 429 retry backoff is a persisted per-host deadline (`rate:<host>` in the
+cooldown database), not a worker-local sleep. Other workers, derived sessions
+and subsequent runs honor it before sending requests. This soft retry delay is
+waited automatically; exhausted retries still use the ordinary hard-block policy.
+Already in-flight requests cannot be withdrawn, but queued requests recheck the
+deadline after pacing. Other hosts continue independently.

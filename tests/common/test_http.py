@@ -289,7 +289,8 @@ def test_429_exhaustion_logs_the_last_response(tmp_path):
     e = Env(tmp_path, [resp(429)] * 4, log=logs.append)
     with pytest.raises(Blocked):
         e.session.get("https://a.com/x")
-    assert len(logs) == 1 and "rate-limits after 3 backoffs" in logs[0] and "HTTP 429" in logs[0]
+    assert len(logs) == 4 and "rate-limits after 3 backoffs" in logs[-1] and "HTTP 429" in logs[-1]
+    assert all("pausing all requests" in message for message in logs[:3])
 
 
 def test_derived_session_keeps_the_log(tmp_path):
@@ -472,3 +473,26 @@ def test_isolated_disconnect_retry_does_not_change_shared_pace(tmp_path):
     assert len(calls) == 2
     assert e.session.interval("img.com") == 0.5
     assert 1 in e.sleeps  # per-request backoff remains
+
+
+def test_429_retry_delay_is_shared_and_survives_interrupted_worker(tmp_path):
+    e = Env(tmp_path, [resp(429)])
+    def interrupted_sleep(seconds):
+        raise RuntimeError('worker interrupted during backoff')
+    e.session._sleep = interrupted_sleep
+    with pytest.raises(RuntimeError, match='interrupted'):
+        e.session.get('https://a.com/x')
+    assert e.cooldown.remaining('rate:a.com', now=e.now) == 60
+    assert e.cooldown.remaining('a.com', now=e.now) == 0
+    # Another worker/session may request other hosts immediately, but must wait
+    # before issuing anything to the rate-limited host.
+    e.session._sleep = e.sleep
+    derived = e.session.derive()
+    try:
+        derived.get('https://b.com/x')
+        assert e.now == 0
+        derived.get('https://a.com/y')
+        assert e.now == 60
+        assert len(e.calls) == 3
+    finally:
+        derived.close()

@@ -267,6 +267,12 @@ class PacedSession:
             until = self._cooldown.until(host)
             remaining = until - self._clock()
             if remaining <= 0:
+                # Rate-limit retry delays apply to every worker/session, even
+                # when --wait-on-block is off. They are distinct from hard blocks.
+                retry_wait = self._cooldown.remaining(f"rate:{host}", now=self._clock())
+                if retry_wait > 0:
+                    self._sleep(retry_wait)
+                    continue
                 return
             if not self._wait_on_block:
                 raise Blocked(host, until, saved_cooldown=True)
@@ -327,6 +333,8 @@ class PacedSession:
                     self._warn(f"{host} still rate-limits after {attempt} backoffs ({describe_response(resp)})")
                     raise Blocked(host, self._block(host, retry_after))
                 backoff = max(min(60 * 2**attempt, 900), retry_after)
+                self._cooldown.block(f"rate:{host}", backoff, now=self._clock())
+                self._warn(f"{host}: HTTP 429; pausing all requests to this host for at least {backoff:.0f}s")
                 self._sleep(backoff)
                 attempt += 1
                 continue
