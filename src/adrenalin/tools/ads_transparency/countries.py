@@ -27,12 +27,20 @@ def country_targets(tally: SampleTally, admitted: Iterable[str], cap: int) -> li
     return sorted(set(admitted), key=_rank)[:cap]
 
 
-def queue_countries(q: WorkQueue, variations: bool, query: Query, today: date, max_ads: int | None) -> int:
-    """Queue a `countries` item for every target Creative not queued yet; returns how many were new."""
-    tally = sample_groups(q, variations, query, today)
+def current_targets(q: WorkQueue, tally: SampleTally, variations: bool, max_ads: int | None) -> list[str]:
+    """`country_targets` for the run as it stands: the Creatives `countries.csv` covers."""
     admitted = {it.payload["creative_id"] for it in q.items(listing_stage(variations))}
-    targets = country_targets(tally, admitted, max_ads or sampling.DEFAULT_SAMPLE_SIZE)
-    return sum(q.put(COUNTRIES, cr, {"creative_id": cr}) for cr in targets)
+    return country_targets(tally, admitted, max_ads or sampling.DEFAULT_SAMPLE_SIZE)
+
+
+def queue_countries(q: WorkQueue, variations: bool, query: Query, today: date, max_ads: int | None) -> int:
+    """Queue a `countries` item for every target Creative not queued yet; returns how many were new. Outside
+    stratified mode the targets wait for the listing to finish: the lowest hashes of a partial listing are not the
+    lowest of the full one, and fetching both would pass the `--max-ads` cap."""
+    tally = sample_groups(q, variations, query, today)
+    if tally.representative is None and not q.get_meta("list_done"):
+        return 0
+    return sum(q.put(COUNTRIES, cr, {"creative_id": cr}) for cr in current_targets(q, tally, variations, max_ads))
 
 
 COUNTRY_FIELDS: tuple[str, ...] = (
@@ -50,22 +58,34 @@ def _blank(v: int | None) -> int | str:
 
 
 def country_weights(items: list[Item], tally: SampleTally, sampled: bool) -> dict[str, float | str]:
-    """Each Creative's weight in `countries.csv`. Stratified: its Copy-sample weight. Otherwise (novelty, `--all`)
-    the countries are a subset of the processed Creatives, so their copy weights are scaled up to the total copy
-    weight of all processed Creatives. "" for a Creative without a copy weight."""
-    copy = {it.key: tally.weight(it.key, sampled) for it in items}
+    """Each Creative's weight in `countries.csv`. Stratified: its Copy-sample (design) weight. Otherwise (novelty,
+    `--all`) the fetched Creatives are post-stratified on the Copy sample's groups: group Inventory / Creatives
+    fetched in the group. Copy weights would over-correct here, since novelty rounds skew copy reads but not the
+    hash-chosen countries subset. "" for a Creative not fetched yet (novelty) or without a design weight."""
     if tally.representative is not None:
-        return copy
-    total = sum(w for cr in tally.processed if isinstance(w := tally.weight(cr, sampled), float))
-    fetched = sum(w for it in items if it.status == "done" and isinstance(w := copy[it.key], float))
-    scale = total / fetched if fetched else 1.0
-    return {cr: w * scale if isinstance(w, float) else "" for cr, w in copy.items()}
+        return {it.key: tally.weight(it.key, sampled) for it in items}
+    fetched: dict[str, int] = {}
+    for it in items:
+        if it.status == "done" and (g := tally.group_of.get(it.key)) is not None:
+            fetched[g] = fetched.get(g, 0) + 1
+    out: dict[str, float | str] = {}
+    for it in items:
+        g = tally.group_of.get(it.key)
+        out[it.key] = tally.groups[g].inventory / fetched[g] if it.status == "done" and g in fetched else ""
+    return out
 
 
-def country_rows(q: WorkQueue, tally: SampleTally, sampled: bool) -> list[dict]:
-    """`countries.csv` rows: one per Shown country (`shown`), or one with a blank country for a Creative fetched
-    with none reported (`none_reported`) or not fetched yet (`pending`, failures included)."""
-    items = q.items(COUNTRIES)
+def _target_items(q: WorkQueue, targets: Iterable[str]) -> list[Item]:
+    """The `countries` items of `targets`; a target not queued yet gets a stand-in pending item. Items queued by an
+    earlier run with other options (another `--max-ads`, mode or cohort) are left out."""
+    queued = {it.key: it for it in q.items(COUNTRIES)}
+    return [queued.get(cr) or Item(COUNTRIES, cr, {"creative_id": cr}, None, "pending", None) for cr in targets]
+
+
+def country_rows(q: WorkQueue, tally: SampleTally, sampled: bool, targets: Iterable[str]) -> list[dict]:
+    """`countries.csv` rows for `targets`: one per Shown country (`shown`), or one with a blank country for a
+    Creative fetched with none reported (`none_reported`) or not fetched yet (`pending`, failures included)."""
+    items = _target_items(q, targets)
     weights = country_weights(items, tally, sampled)
     rows = []
     for it in items:
@@ -85,8 +105,11 @@ def country_rows(q: WorkQueue, tally: SampleTally, sampled: bool) -> list[dict]:
     return rows
 
 
-def countries_pending(q: WorkQueue) -> int:
-    return sum(1 for it in q.items(COUNTRIES) if it.status != "done")
+def countries_pending(q: WorkQueue, targets: Iterable[str]) -> int:
+    """Targets a rerun can still fetch: not done, and not failed on every attempt (those are reported as failed
+    items, and a rerun would not retry them)."""
+    exhausted = q.exhausted(COUNTRIES)
+    return sum(1 for it in _target_items(q, targets) if it.status != "done" and it.key not in exhausted)
 
 
 def countries_message(n: int) -> str:

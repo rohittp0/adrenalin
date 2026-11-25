@@ -22,7 +22,8 @@ from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
 from adrenalin.common.progress import Bar, QueueProgress, stage_bar
 from adrenalin.tools.ads_transparency import sampling
-from adrenalin.tools.ads_transparency.countries import COUNTRY_FIELDS, countries_message, countries_pending, country_rows
+from adrenalin.tools.ads_transparency.countries import (
+    COUNTRY_FIELDS, countries_message, countries_pending, country_rows, current_targets)
 from adrenalin.tools.ads_transparency.copy import (  # noqa: F401
     COPY_STATUSES,
     copy_status,
@@ -576,8 +577,9 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         _write_json_atomic(summary_path, summary)
         pending_countries = 0
         if options.countries:
-            write_csv_atomic(run / "countries.csv", COUNTRY_FIELDS, country_rows(q, tally, sampled))
-            pending_countries = countries_pending(q)
+            targets = current_targets(q, tally, options.variations, options.max_ads)
+            write_csv_atomic(run / "countries.csv", COUNTRY_FIELDS, country_rows(q, tally, sampled, targets))
+            pending_countries = countries_pending(q, targets)
         failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
         if summary["representative_sample"] is not None:
             representative = summary["representative_sample"]
@@ -612,10 +614,10 @@ def _log_summary(r: ScrapeResult, codex: CodexRunner, log: Callable[[str], None]
         log(blocked_message(r.blocked_until))
     if r.coverage is not None:
         log(f"Novelty repetition score {r.coverage:.3f} (not population Coverage)")
-    if not r.listing_complete:
-        log(incomplete_message(r))
     if r.countries_pending:
         log(countries_message(r.countries_pending))
+    if not r.listing_complete:
+        log(incomplete_message(r))  # last: the outcome that matters most
 
 
 def blocked_message(until: float) -> str:
