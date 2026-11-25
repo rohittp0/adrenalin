@@ -163,10 +163,12 @@ class PacedSession:
         adaptive: Mapping[str, AdaptivePace] = {},
         playwright_hosts: Sequence[str] = (),
         solve_captcha: bool = False,
+        cookie_dir: Path | None = None,
     ):
+        self._cookie_dir = cookie_dir
         self._solve_captcha = solve_captcha
         self._playwright_hosts = frozenset(playwright_hosts)
-        self._playwright_session = PlaywrightTransport(solve_captcha=solve_captcha, log=log) if playwright_hosts else None
+        self._playwright_session = PlaywrightTransport(solve_captcha=solve_captcha, log=log, cookie_dir=cookie_dir) if playwright_hosts else None
         self._adaptive = dict(adaptive)
         self._adaptive_state: dict[str, list[float]] = {h: [a.start, 0] for h, a in self._adaptive.items()}
         self._failure_streaks: dict[str, int] = {}
@@ -351,7 +353,7 @@ class PacedSession:
             block_seconds=self._block_seconds, transport=self._custom_transport,
             sleep=self._sleep, clock=self._clock, rng=self._rng, log=self._log,
             adaptive=self._adaptive, playwright_hosts=self._playwright_hosts,
-            solve_captcha=self._solve_captcha,
+            solve_captcha=self._solve_captcha, cookie_dir=self._cookie_dir,
         )
 
     def _warn(self, message: str) -> None:
@@ -399,10 +401,34 @@ class HostChecker:
         self._cache = cache
         self._timeout = timeout
         self._log = log
+        self._candidates: set[str] = set()
         self._known: dict[str, bool] = {}
         self._host_locks: dict[str, threading.Lock] = {}
         self._reported: set[str] = set()
         self._lock = threading.Lock()
+
+    def remember(self, host: str) -> None:
+        host = host.strip().lower().removeprefix("www.")
+        if "." in host and not any(c in host for c in "/ :"):
+            with self._lock:
+                self._candidates.add(host)
+
+    def resolve(self, host: str) -> str:
+        """Repair only a DNS failure with exactly one one-edit known-domain match."""
+        if self._exists(host) or self._exists(host[4:] if host.startswith("www.") else "www." + host):
+            self.remember(host)
+            return host
+        from .domains import one_edit_apart
+        bare = host.lower().removeprefix("www.")
+        with self._lock:
+            matches = [c for c in self._candidates if one_edit_apart(bare, c)]
+        if len(matches) == 1 and self(matches[0]):
+            corrected = ("www." if host.startswith("www.") else "") + matches[0]
+            if self._log:
+                self._log(f"OCR domain corrected: {host} -> {corrected} (known domain)")
+            return corrected
+        self(host)  # retain the existing warning for unresolved names
+        return ""
 
     def __call__(self, host: str) -> bool:
         host = host.strip().strip(".").lower()

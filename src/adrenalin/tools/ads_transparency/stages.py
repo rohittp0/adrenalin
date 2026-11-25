@@ -397,6 +397,8 @@ class AdsStages:
                          "unparsable_checks": checks}
                 if used:  # the row shows the Variation that was read
                     extra |= {"preview_url": used.alt.url, "image_file": used.rel}
+        if copy.website and hasattr(ctx.host_exists, "remember"):
+            ctx.host_exists.remember(copy.website)
         return {**copy.to_dict(), "video_title": title, "title_pending": title_pending,
                 "preview_kind": p.kind if p else "", "content_unparsed": unparsed, **extra}
 

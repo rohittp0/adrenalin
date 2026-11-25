@@ -67,9 +67,10 @@ retried automatically with the same cursor. The window closes after completion;
 headless Chrome continues using the session cookies held in memory and opens a
 visible window again only if needed. The handoff waits up to 10 minutes.
 Existing saved cooldowns are still honored before requests are sent.
-Session cookies are reused only in that browser context and are not saved to disk
-or imported from your regular Chrome profile. Closing the run closes the browser;
-a later run may require another challenge.
+Only the unexpired `GOOGLE_ABUSE_EXEMPTION` cookie is saved under `out/.cache/captcha/`
+in owner-only files, separately per proxy, and restored on restart. Other cookies and
+local storage remain in memory; your regular Chrome profile is never imported.
+Google may still require another challenge if your IP changes or the exemption is rejected.
 
 Script downloads use three concurrent workers with shared adaptive host pacing:
 a 2.5-second base interval decreases toward 1.5 seconds after clean responses and

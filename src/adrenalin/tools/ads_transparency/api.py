@@ -131,7 +131,8 @@ def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool =
     return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"),
                         {HOST: RPC_INTERVAL, SCRIPT_HOST: SCRIPT_INTERVAL},
                         proxies=proxies, wait_on_block=wait_on_block, log=log,
-                        adaptive={IMAGE_HOST: IMAGE_PACE, SCRIPT_HOST: SCRIPT_PACE}, playwright_hosts=(HOST,), solve_captcha=solve_captcha)
+                        adaptive={IMAGE_HOST: IMAGE_PACE, SCRIPT_HOST: SCRIPT_PACE}, playwright_hosts=(HOST,), solve_captcha=solve_captcha,
+                        cookie_dir=cache_dir(out) / "captcha")
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:
@@ -541,6 +542,9 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
                            codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=emit,
                            oembed=oembed, host_exists=HostChecker(oembed, cache, log=emit),
                            read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads, sampling_mode=options.sampling_mode)
+        for _, result in q.results("extract"):
+            if result.get("website"):
+                ctx.host_exists.remember(result["website"])
         ads = AdsStages(ctx)
         if options.stage in (None, "extract"):
             ads.retry_titles(q)  # transient oEmbed failures of earlier runs

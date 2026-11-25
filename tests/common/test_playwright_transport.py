@@ -181,3 +181,26 @@ def test_browser_switch_preserves_proxy_sessions_in_memory():
         transport.close()
     assert len(closed) == 3
     assert not transport._storage
+
+
+def test_exemption_reused_after_restart_with_expiry_and_proxy_isolation(tmp_path):
+    from time import time
+    from adrenalin.common.playwright_http import PlaywrightTransport
+    cookie = dict(name='GOOGLE_ABUSE_EXEMPTION', value='test-exemption', domain='.google.com',
+                  path='/', expires=time() + 600, httpOnly=True, secure=True, sameSite='None')
+    first = PlaywrightTransport(cookie_dir=tmp_path)
+    try:
+        first._save_exemption(None, {'cookies': [cookie, {**cookie, 'name': 'SID'}]})
+    finally:
+        first.close()
+    second = PlaywrightTransport(cookie_dir=tmp_path)
+    try:
+        assert second._load_exemption(None)['cookies'] == [cookie]
+        assert second._load_exemption('http://proxy.test') is None
+        assert second._cookie_path(None).stat().st_mode & 0o777 == 0o600
+        second._save_exemption(None, {'cookies': [{**cookie, 'expires': time() - 1}]})
+        assert second._load_exemption(None) is None
+        second._cookie_path(None).write_text('broken')
+        assert second._load_exemption(None) is None
+    finally:
+        second.close()

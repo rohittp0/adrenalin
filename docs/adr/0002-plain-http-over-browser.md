@@ -36,4 +36,7 @@ only for a challenge. After completion it closes that window and restarts
 headlessly, transferring per-proxy cookies and local storage in memory. A `/sorry/` response triggers a service-root navigation and a
 bounded ten-minute wait for the browser to return to the original origin. The
 same RPC is retried once; if still blocked, normal cooldown handling applies.
-No CAPTCHA is solved automatically, and cookies are not persisted to disk.
+No CAPTCHA is solved automatically. The unexpired `GOOGLE_ABUSE_EXEMPTION` cookie
+is persisted in owner-only files under the output cache, separated by proxy, and
+restored on restart. Other cookies and local storage are not persisted. Expiry is
+checked before restore; Google can still reject an exemption, for example after an IP change.

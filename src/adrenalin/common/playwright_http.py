@@ -6,7 +6,12 @@ transport. User browser profiles and cookies are never imported.
 """
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Event
-from time import monotonic
+from time import monotonic, time
+from pathlib import Path
+import hashlib
+import json
+import os
+import tempfile
 from urllib.parse import urlparse, urlencode
 
 import requests
@@ -14,7 +19,7 @@ from playwright.sync_api import Error, TimeoutError, sync_playwright
 
 
 class PlaywrightTransport:
-    def __init__(self, *, solve_captcha=False, log=None):
+    def __init__(self, *, solve_captcha=False, log=None, cookie_dir=None):
         self._solve_captcha = solve_captcha
         self._log = log or (lambda message: None)
         self._stop = Event()
@@ -27,6 +32,47 @@ class PlaywrightTransport:
         self._pages = {}
         self._headed = False
         self._storage = {}
+        self._cookie_dir = Path(cookie_dir) if cookie_dir is not None else None
+
+    def _cookie_path(self, proxy):
+        if self._cookie_dir is None:
+            return None
+        key = hashlib.sha256((proxy or "direct").encode()).hexdigest()
+        return self._cookie_dir / f"{key}.json"
+
+    @staticmethod
+    def _exemptions(state):
+        return [c for c in state.get("cookies", [])
+                if c.get("name") == "GOOGLE_ABUSE_EXEMPTION"
+                and c.get("domain", "").lstrip(".") in {"google.com", "adstransparency.google.com"}
+                and isinstance(c.get("expires"), (int, float)) and c["expires"] > time()]
+
+    def _load_exemption(self, proxy):
+        path = self._cookie_path(proxy)
+        if path is None:
+            return None
+        try:
+            cookies = self._exemptions(json.loads(path.read_text()))
+            return {"cookies": cookies, "origins": []} if cookies else None
+        except (OSError, ValueError, TypeError, AttributeError):
+            return None
+
+    def _save_exemption(self, proxy, state):
+        path = self._cookie_path(proxy)
+        if path is None:
+            return
+        temporary = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".exemption-")
+            with os.fdopen(fd, "w") as output:
+                json.dump({"cookies": self._exemptions(state), "origins": []}, output)
+            os.replace(temporary, path)  # mkstemp creates an owner-only file
+        except OSError:
+            self._log("warning: could not save CAPTCHA exemption for reuse")
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
     def request(self, method, url, **kwargs):
         with self._lock:
@@ -87,6 +133,10 @@ class PlaywrightTransport:
             self._browser = self._playwright.chromium.launch(channel="chrome", headless=not self._headed)
         if proxy not in self._contexts:
             options = {"proxy": {"server": proxy}} if proxy else {}
+            if proxy not in self._storage:
+                saved = self._load_exemption(proxy)
+                if saved:
+                    self._storage[proxy] = saved
             if proxy in self._storage:
                 options["storage_state"] = self._storage[proxy]
             self._contexts[proxy] = self._browser.new_context(**options)
@@ -104,6 +154,8 @@ class PlaywrightTransport:
             self._browser = None
             self._contexts.clear()
             self._pages.clear()
+        for proxy, state in states.items():
+            self._save_exemption(proxy, state)
         self._storage.update(states)
         self._headed = headed
 
@@ -168,8 +220,14 @@ class PlaywrightTransport:
     def _dispose(self):
         try:
             try:
-                for context in self._contexts.values():
-                    context.close()
+                for proxy, context in self._contexts.items():
+                    try:
+                        if self._cookie_dir is not None:
+                            self._save_exemption(proxy, context.storage_state())
+                    except Error:
+                        self._log("warning: browser closed before CAPTCHA exemption could be saved")
+                    finally:
+                        context.close()
             finally:
                 self._contexts.clear()
                 self._pages.clear()

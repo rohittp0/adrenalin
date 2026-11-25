@@ -429,8 +429,16 @@ def parse_image_ad_ocr(r: OcrResult) -> AdCopy:
 
 
 def verify_hosts(c: AdCopy, host_exists) -> None:
-    """Check OCR-read domains on the network: one that doesn't resolve was misread. It is dropped (the
-    website falls back to the brand line's domain when that one resolves) and the copy goes to Codex."""
+    """Repair unique known-domain typos after DNS failure, then drop unresolved domains.
+    Unresolved copy falls back to the brand domain and is marked for vision review."""
+    resolver = getattr(host_exists, "resolve", None)
+    if resolver:
+        original = _host(c.display_url) if c.display_url else c.website
+        corrected = resolver(original) if original else ""
+        if corrected and corrected != original:
+            c.display_url = re.sub(re.escape(original), lambda _: corrected, c.display_url, count=1, flags=re.I)
+            if c.website == website_from(original):
+                c.website = website_from(corrected)
     bad: set[str] = set()
     url_host = website_from(c.display_url)
     # the host as shown, with its www. (the checker also tries the other form)
