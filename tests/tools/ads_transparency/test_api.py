@@ -184,6 +184,7 @@ def codex(limit=200, run=None):
 
 def run_scrape(tmp_path, fake, session=None, codex_runner=None, **opts):
     opts.setdefault("sampling_mode", "novelty")  # Existing tests exercise the legacy discovery mode.
+    opts.setdefault("countries", False)  # Shown countries add detail requests; test_countries turns them on.
     return scrape(ScrapeOptions(AR, out=tmp_path, **opts), session=session or make_session(tmp_path, fake),
                   ocr=fake_ocr, codex=codex_runner or codex(), log=lambda m: None, poll=POLL)
 

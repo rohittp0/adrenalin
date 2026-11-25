@@ -99,6 +99,7 @@ class ScrapeOptions:
     read_all: bool = False
     coverage: float = 0.95
     max_ads: int | None = None
+    countries: bool = True  # Shown countries of the weighted Copy sample (`--no-countries` skips them)
 
     def __post_init__(self) -> None:
         if self.sampling_mode not in {"stratified", "novelty"}:
@@ -541,11 +542,14 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
                            codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=emit,
                            oembed=oembed, host_exists=HostChecker(oembed, cache, log=emit),
-                           read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads, sampling_mode=options.sampling_mode)
+                           read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads, sampling_mode=options.sampling_mode,
+                           countries=options.countries)
         for _, result in q.results("extract"):
             if result.get("website"):
                 ctx.host_exists.remember(result["website"])
         ads = AdsStages(ctx)
+        if options.stage in (None, "list"):
+            ads.queue_countries(q)  # targets chosen by earlier runs, and backfill of runs from before Shown countries
         if options.stage in (None, "extract"):
             ads.retry_titles(q)  # transient oEmbed failures of earlier runs
         stages = ads.stages(q, options.stage)

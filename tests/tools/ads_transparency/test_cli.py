@@ -109,3 +109,10 @@ def test_cli_rejects_bad_coverage_and_max_ads(monkeypatch, args):
     with pytest.raises(SystemExit) as e:
         main(["ads-transparency", "AR1", *args])
     assert e.value.code == 2
+
+
+def test_cli_countries_on_by_default_and_no_countries_flag(monkeypatch):
+    seen = capture(monkeypatch)
+    assert main(["ads-transparency", "AR1"]) == 0
+    assert main(["ads-transparency", "AR1", "--no-countries"]) == 0
+    assert seen[0].countries is True and seen[1].countries is False

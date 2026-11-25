@@ -19,6 +19,7 @@ from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.pipeline import Item, Stage, WorkQueue
 from adrenalin.tools.ads_transparency import sample_queue, sampling
+from adrenalin.tools.ads_transparency.countries import COUNTRIES, queue_countries
 from adrenalin.tools.ads_transparency.copy import CONTENT_JS_VERSION, AdCopy, extract_image, parse_content_preview
 from adrenalin.tools.ads_transparency.rpc import (
     ListedCreative,
@@ -27,6 +28,7 @@ from adrenalin.tools.ads_transparency.rpc import (
     Query,
     RpcError,
     TransparencyClient,
+    parse_detail,
 )
 from adrenalin.tools.ads_transparency.sample_queue import (
     HELD,
@@ -40,7 +42,8 @@ from adrenalin.tools.ads_transparency.sample_queue import (
 # fetch downloads images; content.js Previews go on to `script`, which has its own (slower) host, so a
 # block there stops only script downloads. `sample` admits held Creatives into the Copy sample in rounds (ADR 0003);
 # `held` is a queue stage no worker claims: listed Creatives left out of the sample so far.
-STAGE_NAMES = ("list", "sample", "detail", "fetch", "script", "extract")
+# `countries` comes after `list` and `sample`, which queue its items.
+STAGE_NAMES = ("list", "sample", "detail", COUNTRIES, "fetch", "script", "extract")
 OEMBED_URL = "https://www.youtube.com/oembed"
 CONTENT_DIR = "content"
 # runs whose detail response for a Broken Preview's Creative could not be parsed before the Preview counts as
@@ -60,6 +63,9 @@ _STAGE_CONFIG = {
     # (`sample_queue.round_lead`, resolved before every claim)
     "sample": (1, ("list", "detail", "fetch", "script", "extract"), None),
     "detail": (1, ("fetch", "script", "extract"), 50),
+    # Shown countries never hold back listing or copy reading. With --variations they wait for `detail` to drain,
+    # so each Creative's detail response is reused instead of requested again (the same host, so no time is lost).
+    COUNTRIES: (1, ("detail",), 0),
     "fetch": (4, ("extract",), 50),
     "script": (3, ("extract",), 50),
     "extract": (2, (), 0),
@@ -153,6 +159,7 @@ class StageContext:
     coverage: float = 0.95
     max_ads: int | None = None
     sampling_mode: str = "novelty"
+    countries: bool = True  # fetch Shown countries of the weighted Copy sample
 
 
 class AdsStages:
@@ -169,16 +176,17 @@ class AdsStages:
         if only == "export":
             names: tuple[str, ...] = ()
         elif only == "list":
-            names = ("list", "detail")
+            names = ("list", "detail", COUNTRIES)
         elif only == "fetch":
             names = ("fetch", "script")
         elif only == "extract":
             names = ("extract",)
         else:
             names = STAGE_NAMES  # `sample` runs only here: it admits by Coverage, so it needs reads to happen
-        names = tuple(n for n in names if n != "detail" or self.ctx.variations)
-        workers = {"list": self.list_page, "sample": self.sample, "detail": self.detail, "fetch": self.fetch,
-                   "script": self.script, "extract": self.extract}
+        names = tuple(n for n in names if (n != "detail" or self.ctx.variations)
+                      and (n != COUNTRIES or self.ctx.countries))
+        workers = {"list": self.list_page, "sample": self.sample, "detail": self.detail, COUNTRIES: self.countries,
+                   "fetch": self.fetch, "script": self.script, "extract": self.extract}
         out = []
         for name in names:
             concurrency, throttle_on, max_ahead = _STAGE_CONFIG[name]
@@ -248,6 +256,7 @@ class AdsStages:
             q.set_meta("list_done", ctx.today().isoformat())
             if q.count(HELD, "pending") or (ctx.sampling_mode == "stratified" and not ctx.read_all):
                 seed_round(q)  # before this page completes, so the sample stage can't finish first
+            self.queue_countries(q)  # before this page completes, so the countries stage can't finish first
         return {"creatives": len(page.creatives), "next_cursor": nxt}
 
     def _admit_probability(self, q: WorkQueue, estimate: int | None, cursor: str | None) -> float:
@@ -276,20 +285,40 @@ class AdsStages:
 
     def sample(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
-        return sample_queue.run_round(q, item, sample_queue.RoundSettings(
+        result = sample_queue.run_round(q, item, sample_queue.RoundSettings(
             ctx.variations, ctx.query, ctx.today(), ctx.read_all, ctx.coverage, ctx.max_ads, ctx.sampling_mode), ctx.log)
+        self.queue_countries(q)  # a round changes the Copy sample
+        return result
+
+    def queue_countries(self, q: WorkQueue) -> int:
+        ctx = self.ctx
+        return queue_countries(q, ctx.variations, ctx.query, ctx.today(), ctx.max_ads) if ctx.countries else 0
 
     # -- detail -------------------------------------------------------------
 
     def detail(self, item: Item, q: WorkQueue) -> dict:
-        previews: list[Preview | None] = list(
-            self.ctx.client.variations(self.ctx.query.advertiser_id, item.key))
+        data = self.ctx.client.detail(self.ctx.query.advertiser_id, item.key)
+        previews: list[Preview | None] = list(parse_detail(data))
         if not previews:
             previews = [preview_from_dict(item.payload.get("preview"))]
         fields = {k: v for k, v in item.payload.items() if k != "preview"}
         for n, p in enumerate(previews, 1):
             q.put("fetch", f"{item.key}#{n}", {**fields, "variation": n, "preview": preview_to_dict(p)})
-        return {"variations": len(previews)}
+        # kept so the countries stage needn't request the same response again
+        return {"variations": len(previews), "shown_countries": data["1"].get("17")}
+
+    # -- countries ----------------------------------------------------------
+
+    def countries(self, item: Item, q: WorkQueue) -> dict:
+        """Shown countries of one Creative: the raw detail field 17, parsed at export. With `--variations` the
+        detail stage's response is reused."""
+        if self.ctx.variations and (d := q.item("detail", item.key)) is not None and d.status == "done" \
+                and "shown_countries" in (d.result or {}):
+            return {"shown_countries": d.result["shown_countries"]}
+        data = self.ctx.client.detail(self.ctx.query.advertiser_id, item.key)
+        if not isinstance(data.get("1"), dict):
+            raise ValueError("detail response has no creative")
+        return {"shown_countries": data["1"].get("17")}
 
     # -- fetch --------------------------------------------------------------
 

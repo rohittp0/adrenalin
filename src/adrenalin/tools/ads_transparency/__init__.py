@@ -46,6 +46,8 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
                    help="novelty mode only: legacy repetition-score stopping threshold, not population Coverage")
     p.add_argument("--max-ads", type=int, metavar="N",
                    help="representative sample size (default 2000), minimum 3 per group may increase it; novelty mode: read cap")
+    p.add_argument("--no-countries", action="store_false", dest="countries",
+                   help="skip Shown countries (one extra request per Creative in the Copy sample)")
     p.add_argument("--solve-captcha", action="store_true", help="show Chrome only when you need to solve a Google CAPTCHA")
     p.add_argument("--wait-on-block", action="store_true", help="wait out Google blocks instead of exiting")
     p.add_argument("--stage", choices=("list", "fetch", "extract", "export"), help="run one stage only")
@@ -90,6 +92,7 @@ def run(args: argparse.Namespace) -> int:
         solve_captcha=args.solve_captcha,
         out=args.out, proxies=tuple(args.proxies), progress=args.progress,
         sampling_mode=args.sampling, read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
+        countries=args.countries,
     )
     def log(message: str) -> None:
         if not api.is_outcome_line(message):  # printed below, once, with what to do next
