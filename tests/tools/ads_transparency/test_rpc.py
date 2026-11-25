@@ -8,11 +8,13 @@ import requests
 from adrenalin.tools.ads_transparency.rpc import (
     DETAIL_URL,
     SEARCH_URL,
+    ShownCountry,
     PaginationLoop,
     Query,
     TransparencyClient,
     build_search_request,
     parse_detail,
+    parse_shown_countries,
     preview_ids,
     parse_search_page,
     transparency_url,
@@ -228,3 +230,39 @@ def test_rpc_timeout_retries_same_cursor_bounded(failures):
         assert client.search(query, 'saved-cursor').creatives == []
     assert len(session.calls) == min(failures + 1, 3)
     assert all(call == session.calls[0] for call in session.calls)
+
+
+def test_parse_shown_countries_from_video_fixture():
+    raw = _load("creative_detail_video.json")["1"]["17"]
+    got = parse_shown_countries(raw)
+    assert got[0] == ShownCountry("NZ", date(2026, 11, 19), None, None, None)
+    de = next(c for c in got if c.country == "DE")
+    assert (de.first_shown, de.impressions_min, de.impressions_max) == (date(2026, 3, 22), 0, 1000)
+
+
+def test_parse_shown_countries_reads_impression_range():
+    [c] = parse_shown_countries([{"1": 2276, "2": "10000", "3": "15000", "4": 20250421, "5": 20261122,
+                                  "7": 20250421}])
+    assert (c.impressions_min, c.impressions_max, c.first_shown) == (10000, 15000, date(2025, 4, 21))
+
+
+def test_parse_shown_countries_first_shown_falls_back_to_4():
+    [c] = parse_shown_countries([{"1": 2250, "4": 20260219, "5": 20261122}])
+    assert c.first_shown == date(2026, 2, 19)
+
+
+def test_parse_shown_countries_unknown_geo():
+    assert parse_shown_countries([{"1": 2999, "5": 20261122}])[0].country == "geo:2999"
+
+
+def test_parse_shown_countries_skips_malformed():
+    assert parse_shown_countries(None) == [] and parse_shown_countries({"1": 2840}) == []
+    got = parse_shown_countries([{"5": 20261122}, {"1": 2840, "5": "soon"}, {"1": 2826, "5": 20261101}, "x"])
+    assert [(c.country, c.last_shown) for c in got] == [("US", None), ("GB", date(2026, 11, 1))]
+
+
+def test_client_detail_returns_raw_response_and_variations_still_parse():
+    body = _load("creative_detail.json")
+    client = TransparencyClient(FakeSession([body]))
+    assert client.detail("AR1", "CR2") == body
+    assert client.variations("AR1", "CR2") == parse_detail(body)

@@ -43,7 +43,12 @@ An extra link or callout shown under a Text ad: a link pill, a row of a link lis
 How many days Google reports a Creative as having run, taken directly from the listing.
 
 **Region**:
-The country an ad was shown in, given as an ISO code (`IN`) or `anywhere`; Google identifies it by a numeric geo ID.
+The country a query filters on, given as an ISO code (`IN`) or `anywhere`; Google identifies it by a numeric geo ID. It says which Creatives a query matches, not where each one ran: for that, see Shown country.
+_Avoid_: Shown country
+
+**Shown country**:
+A country Google reports a Creative was actually shown in during its life, with the last date it was shown there. For EU countries Google also gives the first date shown there and an impression range (such as 10K–15K), the only reach figure Transparency publishes. Checked against Lascade's own targeting: an ad's Shown countries fall inside what its campaign targeted (55 of 59 checked ads; the other 4 fit targeting changed after they ran), and a worldwide campaign shows only the few countries that actually served it.
+_Avoid_: Region, targeting
 
 **Shown period**:
 The date range a query covers, matching Creatives that were *shown* at any point in it, not ones created in it.

@@ -12,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
+from adrenalin.common.geo import geo_id_to_region
 from adrenalin.common.http import PacedSession
 
 HOST = "adstransparency.google.com"
@@ -203,6 +204,43 @@ def parse_detail(data: dict) -> list[Preview]:
     return out
 
 
+@dataclass(frozen=True)
+class ShownCountry:
+    """A Shown country of a Creative (detail field 17). EU countries also carry first shown and an impression
+    range; elsewhere those are None."""
+    country: str  # ISO alpha-2, or `geo:<id>` for a geo ID that is not a country
+    last_shown: date | None
+    first_shown: date | None
+    impressions_min: int | None
+    impressions_max: int | None
+
+
+def _date_or_none(v: Any) -> date | None:
+    try:
+        return datetime.strptime(str(int(v)), "%Y%m%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_shown_countries(raw: object) -> list[ShownCountry]:
+    """Parse a detail response's field 17. Entries without an integer geo ID are skipped; a date or impression
+    count that does not parse is left None."""
+    if not isinstance(raw, list):
+        return []
+    out: list[ShownCountry] = []
+    for e in raw:
+        if not isinstance(e, dict) or not isinstance(e.get("1"), int) or isinstance(e.get("1"), bool):
+            continue
+        geo = e["1"]
+        high = _int_or_none(e.get("3"))
+        low = _int_or_none(e.get("2"))
+        if low is None and high is not None:
+            low = 0  # only an upper bound: "under N" impressions
+        out.append(ShownCountry(geo_id_to_region(geo) or f"geo:{geo}", _date_or_none(e.get("5")),
+                                _date_or_none(e.get("7", e.get("4"))), low, high))
+    return out
+
+
 def transparency_url(advertiser_id: str, creative_id: str, region: str) -> str:
     return f"https://{HOST}/advertiser/{advertiser_id}/creative/{creative_id}?region={region}"
 
@@ -271,9 +309,12 @@ class TransparencyClient:
             seen.add(nxt)
             cursor = nxt
 
+    def detail(self, advertiser_id: str, creative_id: str) -> dict:
+        """The raw GetCreativeById response: Variations (field 5) and Shown countries (field 17)."""
+        return self._post(DETAIL_URL, _build_detail_request(advertiser_id, creative_id), advertiser_id)
+
     def variations(self, advertiser_id: str, creative_id: str) -> list[Preview]:
-        data = self._post(DETAIL_URL, _build_detail_request(advertiser_id, creative_id), advertiser_id)
-        return parse_detail(data)
+        return parse_detail(self.detail(advertiser_id, creative_id))
 
     def advertiser_name(self, query: Query) -> str | None:
         unfiltered = Query(query.advertiser_id, None, None, None)

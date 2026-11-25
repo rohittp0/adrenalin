@@ -9,3 +9,11 @@ def region_to_geo_id(region: str) -> int | None:
     if country is None:
         raise ValueError(f"Unknown region: {region}")
     return 2000 + int(country.numeric)
+
+
+def geo_id_to_region(geo_id: int) -> str | None:
+    """The ISO 3166-1 alpha-2 code of a Google country geo ID (2000 + ISO numeric), or None for any other ID."""
+    if not 2000 < geo_id < 3000:
+        return None
+    country = pycountry.countries.get(numeric=f"{geo_id - 2000:03d}")
+    return country.alpha_2 if country else None
