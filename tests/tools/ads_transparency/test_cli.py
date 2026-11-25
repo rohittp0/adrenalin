@@ -116,3 +116,9 @@ def test_cli_countries_on_by_default_and_no_countries_flag(monkeypatch):
     assert main(["ads-transparency", "AR1"]) == 0
     assert main(["ads-transparency", "AR1", "--no-countries"]) == 0
     assert seen[0].countries is True and seen[1].countries is False
+
+
+def test_cli_pending_countries_exit_3(monkeypatch, capsys):
+    capture(monkeypatch, ScrapeResult(Path("out/x/ads.csv"), 3, None, {}, 0, countries_pending=3))
+    assert main(["ads-transparency", "AR1"]) == 3
+    assert "3 Creatives still need Shown countries; rerun the same command to continue" in capsys.readouterr().err

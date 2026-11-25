@@ -22,6 +22,7 @@ from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
 from adrenalin.common.progress import Bar, QueueProgress, stage_bar
 from adrenalin.tools.ads_transparency import sampling
+from adrenalin.tools.ads_transparency.countries import COUNTRY_FIELDS, countries_message, countries_pending, country_rows
 from adrenalin.tools.ads_transparency.copy import (  # noqa: F401
     COPY_STATUSES,
     copy_status,
@@ -125,6 +126,7 @@ class ScrapeResult:
     estimate: int | None = None  # Google's rough count of Creatives
     coverage: float | None = None
     summary_path: Path | None = None
+    countries_pending: int = 0  # Copy-sample Creatives whose Shown countries are not fetched yet
 
 
 def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False,
@@ -572,6 +574,10 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
             rr.stage_seconds = _previous_stage_seconds(summary_path)
         summary = build_summary(rows, q, rr, tally, sampled)
         _write_json_atomic(summary_path, summary)
+        pending_countries = 0
+        if options.countries:
+            write_csv_atomic(run / "countries.csv", COUNTRY_FIELDS, country_rows(q, tally, sampled))
+            pending_countries = countries_pending(q)
         failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
         if summary["representative_sample"] is not None:
             representative = summary["representative_sample"]
@@ -579,7 +585,8 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
                  f"{representative['exploratory_processed']:,} additional exploratory reads retained")
         result = ScrapeResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, codex.skipped,
                               list(rr.errors), summary["listing_complete"], summary["listed"],
-                              summary["google_estimate"], summary["coverage"], summary_path)
+                              summary["google_estimate"], summary["coverage"], summary_path,
+                              countries_pending=pending_countries)
         _log_summary(result, codex, emit)
         return result
     finally:
@@ -607,6 +614,8 @@ def _log_summary(r: ScrapeResult, codex: CodexRunner, log: Callable[[str], None]
         log(f"Novelty repetition score {r.coverage:.3f} (not population Coverage)")
     if not r.listing_complete:
         log(incomplete_message(r))
+    if r.countries_pending:
+        log(countries_message(r.countries_pending))
 
 
 def blocked_message(until: float) -> str:
@@ -619,6 +628,12 @@ def incomplete_message(r: ScrapeResult) -> str:
 
 
 def is_outcome_line(message: str) -> bool:
-    """Whether `message` is one of the run-outcome lines `scrape` logs last (blocked until, INCOMPLETE). The CLI
-    prints those itself, from the `ScrapeResult`, so it leaves them out of the log."""
-    return message.startswith("INCOMPLETE: ") or re.fullmatch(r"blocked until \d\d:\d\d", message) is not None
+    """Whether `message` is one of the run-outcome lines `scrape` logs last (blocked until, INCOMPLETE, Shown
+    countries pending). The CLI prints those itself, from the `ScrapeResult`, so it leaves them out of the log."""
+    return (message.startswith("INCOMPLETE: ") or message == countries_message(_leading_count(message))
+            or re.fullmatch(r"blocked until \d\d:\d\d", message) is not None)
+
+
+def _leading_count(message: str) -> int:
+    m = re.match(r"([\d,]+) ", message)
+    return int(m.group(1).replace(",", "")) if m else -1

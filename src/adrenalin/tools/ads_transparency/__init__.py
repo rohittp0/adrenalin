@@ -121,6 +121,9 @@ def run(args: argparse.Namespace) -> int:
     if not res.listing_complete:
         print(api.incomplete_message(res), file=sys.stderr)
         code = code or 3
+    if res.countries_pending:
+        print(api.countries_message(res.countries_pending), file=sys.stderr)
+        code = code or 3
     return code
 
 
