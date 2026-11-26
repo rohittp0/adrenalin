@@ -3,7 +3,9 @@
 One queue item per row: the key is the Creative's Library ID, or `<library_id>:<n>` with `variations` (n is the
 1-based Variation). Every row passes through `fetch`, media or not, so Export reads its rows from `row_items`
 (the `fetch` items, plus rows held in `EXPIRED` during an unfinished relist): the payload holds the Creative and
-its Variation (`row_from_payload`) plus `eu_reach` when the detail stage ran; the result holds `image_files`, paths relative to the entity folder. `ocr` items add `image_text`.
+its Variation (`row_from_payload`) plus `eu_reach` when the detail stage ran; the result holds `image_files`, paths
+relative to the entity folder. `ocr` items add `image_text`. With `eu_reach`, a row whose detail has not reached
+`fetch` (pending, failed or blocked) is still a row, from its `detail` item.
 """
 from __future__ import annotations
 
@@ -15,16 +17,22 @@ from dataclasses import asdict, dataclass, replace
 from datetime import date
 from pathlib import Path
 
-import requests
-
 from adrenalin.common.cache import ExtractionCache
-from adrenalin.common.http import PacedSession
-from adrenalin.common.listing import page_key, put_page, record_cursor
+from adrenalin.common.http import PacedSession, get_ok
+from adrenalin.common.listing import (
+    FirstClaim,
+    page_key,
+    put_page,
+    record_cursor,
+    restart_expired_cursor,
+    restart_listing,
+)
 from adrenalin.common.ocr import OcrResult, recognize
 from adrenalin.common.output import write_bytes_atomic
 from adrenalin.common.pipeline import Item, Stage, WorkQueue
 from adrenalin.tools.meta_ad_library.client import MetaClient, MetaQuery
-from adrenalin.tools.meta_ad_library.parse import Card, DocNotFound, GraphQLError, MetaCreative, Variation
+from adrenalin.tools.meta_ad_library.hosts import LIBRARY_HOST
+from adrenalin.tools.meta_ad_library.parse import Card, DocNotFound, EuReach, GraphQLError, MetaCreative, Variation
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +48,9 @@ EXPIRED = "expired_media"
 RELISTED = "relisted"
 OCR_METHOD = "ocr"  # ExtractionCache method of `fbimg:<file stem>` entries
 _EXPIRED_STATUSES = ("HTTP 403", "HTTP 410")
+# Detail requests answered with GraphQL errors in a row before the detail stage takes them for a block (ADR 0004):
+# Meta's refusal of a logged-out client under load is unverified, and an errors-only answer may be one.
+DETAIL_ERRORS_BLOCK = 3
 
 # (concurrency, throttle_on, max_ahead)
 _STAGE_CONFIG = {
@@ -104,9 +115,12 @@ def media_file(url: str) -> str:
 
 
 def row_items(q: WorkQueue) -> list[Item]:
-    """Every row of the run, whatever its status: the `fetch` items and the rows waiting in `EXPIRED` for a relist
-    (an interrupted relist leaves some there)."""
-    return q.items("fetch") + q.items(EXPIRED)
+    """Every row of the run, whatever its status: the `fetch` items, the rows waiting in `EXPIRED` for a relist
+    (an interrupted relist leaves some there), and the `detail` items not in either (their detail is pending,
+    failed or blocked: no EU reach and no media files yet)."""
+    rows = q.items("fetch") + q.items(EXPIRED)
+    have = {it.key for it in rows}
+    return rows + [it for it in q.items("detail") if it.key not in have]
 
 
 def _expired(error: str | None) -> bool:
@@ -137,7 +151,8 @@ class MetaStages:
     def __init__(self, ctx: MetaContext):
         self.ctx = ctx
         self._lock = threading.Lock()
-        self._listed = False  # whether this run's list stage has claimed a page yet
+        self._first_claim = FirstClaim()  # a carried-over cursor can only be on the run's first page
+        self._detail_errors = 0  # detail requests answered with GraphQL errors in a row
 
     def stages(self, q: WorkQueue, only: str | None = None) -> list[Stage]:
         """The run's stages. `only`: None (all), "list" (list, detail), "fetch" (fetch, ocr) or "export" (none).
@@ -154,39 +169,72 @@ class MetaStages:
 
     def prepare(self, q: WorkQueue, only: str | None = None) -> None:
         """Run before each run's pipeline (not for `--stage export`), with the same `only` as `stages`. Queues
-        page 1 on a new queue.
+        page 1 on a new queue; relists a finished listing (`_relist`, needs the list stage, so `only="fetch"`
+        leaves it for a later run).
 
-        Expired media: when the listing is done and rows failed with HTTP 403/410, their URLs expired. They move
-        to `EXPIRED` and the listing starts again from page 1; the relist puts them back in `fetch` with fresh
-        URLs, flagged `RELISTED`. Needs the list stage, so `only="fetch"` leaves them for a later run.
-        With `ocr`, done rows that have no ocr item yet (an earlier run without `ocr`) get one."""
+        With `eu_reach` and the list stage, rows listed without it (an earlier run without `--eu-reach`) get a
+        detail item. With `ocr`, done rows that have no ocr item yet (an earlier run without `ocr`) get one."""
         if only == "export":
             return
         listing = only in (None, "list")
         if listing:
             q.put("list", page_key(None), {"cursor": ""})  # a new queue starts at page 1; a used one keeps its pages
-        if listing and q.get_meta("list_done"):
-            keys = [it.key for it in q.items("fetch")
-                    if it.status != "done" and _expired(it.error) and not it.payload.get(RELISTED)]
-            if keys:
-                log.info("fetch: media URLs of %d row(s) expired; listing again from page 1 for fresh ones",
-                         len(keys))
-                q.move("fetch", EXPIRED, keys)
-                q.set_meta("list_done", "")
-                q.set_meta("seen_cursors", "{}")
-                put_page(q, "list", None)
+            if done := q.get_meta("list_done"):
+                self._relist(q, date.fromisoformat(done))
+            if self.ctx.eu_reach:
+                self._queue_missing_detail(q)
         if self.ctx.ocr and only in (None, "fetch"):
             for key, result in q.results("fetch"):
                 if (result or {}).get("image_files") and not q.has("ocr", key):
                     q.put("ocr", key, {"image_files": result["image_files"]})
+
+    def _relist(self, q: WorkQueue, done: date) -> None:
+        """List a finished listing again from page 1 when:
+
+        - the Shown period is still open (no end, or an end on or after the last listing) and the last listing
+          finished before today: Creatives start and stop every day. At most one relist a day.
+        - rows' media URLs expired (fetch failed with HTTP 403/410: fbcdn URLs are signed and expire) and a relist
+          has not already tried to refresh them (`RELISTED`).
+
+        A relist moves every row with expired media to `EXPIRED`, so no worker downloads the expired URLs again
+        meanwhile; it puts them back in `fetch` with fresh URLs, flagged `RELISTED`. Done rows keep their media
+        files and EU reach: the relist refreshes their payloads only."""
+        expired = [it for it in q.items("fetch") if it.status != "done" and _expired(it.error)]
+        stale = sum(not it.payload.get(RELISTED) for it in expired)
+        end = self.ctx.query.end
+        daily = (end is None or end >= done) and done < self.ctx.today()
+        if not (stale or daily):
+            return
+        if stale:
+            log.info("fetch: media URLs of %d row(s) expired; listing again from page 1 for fresh ones", stale)
+        else:
+            log.info("list: Shown period still open, last listed %s; listing again from page 1", done.isoformat())
+        if expired:
+            q.move("fetch", EXPIRED, [it.key for it in expired])
+        restart_listing(q, "list")
+
+    @staticmethod
+    def _queue_missing_detail(q: WorkQueue) -> None:
+        """A detail item for each row without EU reach (listed by a run without `eu_reach`). Sibling Variations
+        all get one, and the detail stage still makes one request per Creative (`_sibling_reach`). A row whose
+        detail is already done gets its EU reach without a request."""
+        details = {d.key: d for d in q.items("detail")}
+        for it in q.items("fetch"):
+            if "eu_reach" in it.payload:
+                continue
+            d = details.get(it.key)
+            if d is None:
+                q.put("detail", it.key, it.payload)
+            elif d.status == "done":
+                q.put("fetch", it.key, {**it.payload, "eu_reach": (d.result or {}).get("eu_reach")},
+                      update_payload=True)
 
     # -- list -----------------------------------------------------------------
 
     def list_page(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
         cursor = item.key.removeprefix("page:") or None
-        with self._lock:
-            resumed, self._listed = not self._listed, True
+        resumed = self._first_claim()
         try:
             page = ctx.client.search(ctx.query, cursor)
         except DocNotFound:
@@ -196,10 +244,7 @@ class MetaStages:
             # this run fails the item normally (retried on the next run).
             if not (cursor and resumed):
                 raise
-            log.info("list: cursor expired, restarting listing (%s)", e)
-            q.set_meta("seen_cursors", "{}")
-            put_page(q, "list", None)
-            return {"restarted": True}
+            return restart_expired_cursor(q, "list", e)
 
         for c in page.creatives:
             for n in range(1, (len(c.variations) if ctx.variations else 1) + 1):
@@ -215,23 +260,28 @@ class MetaStages:
             put_page(q, "list", nxt)
         else:
             self._return_unlisted(q)
+            if not row_items(q):
+                log.warning("no Creatives listed for Page %s in this Region/Shown period; check the Page ID "
+                            "(an Ad Library ID of a single ad is not a Page ID)", ctx.query.page_id)
             q.set_meta("list_done", ctx.today().isoformat())
         return {"creatives": len(page.creatives), "inactive": sum(not c.is_active for c in page.creatives),
                 "next_cursor": nxt}
 
     def _queue_row(self, q: WorkQueue, key: str, payload: dict) -> None:
         """Queue a listed row to `detail` (with `eu_reach`) or `fetch`. A relist refreshes the payload of a queued
-        row (fbcdn URLs expire); a row whose detail is done is refreshed in `fetch` directly, keeping its EU reach.
+        row (fbcdn URLs expire) and never redoes done work: a row whose detail is done is refreshed in `fetch`
+        directly, keeping its EU reach (with or without `eu_reach` in this run), and a done `fetch` item stays done.
         A row held in `EXPIRED` gets its fresh URLs flagged `RELISTED`; its held copy is dropped once the fresh row
         is in `fetch` (here, or by `detail` when detail has not run for it yet)."""
         held = q.has(EXPIRED, key)
         if held:
             payload = {**payload, RELISTED: True}
-        if self.ctx.eu_reach:
-            d = q.item("detail", key)
-            if d is None or d.status != "done":
-                q.put("detail", key, payload, update_payload=True)
-                return
+        d = q.item("detail", key)
+        detail_done = d is not None and d.status == "done"
+        if self.ctx.eu_reach and not detail_done:
+            q.put("detail", key, payload, update_payload=True)
+            return
+        if detail_done:
             payload = {**payload, "eu_reach": (d.result or {}).get("eu_reach")}
         q.put("fetch", key, payload, update_payload=True)
         if held:
@@ -258,12 +308,36 @@ class MetaStages:
         library_id = item.payload["creative"]["library_id"]
         found, data = self._sibling_reach(q, library_id, item.key)
         if not found:
-            reach = self.ctx.client.detail(self.ctx.query, library_id)
+            reach = self._request_detail(library_id)
             data = asdict(reach) if reach is not None else None
         q.put("fetch", item.key, {**item.payload, "eu_reach": data}, update_payload=True)
         if q.has(EXPIRED, item.key):
             q.move(EXPIRED, "fetch", [item.key])  # the row was held for a relist: drop its expired copy
         return {"eu_reach": data}
+
+    def _request_detail(self, library_id: str) -> EuReach | None:
+        """One detail request. `DETAIL_ERRORS_BLOCK` GraphQL errors in a row (not `DocNotFound`) are taken for a
+        block of the Ad Library host: it goes into the shared cooldown and `Blocked` stops the stage, so the run
+        ends cleanly and a rerun resumes after the cooldown. Each error before that fails only its item."""
+        try:
+            reach = self.ctx.client.detail(self.ctx.query, library_id)
+        except DocNotFound:
+            raise
+        except GraphQLError as e:
+            with self._lock:
+                self._detail_errors += 1
+                n = self._detail_errors
+                if n >= DETAIL_ERRORS_BLOCK:
+                    self._detail_errors = 0
+            if n >= DETAIL_ERRORS_BLOCK:
+                blocked = self.ctx.session.block(
+                    LIBRARY_HOST, f"{n} detail requests in a row answered with GraphQL errors (latest: {e})")
+                if blocked is not None:
+                    raise blocked from e
+            raise
+        with self._lock:
+            self._detail_errors = 0
+        return reach
 
     @staticmethod
     def _sibling_reach(q: WorkQueue, library_id: str, key: str) -> tuple[bool, dict | None]:
@@ -280,13 +354,6 @@ class MetaStages:
 
     # -- fetch ----------------------------------------------------------------
 
-    def _download(self, url: str) -> bytes:
-        resp = self.ctx.session.get(url, allow_redirects=True, retry_network=2)
-        if resp.status_code != 200:
-            # "HTTP 403"/"HTTP 410" in the item's error is what `prepare` takes for expired URLs
-            raise requests.HTTPError(f"HTTP {resp.status_code} for {url.split('?', 1)[0]}", response=resp)
-        return resp.content
-
     def fetch(self, item: Item, q: WorkQueue) -> dict:
         """Download the row's media files (skipping files already on disk). Result: `image_files`, paths
         relative to the entity folder, in the order of `media_urls`."""
@@ -296,7 +363,10 @@ class MetaStages:
             rel = media_file(url)
             path = self.ctx.entity / rel
             if not path.exists():
-                write_bytes_atomic(path, self._download(url))
+                # "HTTP 403"/"HTTP 410" in the item's error is what `_relist` takes for expired URLs; the message
+                # leaves out fbcdn's signature
+                write_bytes_atomic(path, get_ok(self.ctx.session, url, retry_network=2,
+                                                shown_url=url.split("?", 1)[0]).content)
             files.append(rel)
         if self.ctx.ocr and files:
             q.put("ocr", item.key, {"image_files": files}, update_payload=True)

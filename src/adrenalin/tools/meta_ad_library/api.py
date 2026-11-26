@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -78,6 +79,8 @@ class MetaResult:
     listing_complete: bool = True
     listed: int = 0
     summary_path: Path | None = None
+    # Meta changed its GraphQL queries (`DocNotFound`): the run stopped and the only fix is updating the doc_ids
+    doc_not_found: bool = False
 
 
 def parse_page_arg(text: str) -> str:
@@ -106,9 +109,10 @@ def _query(options: MetaOptions) -> MetaQuery:
     return MetaQuery(options.page_id, country_code(options.region), options.status, options.start, options.end)
 
 
-def _page_name(client: MetaClient, page_id: str, out: Path) -> str:
-    """The Page's name for the entity folder: cached in `meta_pages.json`, else from the first Creative of an
-    unfiltered listing (so a narrow run still names the Page), else the Page's ID."""
+def _entity_name(client: MetaClient, page_id: str, out: Path) -> str:
+    """The entity folder's name: the Page's name and ID (two Pages can share a name), or the ID alone when the
+    Page has no name. The name is cached in `meta_pages.json`, else taken from the first Creative of an
+    unfiltered listing (so a narrow run still names the Page)."""
     def lookup() -> str | None:
         try:
             page = client.search(MetaQuery(page_id, "ALL", "all", None, None), None)
@@ -116,7 +120,8 @@ def _page_name(client: MetaClient, page_id: str, out: Path) -> str:
             raise ValueError(DOC_NOT_FOUND) from e
         return next((c.page_name for c in page.creatives if c.page_name), None)
 
-    return cached_entity_name(out, "meta_pages.json", page_id, lookup) or page_id
+    name = cached_entity_name(out, "meta_pages.json", page_id, lookup)
+    return f"{name} {page_id}" if name else page_id
 
 
 def run_dir_name(options: MetaOptions) -> str:
@@ -176,9 +181,10 @@ _STAGE_LABELS = {"list": ("list", "page"), "detail": ("detail", "creative"), "fe
 
 
 def scrape(options: MetaOptions, *, session: PacedSession | None = None, ocr=recognize,
-           poll: float = 0.2) -> MetaResult:
+           poll: float = 0.2, today: Callable[[], date] = date.today) -> MetaResult:
     """Run (or resume) one scrape and export its CSV. Raises on setup errors; reports run outcomes.
-    Messages go to the `adrenalin` logger (and `run.log` in the run folder)."""
+    Messages go to the `adrenalin` logger (and `run.log` in the run folder). `today` dates the listing (an open
+    Shown period is listed again at most once a day)."""
     query = _query(options)
     own_session = session is None
     if own_session:
@@ -187,8 +193,8 @@ def scrape(options: MetaOptions, *, session: PacedSession | None = None, ocr=rec
     cache: ExtractionCache | None = None
     q: WorkQueue | None = None
     try:
-        client = MetaClient(session)
-        ent = entity_dir(options.out, TOOL_NAME, options.page_id, _page_name(client, options.page_id, options.out))
+        client = MetaClient(session, today=today)
+        ent = entity_dir(options.out, TOOL_NAME, options.page_id, _entity_name(client, options.page_id, options.out))
         cache = ExtractionCache(cache_dir(options.out) / "extract.sqlite3")
         run = ent / "runs" / run_dir_name(options)
         run.mkdir(parents=True, exist_ok=True)
@@ -196,7 +202,7 @@ def scrape(options: MetaOptions, *, session: PacedSession | None = None, ocr=rec
             q = WorkQueue(run / "state.sqlite3")
             ctx = MetaContext(client=client, session=session, query=query, entity=ent, cache=cache,
                               variations=options.variations, eu_reach=options.eu_reach, ocr=options.ocr,
-                              recognize=ocr)
+                              today=today, recognize=ocr)
             return _scrape_run(options, q, MetaStages(ctx), run=run, poll=poll)
     finally:
         if q is not None:
@@ -231,23 +237,23 @@ def _scrape_run(options: MetaOptions, q: WorkQueue, stages_obj: MetaStages, *, r
     })
     failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
     result = MetaResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, list(rr.errors), complete,
-                        len(listed), summary_path)
+                        len(listed), summary_path, any(isinstance(e, DocNotFound) for e in rr.fatal))
     _log_summary(result, options)
     return result
 
 
 def _log_summary(r: MetaResult, options: MetaOptions) -> None:
     """The run's closing lines. The outcome lines (blocked until, INCOMPLETE) are printed by the CLI from the
-    `MetaResult`, and library callers read the result."""
+    `MetaResult`, and library callers read the result. A changed query is the one line to show: nothing else in
+    the run means anything until the doc_ids are updated."""
+    if r.doc_not_found:
+        log.error(DOC_NOT_FOUND)
+        return
     log.info("exported %d rows to %s", r.rows, r.csv_path)
     if r.failed:
         log.info("failed items: " + ", ".join(f"{s}: {n}" for s, n in r.failed.items()))
-    doc_not_found = [e for e in r.errors if "DocNotFound" in e]
-    if doc_not_found:
-        log.error(DOC_NOT_FOUND)
     for e in r.errors:
-        if e not in doc_not_found:
-            log.error("%s", e)
+        log.error("%s", e)
     if options.region.lower() != "anywhere" and options.region.upper() not in EU_COUNTRIES:
         log.info(INACTIVE_NOTE)
 

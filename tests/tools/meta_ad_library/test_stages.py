@@ -1,6 +1,8 @@
 import hashlib
 import json
-from datetime import date
+import logging
+import shutil
+from datetime import date, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -8,13 +10,13 @@ import pytest
 import requests
 
 from adrenalin.common.cache import ExtractionCache
-from adrenalin.common.http import Cooldown, PacedSession
+from adrenalin.common.http import Blocked, Cooldown, PacedSession
 from adrenalin.common.listing import page_key
 from adrenalin.common.ocr import OcrLine, OcrResult
 from adrenalin.common.pipeline import Pipeline, WorkQueue
 from adrenalin.tools.meta_ad_library.client import GRAPHQL_URL, SEARCH_DOC_ID, MetaClient, MetaQuery
-from adrenalin.tools.meta_ad_library.hosts import HOSTS, MEDIA_SUFFIX
-from adrenalin.tools.meta_ad_library.parse import parse_search_page
+from adrenalin.tools.meta_ad_library.hosts import HOSTS, LIBRARY_HOST, MEDIA_SUFFIX
+from adrenalin.tools.meta_ad_library.parse import GraphQLError, parse_search_page
 from adrenalin.tools.meta_ad_library.stages import (
     EXPIRED,
     FATAL,
@@ -74,7 +76,7 @@ class FakeMeta:
 
     def __init__(self, pages: dict[str | None, str]):
         self.pages = pages
-        self.detail = load("detail_eu.json")
+        self.detail: str | list[str] = load("detail_eu.json")  # a list: one answer per detail request, in order
         self.media_status: dict[str, int] = {}  # full URL -> status (default 200)
         self.media: list[str] = []
         self.cursors: list[str | None] = []
@@ -85,7 +87,7 @@ class FakeMeta:
             v = json.loads(data["variables"])
             if data["doc_id"] != SEARCH_DOC_ID:
                 self.details.append(v["adArchiveID"])
-                return response(self.detail)
+                return response(self.detail.pop(0) if isinstance(self.detail, list) else self.detail)
             self.cursors.append(v["cursor"])
             return response(self.pages[v["cursor"]])
         assert urlparse(url).hostname.endswith(MEDIA_SUFFIX), url
@@ -471,3 +473,171 @@ def test_eu_reach_added_later_keeps_held_rows_out_of_fetch(env):
     assert item.status == "done" and all("_nc_cat=9" in u for u in v.image_urls)
     assert item.payload["eu_reach"] is not None
     assert e.q.items(EXPIRED) == [] and sum(u in urls for u in e.fake.media) == tried
+
+
+# -- final review fixes -----------------------------------------------------------
+
+TOMORROW = TODAY + timedelta(days=1)
+GRAPHQL_ERROR = json.dumps({"errors": [{"message": "Something went wrong", "code": 1357001}]})
+
+
+def row_files(q: WorkQueue, keys) -> set[str]:
+    return {f for k in keys for f in (q.item("fetch", k).result or {}).get("image_files", [])}
+
+
+def test_open_period_relists_next_day_without_redoing_done_work(env):
+    e = env({None: page("search_page.json")}, eu_reach=True)
+    assert e.run().failed == {}
+    old_keys = [i.key for i in e.q.items("fetch")]
+    reach = {k: e.q.item("fetch", k).payload["eu_reach"] for k in old_keys}
+    details = len(e.fake.details)
+    shutil.rmtree(e.entity / "images")  # a done fetch run again would download its files again
+    e.reopen()
+    e.fake.pages = {None: page("first_page.json", "C2"), "C2": page("search_page.json")}  # Meta lists more now
+    e.fake.cursors.clear()
+    e.ctx.today = lambda: TOMORROW
+    res = e.run()
+    assert res.failed == {} and e.fake.cursors == [None, "C2"]
+    assert e.q.get_meta("list_done") == TOMORROW.isoformat()
+    new_keys = [i.key for i in e.q.items("fetch") if i.key not in old_keys]
+    assert len(new_keys) == 30 and all(e.q.item("fetch", k).status == "done" for k in new_keys)
+    assert len(e.fake.details) == details + 30  # the new Creatives only
+    assert all(e.q.item("fetch", k).payload["eu_reach"] == reach[k] for k in old_keys)
+    only_old = row_files(e.q, old_keys) - row_files(e.q, new_keys)
+    assert only_old and not any((e.entity / f).exists() for f in only_old)  # never downloaded again
+    e.reopen()
+    e.fake.cursors.clear()
+    e.run()
+    assert e.fake.cursors == []  # listed today already
+
+
+def test_closed_period_is_not_relisted(env):
+    e = env({None: page("search_page.json")})
+    e.ctx.query = MetaQuery(PAGE_ID, "IN", "all", date(2026, 11, 1), TODAY - timedelta(days=1))
+    e.run()
+    e.reopen()
+    e.fake.cursors.clear()
+    e.ctx.today = lambda: TOMORROW
+    e.run()
+    assert e.fake.cursors == [] and e.q.get_meta("list_done") == TODAY.isoformat()
+    e.ctx.query = MetaQuery(PAGE_ID, "IN", "all", date(2026, 11, 1), TODAY)  # ends on the day it was listed
+    e.run()
+    assert e.fake.cursors == [None]
+
+
+def test_relist_without_eu_reach_keeps_eu_reach(env):
+    e = env({None: page("search_page.json")}, eu_reach=True)
+    e.run()
+    reach = e.q.item("fetch", DCO_ID).payload["eu_reach"]
+    assert reach is not None
+    e.reopen()
+    e.ctx.eu_reach = False
+    e.ctx.today = lambda: TOMORROW
+    e.fake.cursors.clear()
+    e.run()
+    assert e.fake.cursors == [None]
+    assert e.q.item("fetch", DCO_ID).payload["eu_reach"] == reach
+
+
+def test_daily_relist_keeps_failing_media_from_relisting_again(env):
+    old = page("search_page.json")
+    e = env({None: old})
+    urls = dco().variations[0].image_urls
+    e.fake.media_status = {u: 403 for u in urls} | {fresh(u): 403 for u in urls}
+    e.run()
+    e.reopen()
+    e.fake.pages[None] = fresh(old)
+    e.run()  # the expired-media relist: still 403, flagged
+    e.reopen()
+    e.ctx.today = lambda: TOMORROW
+    e.fake.cursors.clear()
+    e.run()  # the daily relist holds the row again and refreshes it
+    assert e.fake.cursors == [None]
+    item = e.q.item("fetch", DCO_ID)
+    assert item.status == "failed" and item.payload.get("relisted")
+    e.reopen()
+    e.fake.cursors.clear()
+    e.run()
+    assert e.fake.cursors == []  # same day: neither relist again
+
+
+def test_rows_without_detail_still_export(env):
+    e = env({None: page("search_page.json")}, eu_reach=True)
+    e.fake.detail = GRAPHQL_ERROR
+    st = e.stages()
+    st.prepare(e.q)
+    item = e.q.claim("list")
+    e.q.complete("list", item.key, st.list_page(item, e.q))
+    assert e.q.items("fetch") == [] and len(row_items(e.q)) == 10  # detail pending: rows all the same
+    item = e.q.claim("detail")
+    with pytest.raises(GraphQLError):
+        st.detail(item, e.q)
+    e.q.fail("detail", item.key, "GraphQLError")
+    assert {i.key for i in row_items(e.q)} == {c.library_id for c in parse_search_page(load("search_page.json")).creatives}
+
+
+def test_detail_errors_in_a_row_are_a_block(env):
+    e = env({None: page("search_page.json")}, eu_reach=True)
+    e.fake.detail = GRAPHQL_ERROR
+    res = e.run()
+    assert res.blocked is not None and res.blocked.host == LIBRARY_HOST
+    assert len(e.fake.details) == 3 and res.failed == {"detail": 2}
+    assert e.q.count("detail", "pending") == 8  # the third is released, the rest wait for the next run
+    assert Cooldown(e.tmp / "cooldown.sqlite3").remaining(LIBRARY_HOST, now=1_000_000.0) > 0
+    assert e.session.interval(LIBRARY_HOST) > HOSTS[LIBRARY_HOST].pace.start
+
+
+def test_detail_error_count_resets_and_skips_doc_not_found(env):
+    e = env({}, eu_reach=True)
+    e.fake.detail = [GRAPHQL_ERROR, GRAPHQL_ERROR, load("detail_eu.json"), GRAPHQL_ERROR, load("doc_not_found.json"),
+                     load("doc_not_found.json"), GRAPHQL_ERROR, GRAPHQL_ERROR]
+    st = e.stages()
+    raised = []
+    for _ in range(8):
+        try:
+            st._request_detail(DCO_ID)
+            raised.append(None)
+        except (Blocked, GraphQLError) as exc:  # DocNotFound is a GraphQLError
+            raised.append(type(exc).__name__)
+    assert raised == ["GraphQLError", "GraphQLError", None, "GraphQLError", "DocNotFound", "DocNotFound",
+                      "GraphQLError", "Blocked"]
+
+
+def test_eu_reach_added_to_a_finished_run(env):
+    e = env({None: page("search_page.json")}, variations=True)
+    e.run()
+    assert e.fake.details == [] and all("eu_reach" not in i.payload for i in e.q.items("fetch"))
+    media = len(e.fake.media)
+    e.reopen()
+    e.ctx.eu_reach = True
+    res = e.run()
+    assert res.failed == {}
+    ids = {c.library_id for c in parse_search_page(load("search_page.json")).creatives}
+    assert sorted(e.fake.details) == sorted(ids)  # one request per Creative, Variations share it
+    rows = e.q.items("fetch")
+    assert len(rows) == 15 and all(i.status == "done" and i.payload["eu_reach"] is not None for i in rows)
+    assert len(e.fake.media) == media
+    e.reopen()
+    e.run()
+    assert sorted(e.fake.details) == sorted(ids)  # nothing left to ask
+
+
+def test_zero_creatives_warns_once(env, caplog):
+    caplog.set_level(logging.INFO, logger="adrenalin")
+    e = env({None: empty_page()})
+    e.run()
+    warned = [r for r in caplog.records if "no Creatives listed for Page" in r.getMessage()]
+    assert len(warned) == 1 and warned[0].levelno == logging.WARNING
+    assert PAGE_ID in warned[0].getMessage() and "not a Page ID" in warned[0].getMessage()
+    caplog.clear()
+    e.reopen()
+    e.run()
+    e.run(only="export")
+    assert not any("no Creatives listed" in r.getMessage() for r in caplog.records)
+
+
+def test_some_creatives_do_not_warn(env, caplog):
+    caplog.set_level(logging.INFO, logger="adrenalin")
+    e = env({None: page("search_page.json")})
+    e.run()
+    assert not any("no Creatives listed" in r.getMessage() for r in caplog.records)

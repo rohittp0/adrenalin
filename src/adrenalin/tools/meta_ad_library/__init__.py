@@ -38,6 +38,8 @@ def run(args: argparse.Namespace) -> int:
 
     def body() -> int:
         res = api.scrape(options)
+        if res.doc_not_found:
+            return 1  # the scrape logged the one line that matters: update the doc_ids
         print(f"{res.csv_path} ({res.rows} rows)")
         return finish(failed=res.failed, errors=res.errors, blocked_until=res.blocked_until,
                       incomplete_message=None if res.listing_complete else api.incomplete_message(res))

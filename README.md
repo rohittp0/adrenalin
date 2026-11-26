@@ -74,9 +74,11 @@ Caveats:
 - Inactive Creatives outside the EU are only partly listed by Meta, so don't read stopped counts as complete.
 - There is no Inventory estimate (the count is only in the Ad Library HTML), so completeness comes from the listing reaching its last page. Exit code `3` means it did not.
 - Meta's query IDs are hard-coded. A "GraphQL document not found" error means Meta changed them: update `SEARCH_DOC_ID` / `DETAIL_DOC_ID` in `src/adrenalin/tools/meta_ad_library/client.py`.
-- Meta requests run in a Playwright-controlled Chrome, so install Google Chrome. A redirect to a login or checkpoint page is treated as a block, never as a challenge to solve.
+- Meta requests run in a Playwright-controlled Chrome, so install Google Chrome. A redirect to a login or checkpoint page is treated as a block, never as a challenge to solve, as is any HTTP error from `www.facebook.com` except 429 (which backs off and retries) and three EU reach requests in a row answered with GraphQL errors.
+- A rerun of a finished run lists the Page again from page 1 when the Shown period is still open and the last listing was before today, so at most once a day. Media files already downloaded and EU reach already fetched are kept. Adding `--eu-reach` to a finished run fetches EU reach for the rows that lack it.
+- If a run lists no Creatives at all, check the Page ID: the Ad Library ID of a single ad is not a Page ID.
 
-Output goes to `out/meta-ad-library/<page-slug>/runs/<REGION>_<status>_<start>_<end>[_variations]/ads.csv` (start and end print `all` when unset, e.g. `IN_active_all_all`), with `summary.json` and `state.sqlite3` beside it.
+Output goes to `out/meta-ad-library/<page-slug>-<page-id>/runs/<REGION>_<status>_<start>_<end>[_variations]/ads.csv` (e.g. `out/meta-ad-library/makemytrip-120740541030/runs/IN_active_all_all/`: the Page ID keeps two Pages with the same name apart, and start and end print `all` when unset), with `summary.json` and `state.sqlite3` beside it.
 
 ## Output
 

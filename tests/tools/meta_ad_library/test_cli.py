@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -60,3 +61,14 @@ def test_cli_exit_codes(monkeypatch, capsys, tmp_path, make_session):
     assert "SEARCH_DOC_ID" in capsys.readouterr().err
     monkeypatch.setattr(api, "make_session", lambda *a, **k: make_session(FakeMeta({}, blocked=True)))
     assert main(["meta-ad-library", PAGE_ID, "--out", str(tmp_path / "o")]) == 2
+
+
+def test_doc_not_found_is_one_clear_message(monkeypatch, capsys, tmp_path, make_session):
+    out = tmp_path / "o"
+    (out / ".cache").mkdir(parents=True)
+    (out / ".cache" / "meta_pages.json").write_text(json.dumps({PAGE_ID: "Make My Trip"}))  # the pipeline meets it
+    monkeypatch.setattr(api, "make_session", lambda *a, **k: make_session(FakeMeta({None: load("doc_not_found.json")})))
+    assert main(["meta-ad-library", PAGE_ID, "--out", str(out)]) == 1
+    captured = capsys.readouterr()
+    lines = [line for line in (captured.out + captured.err).splitlines() if line.strip()]
+    assert lines == [f"error: {api.DOC_NOT_FOUND}"]

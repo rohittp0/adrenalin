@@ -30,16 +30,16 @@ Code lives in `src/adrenalin/` in three layers:
 1. **`cli.py`** discovers tools by scanning `adrenalin.tools.*` packages for a module-level `TOOL` (a `common.tool.Tool`: name, help, `add_arguments`, `run`). It holds no tool-specific logic and has no hard-coded tool list.
 2. **`tools/<name>/`** are self-contained tools. A new tool must expose `TOOL` in its package `__init__.py` and a callable Python API in `api.py` (the CLI is a thin wrapper over it), so other tools can call it programmatically. Tools never shell out to `adrenalin`.
 3. **`common/`** is shared code:
-   - `http.py`: `PacedSession` (per-host pacing, proxies, per-host `HostPolicy`), `Cooldown` (block state shared across runs in `out/.cache/cooldown.sqlite3`), `Blocked`, `HostChecker` (does a host exist: one `GET https://<host>/`).
-   - `pipeline.py`: `Pipeline` and the SQLite-backed `WorkQueue` for staged, resumable, backpressured runs (see ADR 0001).
+   - `http.py`: `PacedSession` (per-host pacing, proxies, per-host `HostPolicy`), `Cooldown` (block state shared across runs in `out/.cache/cooldown.sqlite3`), `Blocked`, `HostChecker` (does a host exist: one `GET https://<host>/`), `get_ok` (a GET that must answer 200). `PacedSession.block` puts a host in cooldown for a block a tool infers from several responses.
+   - `pipeline.py`: `Pipeline` and the SQLite-backed `WorkQueue` for staged, resumable, backpressured runs (see ADR 0001). `fatal` exceptions stop the run and come back in `RunResult.fatal`; the tool reports them.
    - `progress.py`: `QueueProgress`, tqdm bars refreshed from a `WorkQueue`'s counts.
    - `ocr/`: `recognize()` (Apple Vision on macOS, else Tesseract) and, separately, `CodexRunner` (the `codex` CLI as a vision model, with a per-run call cap and a breaker when the binary is missing). Which of them reads an image is decided by the tool (`ads_transparency/copy.py:extract_image`).
    - `cache.py`: `ExtractionCache` of extraction results, shared by all runs; keys are namespaced (`simgad:<id>`, `domain:<host>`).
    - `output.py`: `entity_dir`, `cache_dir`, `write_csv_atomic` (also defuses spreadsheet formulas), `write_bytes_atomic`, `write_json_atomic`, slugs.
    - `geo.py`: region (ISO code or `anywhere`) to Google geo ID, and a country geo ID back to its ISO code.
-   - `runlog.py`: `console_logging(verbose)` (the `adrenalin` logger to stderr above tqdm bars) and `run_log(run_dir)` (`run.log`). Modules log through `logging.getLogger(__name__)`.
+   - `runlog.py`: `console_logging(verbose)` (the `adrenalin` logger to stderr above tqdm bars) and `run_log(run_dir)` (`run.log`; a library caller's root handlers still get only what they got before). Modules log through `logging.getLogger(__name__)`.
    - `cli.py`: shared run flags (`add_run_arguments`), Shown period flags and validation (`add_period_arguments`, `resolve_period`), `finish` (outcome lines and exit code), `run_cli` (exception to exit code). Exit codes: 0 ok, 1 failed items or errors, 2 blocked, 3 incomplete or pending.
-   - `listing.py`: `PaginationLoop` and cursor-paginated listings on a `WorkQueue` (one queue item per page, loop detection across reruns).
+   - `listing.py`: `PaginationLoop` and cursor-paginated listings on a `WorkQueue` (one queue item per page, loop detection across reruns), `restart_listing` (a relist from page 1), and `FirstClaim` / `restart_expired_cursor` (a cursor carried over from an earlier run that has expired).
    - `tool.py`: the `Tool` dataclass.
 
 **Refactor shared logic into `common/` aggressively.** When a second tool needs logic that already exists inside another tool, move it into `common/` instead of duplicating it. Check `common/` before writing a new helper inside a tool.

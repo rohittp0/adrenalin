@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 import requests
 
-from adrenalin.common.http import Cooldown, PacedSession
+from adrenalin.common.http import Blocked, Cooldown, PacedSession
 from adrenalin.tools.meta_ad_library.client import (
     DETAIL_DOC_ID,
     GRAPHQL_URL,
@@ -108,6 +108,32 @@ def test_meta_block_rules():
     assert meta_block(response(json.dumps({"errors": [{"message": "bad cursor", "code": 1}]})), True) is None
     # media and other pages are not GraphQL answers: their bodies are never judged
     assert meta_block(response(b"\xff\xd8 jpeg", url="https://scontent-maa5-1.xx.fbcdn.net/v/a.jpg?x=1"), True) is None
+
+
+def test_meta_block_http_errors():
+    origin = "https://www.facebook.com/"
+    # the origin page the browser opens first, and GraphQL answers: Meta answers queries with HTTP 200
+    assert meta_block(response("<html>Sorry</html>", status=403, url=origin), True) == "HTTP 403"
+    assert meta_block(response(load("search_page.json"), status=500), True) == "HTTP 500"
+    assert meta_block(response(b"", status=404, url=origin), False) == "HTTP 404"  # status only, body unread
+    # 429 is the shared back-off-and-retry path, even with an HTML body
+    assert meta_block(response("<html>Too many</html>", status=429), True) is None
+
+
+def test_origin_403_is_a_block_that_slows_the_host(tmp_path):
+    def origin_403(method, url, **kw):
+        return response("<html>Sorry</html>", status=403, url="https://www.facebook.com/")
+
+    clock = Clock()
+    session = PacedSession(Cooldown(tmp_path / "cooldown.sqlite3", clock=clock), HOSTS, transport=origin_403,
+                           sleep=lambda s: None, clock=clock)
+    try:
+        with pytest.raises(Blocked):
+            MetaClient(session).search(query(), None)
+        assert session.interval(LIBRARY_HOST) > HOSTS[LIBRARY_HOST].pace.start
+        assert Cooldown(tmp_path / "cooldown.sqlite3").remaining(LIBRARY_HOST, now=clock.now) > 0
+    finally:
+        session.close()
 
 
 def test_meta_block_never_reads_a_streamed_body():

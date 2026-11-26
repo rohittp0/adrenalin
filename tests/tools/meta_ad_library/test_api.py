@@ -1,7 +1,7 @@
 import csv
 import json
 import logging
-from datetime import date
+from datetime import date, timedelta
 
 import pytest
 
@@ -15,6 +15,7 @@ from adrenalin.tools.meta_ad_library.api import (
 from adrenalin.tools.meta_ad_library.parse import parse_detail, parse_search_page
 
 from meta_fakes import FakeMeta, response, PAGE_ID, load, page
+from adrenalin.tools.meta_ad_library.client import GRAPHQL_URL
 
 DCO_ID = "1535930091652737"
 TWO_PAGES = {None: page("first_page.json", "C2"), "C2": page("search_page.json")}
@@ -184,7 +185,7 @@ def test_narrow_run_still_names_the_page_from_a_broad_lookup(tmp_path, make_sess
     fake = Narrow({None: page("search_page.json")})
     res = scrape(MetaOptions(PAGE_ID, out=tmp_path / "out", region="IN", status="inactive"),
                  session=make_session(fake), poll=0.005)
-    assert res.rows == 0 and res.csv_path.parents[2].name == "makemytrip"
+    assert res.rows == 0 and res.csv_path.parents[2].name == f"makemytrip-{PAGE_ID}"
     assert seen[0] == (["ALL"], "all")
 
 
@@ -192,3 +193,88 @@ def test_narrow_run_still_names_the_page_from_a_broad_lookup(tmp_path, make_sess
 def test_unknown_region_and_stage_are_rejected(tmp_path, make_session, kw):
     with pytest.raises(ValueError):
         run(tmp_path, make_session, **kw)
+
+
+# -- final review fixes -----------------------------------------------------------
+
+DAY = date(2026, 11, 26)
+GRAPHQL_ERROR = json.dumps({"errors": [{"message": "Something went wrong", "code": 1357001}]})
+
+
+def few(n: int) -> str:
+    """search_page.json cut to its first `n` Creatives (the last page)."""
+    data = json.loads(page("search_page.json"))
+    conn = data["data"]["ad_library_main"]["search_results_connection"]
+    conn["edges"] = conn["edges"][:n]
+    return json.dumps(data)
+
+
+def scrape_on(tmp_path, make_session, fake, day, **kw):
+    return scrape(MetaOptions(PAGE_ID, out=tmp_path / "out", **kw), session=make_session(fake), poll=0.005,
+                  today=lambda: day)
+
+
+def test_open_period_is_relisted_once_a_day(tmp_path, make_session):
+    res = scrape_on(tmp_path, make_session, FakeMeta({None: page("search_page.json")}), DAY)
+    assert res.rows == 10 and res.listing_complete
+    same_day = FakeMeta(TWO_PAGES)  # Meta now lists another page of Creatives
+    res = scrape_on(tmp_path, make_session, same_day, DAY)
+    assert same_day.requests.count(GRAPHQL_URL) == 0 and res.rows == 10
+    next_day = FakeMeta(TWO_PAGES)
+    res = scrape_on(tmp_path, make_session, next_day, DAY + timedelta(days=1))
+    assert next_day.requests.count(GRAPHQL_URL) == 2 and res.listing_complete
+    assert res.rows == res.listed == 40 and {r["library_id"] for r in read(res)} == set(fixture_creatives())
+
+
+def test_rows_whose_detail_failed_are_still_exported(tmp_path, make_session):
+    fake = FakeMeta({None: few(2)})
+    fake.detail = GRAPHQL_ERROR
+    res, _ = run(tmp_path, make_session, fake=fake, eu_reach=True)
+    rows = read(res)
+    assert res.failed == {"detail": 2} and res.blocked_until is None
+    assert res.rows == res.listed == len(rows) == 2 and res.listing_complete
+    assert all(r["eu_total_reach"] == r["payer"] == r["image_files"] == "" and r["image_urls"] for r in rows)
+    assert json.loads(res.summary_path.read_text())["listed"] == 2
+
+
+def test_rows_waiting_on_a_blocked_detail_are_still_exported(tmp_path, make_session):
+    fake = FakeMeta({None: page("search_page.json")})
+    fake.detail = GRAPHQL_ERROR
+    res, _ = run(tmp_path, make_session, fake=fake, eu_reach=True)
+    assert res.blocked_until is not None and res.failed == {"detail": 2}  # the third error in a row is a block
+    assert res.rows == res.listed == 10
+
+
+def test_eu_reach_added_to_a_finished_run_fills_its_columns(tmp_path, make_session):
+    res = scrape_on(tmp_path, make_session, FakeMeta({None: page("search_page.json")}), DAY, variations=True)
+    assert all(r["eu_total_reach"] == "" for r in read(res))
+    again = FakeMeta({None: page("search_page.json")})
+    res = scrape_on(tmp_path, make_session, again, DAY, variations=True, eu_reach=True)
+    rows = read(res)
+    assert len(rows) == 15 and all(r["eu_total_reach"] == "22" for r in rows)
+    # no listing on the same day: every GraphQL request is a detail, one per Creative
+    assert again.requests.count(GRAPHQL_URL) == len({r["library_id"] for r in rows}) == 10
+
+
+def test_doc_not_found_is_flagged_by_type(tmp_path, make_session):
+    cache = tmp_path / "out" / ".cache"
+    cache.mkdir(parents=True)
+    (cache / "meta_pages.json").write_text(json.dumps({PAGE_ID: "Make My Trip"}))
+    res, _ = run(tmp_path, make_session, {None: load("doc_not_found.json")})
+    assert res.doc_not_found and res.errors and res.errors[0].startswith("list: DocNotFound: ")
+    res, _ = run(tmp_path, make_session, {None: json.dumps({"errors": [{"message": "DocNotFound"}]})})
+    assert not res.doc_not_found  # an ordinary GraphQL error that only mentions the name
+
+
+def test_pages_with_the_same_name_get_their_own_folders(tmp_path, make_session):
+    res, _ = run(tmp_path, make_session, {None: page("search_page.json")})
+    other = scrape(MetaOptions("999", out=tmp_path / "out"), session=make_session(FakeMeta({None: page("search_page.json")})),
+                   poll=0.005)
+    assert res.csv_path.parents[2].name == f"makemytrip-{PAGE_ID}" and other.csv_path.parents[2].name == "makemytrip-999"
+
+
+def test_page_without_a_name_uses_its_id(tmp_path, make_session):
+    empty = json.loads(page("search_page.json"))
+    empty["data"]["ad_library_main"]["search_results_connection"]["edges"] = []
+    res, _ = run(tmp_path, make_session, {None: json.dumps(empty)})
+    assert res.csv_path.parents[2].name == PAGE_ID
