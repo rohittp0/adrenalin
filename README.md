@@ -46,7 +46,7 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `-p`, `--progress` | Progress bars: creatives done (Google's estimated total until the listing finishes, then exact) with rate and ETA, plus one bar per stage |
 | `--out DIR` | Output root (default `out/`) |
 
-Exit codes (the same for every tool; `-v` prints debug messages, and every run writes `run.log` in its run folder): `0` done; `1` some items failed or the run hit an error (the CSV is still written; rerun to retry them); `2` Google blocked the run (rerun later to continue); `3` otherwise done, but the listing did not finish (an Incomplete run: draw no counts or start/stop conclusions until a rerun completes it). A block on one Google host stops only the work that depends on it (e.g. image downloads continue while `content.js` downloads are blocked), and the log describes the response that was taken as a block. Run `uv run adrenalin ads-transparency --help` for everything.
+Exit codes (the same for every tool): `0` done; `1` some items failed or the run hit an error (the CSV is still written; rerun to retry them); `2` the run was blocked (rerun later to continue); `3` otherwise done, but the listing did not finish (an Incomplete run: draw no counts or start/stop conclusions until a rerun completes it). `-v` prints debug messages, and every run writes `run.log` in its run folder; the log describes the response that was taken as a block. For ads-transparency, a block on one Google host stops only the work that depends on it (e.g. image downloads continue while `content.js` downloads are blocked). Run `uv run adrenalin ads-transparency --help` for everything.
 
 ### meta-ad-library usage
 
@@ -66,16 +66,17 @@ The page argument is a numeric Page ID or an Ad Library URL containing `view_all
 | `--eu-reach` | EU reach, payer and beneficiary. Costs one extra request per Creative |
 | `--ocr` | Read the text in each Creative's downloaded images |
 | `--stage list\|fetch\|export` | Run one stage only |
-| `--wait-on-block`, `--proxy URL`, `-p`, `--out DIR` | As for ads-transparency |
+| `--wait-on-block`, `--proxy URL`, `-p`, `--out DIR`, `-v` | As for ads-transparency |
+| `--solve-captcha` | Accepted, but never applies to a login or checkpoint redirect: those are blocks (ADR 0004) |
 
 Caveats:
 
 - Inactive Creatives outside the EU are only partly listed by Meta, so don't read stopped counts as complete.
 - There is no Inventory estimate (the count is only in the Ad Library HTML), so completeness comes from the listing reaching its last page. Exit code `3` means it did not.
 - Meta's query IDs are hard-coded. A "GraphQL document not found" error means Meta changed them: update `SEARCH_DOC_ID` / `DETAIL_DOC_ID` in `src/adrenalin/tools/meta_ad_library/client.py`.
-- Meta requests use the same headless Chrome as ads-transparency. A redirect to a login or checkpoint page is treated as a block, never as a challenge to solve.
+- Meta requests run in a Playwright-controlled Chrome, so install Google Chrome. A redirect to a login or checkpoint page is treated as a block, never as a challenge to solve.
 
-Output goes to `out/meta-ad-library/<page-slug>/runs/<REGION>_<start>_<end>/ads.csv`, with `summary.json` and `state.sqlite3` beside it.
+Output goes to `out/meta-ad-library/<page-slug>/runs/<REGION>_<status>_<start>_<end>[_variations]/ads.csv` (start and end print `all` when unset, e.g. `IN_active_all_all`), with `summary.json` and `state.sqlite3` beside it.
 
 ## Output
 
