@@ -15,7 +15,7 @@ from typing import Literal
 
 from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.geo import region_to_geo_id
-from adrenalin.common.http import AdaptivePace, Cooldown, HostChecker, PacedSession
+from adrenalin.common.http import Cooldown, HostChecker, PacedSession, run_session
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
@@ -30,8 +30,8 @@ from adrenalin.tools.ads_transparency.copy import (  # noqa: F401
     is_broken_preview,
     stale_content_read,
 )
+from adrenalin.tools.ads_transparency.hosts import DEFAULT, HOSTS
 from adrenalin.tools.ads_transparency.rpc import (
-    HOST,
     ListedCreative,
     Query,
     TransparencyClient,
@@ -62,13 +62,6 @@ from adrenalin.tools.ads_transparency.stages import (
 )
 
 TOOL_NAME = "ads-transparency"
-RPC_INTERVAL = (6.0, 2.0)
-# content.js previously blocked at 0.5 s: accelerate cautiously and back off on errors.
-SCRIPT_HOST, SCRIPT_INTERVAL = "displayads-formats.googleusercontent.com", (2.5, 0.5)
-SCRIPT_PACE = AdaptivePace(2.5, 1.5, 15.0, clean_streak=30)
-# simgad images: never blocked so far. Paced adaptively: from one a second, faster while responses stay clean,
-# slower on errors (see `AdaptivePace`).
-IMAGE_HOST, IMAGE_PACE = "tpc.googlesyndication.com", AdaptivePace(1.0, 0.2, 4.0)
 
 CSV_FIELDS: tuple[str, ...] = (
     "transparency_url", "creative_id", "variation", "format", "region", "first_shown", "last_shown",
@@ -132,11 +125,8 @@ class ScrapeResult:
 
 def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False,
                  log: Callable[[str], None] | None = print_to_stderr, *, solve_captcha: bool = False) -> PacedSession:
-    return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"),
-                        {HOST: RPC_INTERVAL, SCRIPT_HOST: SCRIPT_INTERVAL},
-                        proxies=proxies, wait_on_block=wait_on_block, log=log,
-                        adaptive={IMAGE_HOST: IMAGE_PACE, SCRIPT_HOST: SCRIPT_PACE}, playwright_hosts=(HOST,), solve_captcha=solve_captcha,
-                        cookie_dir=cache_dir(out) / "captcha")
+    return run_session(out, HOSTS, default=DEFAULT, proxies=proxies, wait_on_block=wait_on_block,
+                       solve_captcha=solve_captcha, log=log)
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:

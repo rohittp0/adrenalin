@@ -1,11 +1,15 @@
 import pytest
 import requests
 
-from adrenalin.common.http import Cooldown, PacedSession, Blocked
+from adrenalin.common.http import Blocked, Cooldown, HostPolicy, PacedSession
+
+
+def sorry(resp, read_body):
+    return '/sorry/ redirect' if '/sorry/' in resp.headers.get('Location', '') else None
 
 
 def test_playwright_routing_derive_and_errors(tmp_path, monkeypatch):
-    session = PacedSession(Cooldown(tmp_path / 'cooldown.db'), {}, playwright_hosts=('google.test',))
+    session = PacedSession(Cooldown(tmp_path / 'cooldown.db'), {'google.test': HostPolicy(browser=True, blocked=sorry)})
     response = requests.Response()
     response.status_code = 200
     response.url = 'https://google.test/'
@@ -23,7 +27,7 @@ def test_playwright_routing_derive_and_errors(tmp_path, monkeypatch):
         assert len(calls) == 1
         derived = session.derive()
         try:
-            assert derived._playwright_hosts == session._playwright_hosts
+            assert derived._hosts == session._hosts
             assert derived._playwright_session is not session._playwright_session
         finally:
             derived.close()

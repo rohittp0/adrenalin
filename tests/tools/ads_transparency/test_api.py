@@ -18,6 +18,7 @@ from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.output import EntityCollision
 from adrenalin.common.pipeline import Item, WorkQueue
 from adrenalin.tools.ads_transparency import sample_queue, sampling
+from adrenalin.tools.ads_transparency.hosts import DEFAULT
 from adrenalin.tools.ads_transparency.api import (
     COPY_STATUSES,
     CSV_FIELDS,
@@ -138,7 +139,7 @@ class Clock:
 
 def make_session(tmp_path, fake, clock=None, sleep=None, wait_on_block=False):
     clock = clock or Clock()
-    return PacedSession(Cooldown(tmp_path / "test-cooldown.sqlite3", clock=clock), intervals={},
+    return PacedSession(Cooldown(tmp_path / "test-cooldown.sqlite3", clock=clock), {}, default=DEFAULT,
                         transport=fake, sleep=sleep or (lambda s: None), clock=clock, wait_on_block=wait_on_block)
 
 

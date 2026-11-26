@@ -2,9 +2,18 @@ import requests
 
 import pytest
 
-from adrenalin.common.http import Blocked, Cooldown, PacedSession, is_block_response
+from adrenalin.common.http import Blocked, Cooldown, HostPolicy, PacedSession
 
 SORRY = "https://www.google.com/sorry/index"
+
+
+def sorry_block(resp, read_body):
+    """A block rule like Google's, so these tests can exercise the session's block handling."""
+    if "/sorry/" in (resp.url or "") or "/sorry/" in resp.headers.get("Location", ""):
+        return "/sorry/ redirect"
+    if read_body and "text/html" in resp.headers.get("Content-Type", "").lower() and b"recaptcha" in resp.content[:4000].lower():
+        return "reCAPTCHA page"
+    return None
 
 
 def resp(status=200, body=b"{}", headers=None, url="https://a.com/x", ctype=None):
@@ -25,9 +34,10 @@ class Env:
         self.calls = []
         self.replies = list(replies)
         self.cooldown = Cooldown(tmp_path / "cd.sqlite")
-        intervals = kw.pop("intervals", {})
+        hosts = kw.pop("hosts", {})
+        kw.setdefault("default", HostPolicy(blocked=sorry_block))
         self.session = PacedSession(
-            self.cooldown, intervals, transport=self.transport,
+            self.cooldown, hosts, transport=self.transport,
             sleep=self.sleep, clock=lambda: self.now, rng=kw.pop("rng", lambda: 0.5), **kw,
         )
 
@@ -41,7 +51,7 @@ class Env:
 
 
 def test_spaces_requests_per_host_independently(tmp_path):
-    e = Env(tmp_path, intervals={"a.com": (6, 0)})
+    e = Env(tmp_path, hosts={"a.com": HostPolicy((6, 0))})
     e.session.get("https://a.com/1")
     e.session.get("https://a.com/2")
     e.session.get("https://b.com/1")
@@ -50,7 +60,7 @@ def test_spaces_requests_per_host_independently(tmp_path):
 
 @pytest.mark.parametrize("r,delay", [(0.0, 4), (1.0, 8)])
 def test_jitter_within_bounds(tmp_path, r, delay):
-    e = Env(tmp_path, intervals={"a.com": (6, 2)}, rng=lambda: r)
+    e = Env(tmp_path, hosts={"a.com": HostPolicy((6, 2))}, rng=lambda: r)
     e.session.get("https://a.com/1")
     e.session.get("https://a.com/2")
     assert e.sleeps == [delay]
@@ -101,8 +111,6 @@ def test_sorry_redirect_blocks_for_900s_without_retry(tmp_path):
 
 def test_recaptcha_html_counts_as_block(tmp_path):
     r = resp(200, b"<html>please solve recaptcha</html>", ctype="text/html; charset=utf-8")
-    assert is_block_response(r)
-    assert not is_block_response(resp(200, b"recaptcha", ctype="application/json"))
     e = Env(tmp_path, [r])
     with pytest.raises(Blocked):
         e.session.get("https://a.com/1")
@@ -305,8 +313,8 @@ from adrenalin.common.http import AdaptivePace  # noqa: E402
 
 
 def _adaptive_env(tmp_path, start=1.0, replies=(), **kw):
-    return Env(tmp_path, replies=replies, intervals={"fixed.com": (1.0, 0.0)},
-               adaptive={"img.com": AdaptivePace(start, 0.2, 4.0)}, **kw)
+    return Env(tmp_path, replies=replies, hosts={"fixed.com": HostPolicy((1.0, 0.0)),
+                                      "img.com": HostPolicy(AdaptivePace(start, 0.2, 4.0), blocked=sorry_block)}, **kw)
 
 
 def test_adaptive_speeds_up_after_clean_streak(tmp_path):
@@ -378,7 +386,7 @@ def test_host_checker_handles_string_error_reason(tmp_path):
 
 @pytest.mark.parametrize('method, failures, expected_calls', [('GET', 1, 2), ('GET', 9, 3), ('POST', 1, 1)])
 def test_network_retries_are_bounded_paced_and_read_only(tmp_path, method, failures, expected_calls):
-    e = Env(tmp_path, intervals={'a.com': (3, 0)})
+    e = Env(tmp_path, hosts={'a.com': HostPolicy((3, 0))})
     times = []
     def transport(method, url, **kwargs):
         assert 'retry_network' not in kwargs
@@ -415,7 +423,7 @@ def test_pacing_sleep_does_not_block_completed_response(tmp_path):
     from threading import Event
     from adrenalin.common.http import AdaptivePace
     sleeping, release = Event(), Event()
-    e = Env(tmp_path, adaptive={'a.com': AdaptivePace(2.5, 1.5, 15)})
+    e = Env(tmp_path, hosts={'a.com': HostPolicy(AdaptivePace(2.5, 1.5, 15))})
     def sleep(seconds):
         sleeping.set()
         assert release.wait(3)
@@ -496,3 +504,37 @@ def test_429_retry_delay_is_shared_and_survives_interrupted_worker(tmp_path):
         assert len(e.calls) == 3
     finally:
         derived.close()
+
+
+def test_suffix_policy_shares_pace_and_cooldown(tmp_path):
+    blocking = HostPolicy((1.0, 0.0), blocked=lambda r, b: "x" if r.status_code == 403 else None)
+    e = Env(tmp_path, [resp(403), resp(200)], hosts={".cdn.test": blocking})
+    assert e.session.policy_key("a.cdn.test") == e.session.policy_key("b.cdn.test") == ".cdn.test"
+    assert e.session.policy_key("cdn.test") == "cdn.test"
+    with pytest.raises(Blocked):
+        e.session.get("https://a.cdn.test/1")
+    with pytest.raises(Blocked) as ei:
+        e.session.get("https://b.cdn.test/1")
+    assert ei.value.host == ".cdn.test"
+    assert len(e.calls) == 1
+
+
+def test_exact_key_beats_suffix_and_longest_suffix_wins(tmp_path):
+    e = Env(tmp_path, hosts={".test": HostPolicy(), ".cdn.test": HostPolicy(), "a.cdn.test": HostPolicy()})
+    assert e.session.policy_key("a.cdn.test") == "a.cdn.test"
+    assert e.session.policy_key("b.cdn.test") == ".cdn.test"
+    assert e.session.policy_key("b.other.test") == ".test"
+
+
+def test_default_policy_never_blocks(tmp_path):
+    e = Env(tmp_path, [resp(302, headers={"Location": SORRY})], default=HostPolicy())
+    assert e.session.get("https://a.com/x").status_code == 302
+
+
+def test_block_reason_is_logged(tmp_path):
+    logs = []
+    e = Env(tmp_path, [resp(200)], log=logs.append,
+            default=HostPolicy(blocked=lambda r, b: "custom reason"))
+    with pytest.raises(Blocked):
+        e.session.get("https://a.com/x")
+    assert any("custom reason" in line for line in logs)

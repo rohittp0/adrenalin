@@ -22,6 +22,7 @@ from adrenalin.common.playwright_http import PlaywrightTransport
 from urllib3.exceptions import NameResolutionError
 
 from adrenalin.common.cache import ExtractionCache
+from adrenalin.common.output import cache_dir
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -94,15 +95,6 @@ class Cooldown:
         return max(until, self.until(host))
 
 
-def is_block_response(resp: requests.Response, read_body: bool = True) -> bool:
-    if "/sorry/" in (resp.url or "") or "/sorry/" in resp.headers.get("Location", ""):
-        return True
-    if read_body and "text/html" in resp.headers.get("Content-Type", "").lower():
-        text = resp.content[:4000].decode("utf-8", errors="ignore").lower()
-        return "recaptcha" in text
-    return False
-
-
 def describe_response(resp: requests.Response, read_body: bool = True) -> str:
     """One line on what a response looked like, for logging why it was taken as a block."""
     parts = [f"HTTP {resp.status_code}", resp.url or ""]
@@ -144,13 +136,40 @@ class AdaptivePace:
     failure_streak: int = 3
 
 
+BlockCheck = Callable[[requests.Response, bool], "str | None"]
+
+
+def no_block(resp: requests.Response, read_body: bool) -> str | None:
+    """A block check that never sees a block."""
+    return None
+
+
+@dataclass(frozen=True)
+class Challenge:
+    """A host's human-solvable challenge page. `shown(url)` says whether a URL is one. Cookies are persisted
+    only when both name and domain match (domain compared with the leading `.` stripped)."""
+    shown: Callable[[str], bool]
+    keep_cookies: frozenset[str] = frozenset()
+    cookie_domains: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class HostPolicy:
+    """How one host (or `.suffix` family of hosts) is paced, fetched and checked for blocks.
+    `blocked(response, read_body)` returns a reason when the response is a block, else None."""
+    pace: AdaptivePace | tuple[float, float] = (0.5, 0.0)
+    browser: bool = False
+    blocked: BlockCheck = no_block
+    challenge: Challenge | None = None
+
+
 class PacedSession:
     def __init__(
         self,
         cooldown: Cooldown,
-        intervals: Mapping[str, tuple[float, float]],
+        hosts: Mapping[str, HostPolicy],
         *,
-        default_interval: tuple[float, float] = (0.5, 0.0),
+        default: HostPolicy = HostPolicy(),
         proxies: Sequence[str] = (),
         wait_on_block: bool = False,
         max_retries: int = 3,
@@ -160,24 +179,23 @@ class PacedSession:
         clock: Callable[[], float] = time.time,
         rng: Callable[[], float] = random.random,
         log: Callable[[str], None] | None = None,
-        adaptive: Mapping[str, AdaptivePace] = {},
-        playwright_hosts: Sequence[str] = (),
         solve_captcha: bool = False,
         cookie_dir: Path | None = None,
     ):
         self._cookie_dir = cookie_dir
         self._solve_captcha = solve_captcha
-        self._playwright_hosts = frozenset(playwright_hosts)
-        self._playwright_session = PlaywrightTransport(solve_captcha=solve_captcha, log=log, cookie_dir=cookie_dir) if playwright_hosts else None
-        self._adaptive = dict(adaptive)
-        self._adaptive_state: dict[str, list[float]] = {h: [a.start, 0] for h, a in self._adaptive.items()}
+        self._hosts = dict(hosts)
+        self._default = default
+        self._suffixes = sorted((k for k in self._hosts if k.startswith(".")), key=len, reverse=True)
+        needs_browser = default.browser or any(p.browser for p in self._hosts.values())
+        self._playwright_session = (PlaywrightTransport(solve_captcha=solve_captcha, log=log, cookie_dir=cookie_dir)
+                                    if needs_browser else None)
+        self._adaptive_state: dict[str, list[float]] = {}
         self._failure_streaks: dict[str, int] = {}
         self._cooldown = cooldown
         self._log = log
         self._custom_transport = transport
         self._proxy_list = tuple(proxies)
-        self._intervals = dict(intervals)
-        self._default_interval = default_interval
         self._proxies = itertools.cycle(proxies) if proxies else None
         self._proxy_lock = threading.Lock()
         self._wait_on_block = wait_on_block
@@ -196,8 +214,29 @@ class PacedSession:
         self._locks_guard = threading.Lock()
         self._last: dict[str, float] = {}
 
+    def policy_key(self, host: str) -> str:
+        """The key pacing, cooldown and block state are shared under: an exact key, else the longest
+        `.suffix` key the host ends with, else the host itself (which gets the default policy)."""
+        if host in self._hosts:
+            return host
+        for suffix in self._suffixes:
+            if host.endswith(suffix):
+                return suffix
+        return host
+
+    def _policy(self, key: str) -> HostPolicy:
+        return self._hosts.get(key, self._default)
+
+    def _adaptive(self, key: str) -> tuple[AdaptivePace, list[float]] | None:
+        pace = self._policy(key).pace
+        if not isinstance(pace, AdaptivePace):
+            return None
+        with self._locks_guard:
+            return pace, self._adaptive_state.setdefault(key, [pace.start, 0])
+
     def _request_transport(self, method: str, url: str, **kwargs):
-        if urlparse(url).hostname not in self._playwright_hosts:
+        host = urlparse(url).hostname or ""
+        if not self._policy(self.policy_key(host)).browser:
             return self._session.request(method, url, **kwargs)
         return self._playwright_session.request(method, url, **kwargs)
 
@@ -207,10 +246,11 @@ class PacedSession:
 
     def interval(self, host: str) -> float:
         """The current base interval of a host."""
-        with self._host_lock(host):
-            if host in self._adaptive_state:
-                return self._adaptive_state[host][0]
-        return self._intervals.get(host, self._default_interval)[0]
+        host = self.policy_key(host)
+        if (adaptive := self._adaptive(host)) is not None:
+            with self._host_lock(host):
+                return adaptive[1][0]
+        return self._policy(host).pace[0]
 
     def _record(self, host: str, clean: bool, *, immediate: bool = False,
                 reason: str = "transient failure") -> None:
@@ -219,11 +259,11 @@ class PacedSession:
         Failure streaks follow completion order across workers. A clean response
         resets the streak; each full streak can slow the host once.
         """
-        cfg = self._adaptive.get(host)
-        if cfg is None:
+        adaptive = self._adaptive(host)
+        if adaptive is None:
             return
+        cfg, state = adaptive
         with self._host_lock(host):
-            state = self._adaptive_state[host]
             before = state[0]
             if not clean:
                 state[1] = 0
@@ -251,11 +291,12 @@ class PacedSession:
         with self._locks_guard:
             gate = self._pace_locks.setdefault(host, threading.Lock())
         with gate:
-            base, jitter = self._intervals.get(host, self._default_interval)
-            with self._host_lock(host):
-                if host in self._adaptive_state:
-                    base = self._adaptive_state[host][0]
-                    jitter = 0.3 * base
+            if (adaptive := self._adaptive(host)) is not None:
+                with self._host_lock(host):
+                    base = adaptive[1][0]
+                jitter = 0.3 * base
+            else:
+                base, jitter = self._policy(host).pace
             last = self._last.get(host)
             if last is not None:
                 delay = base - jitter + 2 * jitter * self._rng()
@@ -286,7 +327,8 @@ class PacedSession:
         return self._cooldown.block(host, max(self._block_seconds, retry_after), now=self._clock())
 
     def request(self, method: str, url: str, *, retry_network: int = 0, **kwargs) -> requests.Response:
-        host = urlparse(url).hostname or ""
+        host = self.policy_key(urlparse(url).hostname or "")
+        policy = self._policy(host)
         kwargs.setdefault("allow_redirects", False)
         kwargs.setdefault("timeout", 30)
         attempt = 0
@@ -317,11 +359,11 @@ class PacedSession:
 
             # stream=True callers (the host check) never download the body, so only the URL tells a block
             read_body = not kwargs.get("stream")
-            if is_block_response(resp, read_body=read_body):
+            if (reason := policy.blocked(resp, read_body)) is not None:
                 self._record(host, clean=False, immediate=True, reason="CAPTCHA/block response")
                 retry_after = _retry_after_seconds(resp.headers.get("Retry-After", ""), self._clock())
                 until = self._block(host, retry_after)
-                self._warn(f"{host} sent a block page ({describe_response(resp, read_body)})")
+                self._warn(f"{host} sent a block page: {reason} ({describe_response(resp, read_body)})")
                 if self._wait_on_block and block_waits < self._max_retries:
                     block_waits += 1
                     continue
@@ -343,16 +385,15 @@ class PacedSession:
             return resp
 
     def derive(self, *, wait_on_block: bool | None = None, max_retries: int | None = None) -> PacedSession:
-        """A new session sharing this one's cooldown, intervals, proxies, transport, sleep and clock,
+        """A new session sharing this one's cooldown, host policies, proxies, transport, sleep and clock,
         with its own block/retry policy and its own pacing state. Close it separately."""
         return PacedSession(
-            self._cooldown, self._intervals,
-            default_interval=self._default_interval, proxies=self._proxy_list,
+            self._cooldown, self._hosts,
+            default=self._default, proxies=self._proxy_list,
             wait_on_block=self._wait_on_block if wait_on_block is None else wait_on_block,
             max_retries=self._max_retries if max_retries is None else max_retries,
             block_seconds=self._block_seconds, transport=self._custom_transport,
             sleep=self._sleep, clock=self._clock, rng=self._rng, log=self._log,
-            adaptive=self._adaptive, playwright_hosts=self._playwright_hosts,
             solve_captcha=self._solve_captcha, cookie_dir=self._cookie_dir,
         )
 
@@ -370,6 +411,15 @@ class PacedSession:
         self._session.close()
         if self._playwright_session is not None:
             self._playwright_session.close()
+
+
+def run_session(out: Path, hosts: Mapping[str, HostPolicy], *, default: HostPolicy = HostPolicy(),
+                proxies: Sequence[str] = (), wait_on_block: bool = False, solve_captcha: bool = False,
+                log: Callable[[str], None] | None = None) -> PacedSession:
+    """A session for a tool's run: cooldown and CAPTCHA cookies live under the run's cache dir."""
+    return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"), hosts, default=default, proxies=proxies,
+                        wait_on_block=wait_on_block, log=log, solve_captcha=solve_captcha,
+                        cookie_dir=cache_dir(out) / "captcha")
 
 
 def _dns_failure(e: BaseException) -> bool:
