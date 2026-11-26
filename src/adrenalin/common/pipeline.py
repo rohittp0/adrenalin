@@ -2,7 +2,6 @@
 import json
 import logging
 import sqlite3
-import sys
 import threading
 import time
 from collections.abc import Callable, Iterable, Sequence
@@ -12,10 +11,6 @@ from pathlib import Path
 from adrenalin.common.http import Blocked
 
 log = logging.getLogger(__name__)
-
-
-def print_to_stderr(msg: str) -> None:
-    print(msg, file=sys.stderr, flush=True)
 
 
 @dataclass
