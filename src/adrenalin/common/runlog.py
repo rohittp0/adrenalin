@@ -76,7 +76,9 @@ class _Propagate(logging.Handler):
         self._parent = logger.parent
 
     def emit(self, record: logging.LogRecord) -> None:
-        if self._parent is not None:
+        # Without handlers up the chain, `callHandlers` would fall back to `logging.lastResort` (stderr), which
+        # propagation never reached: the logger's own run.log handler counted as found.
+        if self._parent is not None and self._parent.hasHandlers():
             self._parent.callHandlers(record)
 
 

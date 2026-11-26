@@ -386,16 +386,16 @@ class PacedSession:
                 continue
             return resp
 
-    def block(self, host: str, reason: str) -> Blocked | None:
+    def block(self, host: str, reason: str) -> Blocked:
         """Put a host in cooldown for a block that no single response shows (e.g. a run of refused requests that
         each look like an ordinary error), as a block response would: the host slows down and the cooldown is
-        saved. Returns the `Blocked` for the caller to raise, or None with `wait_on_block`: the next request to
-        the host then waits the cooldown out."""
+        saved. Returns the `Blocked` for the caller to raise; the next request to the host (in this run with
+        `wait_on_block`, or a rerun) waits the cooldown out."""
         host = self.policy_key(host)
         self._record(host, clean=False, immediate=True, reason=reason)
         until = self._block(host, 0.0)
         log.warning("%s: %s; treated as a block", host, reason)
-        return None if self._wait_on_block else Blocked(host, until)
+        return Blocked(host, until)
 
     def derive(self, *, wait_on_block: bool | None = None, max_retries: int | None = None) -> PacedSession:
         """A new session sharing this one's cooldown, host policies, proxies, transport, sleep and clock,

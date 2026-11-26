@@ -330,10 +330,8 @@ class MetaStages:
                 if n >= DETAIL_ERRORS_BLOCK:
                     self._detail_errors = 0
             if n >= DETAIL_ERRORS_BLOCK:
-                blocked = self.ctx.session.block(
-                    LIBRARY_HOST, f"{n} detail requests in a row answered with GraphQL errors (latest: {e})")
-                if blocked is not None:
-                    raise blocked from e
+                raise self.ctx.session.block(
+                    LIBRARY_HOST, f"{n} detail requests in a row answered with GraphQL errors (latest: {e})") from e
             raise
         with self._lock:
             self._detail_errors = 0

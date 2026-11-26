@@ -573,6 +573,6 @@ def test_block_puts_the_host_in_cooldown(tmp_path):
 
 def test_block_with_wait_on_block_waits_on_the_next_request(tmp_path):
     e = Env(tmp_path, wait_on_block=True)
-    assert e.session.block("a.com", "3 errors in a row") is None
+    assert isinstance(e.session.block("a.com", "3 errors in a row"), Blocked)  # the caller still stops
     e.session.get("https://a.com/1")
     assert e.sleeps and e.sleeps[0] >= 900 and len(e.calls) == 1

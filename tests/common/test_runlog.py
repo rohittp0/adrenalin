@@ -103,3 +103,16 @@ def test_run_log_leaves_root_handlers_at_their_level(tmp_path):
     finally:
         root.removeHandler(handler)
         root.setLevel(saved)
+
+
+def test_run_log_prints_nothing_without_logging_configured(tmp_path, capsys):
+    root = logging.getLogger()
+    saved = root.handlers[:]
+    root.handlers.clear()  # a library caller that configured no logging (pytest puts its own handlers here)
+    try:
+        with run_log(tmp_path) as path:
+            logging.getLogger("adrenalin.x").warning("w")
+    finally:
+        root.handlers[:] = saved
+    assert capsys.readouterr().err == ""  # no `logging.lastResort` line
+    assert path.read_text().rstrip().endswith("w")
