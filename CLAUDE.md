@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Adrenalin is a set of competitor-analysis tools for marketing teams: one CLI, `adrenalin <tool_name> [args...]`, that dispatches to sub-tools. The only tool so far is `ads-transparency` (Google Ads Transparency creatives and ad copy to CSV). Domain terms (Advertiser, Creative, Variation, Preview, Shown period) are defined in `CONTEXT.md`; use them. Decisions that should not be undone ("don't simplify this into a sequential loop", "plain HTTP, not a browser") are in `docs/adr/`.
+Adrenalin is a set of competitor-analysis tools for marketing teams: one CLI, `adrenalin <tool_name> [args...]`, that dispatches to sub-tools. There are two tools: `ads-transparency` (Google Ads Transparency creatives and ad copy to CSV) and `meta-ad-library` (one Facebook Page's Meta Ad Library Creatives to CSV). Domain terms (Advertiser, Creative, Variation, Preview, Shown period) are defined in `CONTEXT.md`; use them. Decisions that should not be undone ("don't simplify this into a sequential loop", "plain HTTP, not a browser") are in `docs/adr/`.
 
 ## Commands
 
@@ -45,5 +45,7 @@ Code lives in `src/adrenalin/` in three layers:
 **Refactor shared logic into `common/` aggressively.** When a second tool needs logic that already exists inside another tool, move it into `common/` instead of duplicating it. Check `common/` before writing a new helper inside a tool.
 
 `ads-transparency` (`tools/ads_transparency/`): `rpc.py` (Google's internal RPCs over plain HTTP), `stages.py` (the queue stages List, Sample, Detail, Countries, Fetch (images), Script (`content.js`) and Extract; see ADR 0003 for Sample), `countries.py` (Shown countries: which Copy-sample Creatives get them, and `countries.csv`), `sampling.py` (pure Copy sample rules: Messages, Coverage, buckets, allocation, weights), `sample_queue.py` (the Copy sample on the queue: `held` Creatives, groups and per-Creative weights, and the Sample stage's rounds), `copy.py` (ad copy and Copy status: `content.js` Previews, OCR layout rules for `simgad` images, the Codex fallback and the OCR domain check), `api.py` (`scrape()`, `ScrapeOptions`, and Export: CSV columns and rows).
+
+`meta-ad-library` (`tools/meta_ad_library/`): `parse.py` (pure parsing of Meta's GraphQL answers into Creatives, Cards and Variations), `client.py` (the GraphQL client; the hard-coded `doc_id`s and the block and "document not found" detection), `hosts.py` (Meta host rules: pacing and which answers are blocks), `stages.py` (the queue stages List, Detail (EU reach, `--eu-reach`), Fetch (media) and OCR (`--ocr`)), `api.py` (`scrape()`, `MetaOptions`, and Export: CSV columns and rows). See ADR 0004.
 
 Output goes to `out/<tool>/<entity>/runs/<run>/` (git-ignored).

@@ -6,6 +6,10 @@ Competitor-analysis tools for marketing teams, run as one CLI: `adrenalin <tool>
 
 Exports every creative an advertiser showed on [Google Ads Transparency](https://adstransparency.google.com) to a CSV: format, region, dates shown, landing page, headline, description, sitelinks, video title and the preview image. Copy comes from Google's `content.js` previews where possible and from OCR of the preview image otherwise (Apple Vision on macOS, Tesseract elsewhere, Codex for images OCR cannot read). Domains read by OCR are checked with one `GET https://<host>/` per host; one that doesn't resolve in DNS (with or without `www.`) is treated as misread, dropped, and the image goes to Codex. Runs are paced to avoid blocks and can be resumed by rerunning the same command.
 
+## meta-ad-library
+
+Exports every Creative a Facebook Page showed in the [Meta Ad Library](https://www.facebook.com/ads/library/) to a CSV: status, dates shown, platforms, page, copy, Cards, DCO Variations, link and media URLs, and optionally EU reach, payer and beneficiary. It calls the Ad Library's own GraphQL (see `docs/adr/0004-meta-web-ad-library-not-graph-api.md`), logged out, and downloads media with plain requests. Runs are paced and resumable like ads-transparency.
+
 ## Install
 
 Requires Python 3.13 and [uv](https://docs.astral.sh/uv/).
@@ -42,7 +46,36 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `-p`, `--progress` | Progress bars: creatives done (Google's estimated total until the listing finishes, then exact) with rate and ETA, plus one bar per stage |
 | `--out DIR` | Output root (default `out/`) |
 
-Exit codes: `0` done; `1` some items failed or the run hit an error (the CSV is still written; rerun to retry them); `2` Google blocked the run (rerun later to continue); `3` otherwise done, but the listing did not finish (an Incomplete run: draw no counts or start/stop conclusions until a rerun completes it). A block on one Google host stops only the work that depends on it (e.g. image downloads continue while `content.js` downloads are blocked), and the log describes the response that was taken as a block. Run `uv run adrenalin ads-transparency --help` for everything.
+Exit codes (the same for every tool; `-v` prints debug messages, and every run writes `run.log` in its run folder): `0` done; `1` some items failed or the run hit an error (the CSV is still written; rerun to retry them); `2` Google blocked the run (rerun later to continue); `3` otherwise done, but the listing did not finish (an Incomplete run: draw no counts or start/stop conclusions until a rerun completes it). A block on one Google host stops only the work that depends on it (e.g. image downloads continue while `content.js` downloads are blocked), and the log describes the response that was taken as a block. Run `uv run adrenalin ads-transparency --help` for everything.
+
+### meta-ad-library usage
+
+```bash
+uv run adrenalin meta-ad-library 120740541030 --region IN --status active
+uv run adrenalin meta-ad-library "https://www.facebook.com/ads/library/?view_all_page_id=120740541030" --days 30
+```
+
+The page argument is a numeric Page ID or an Ad Library URL containing `view_all_page_id=`.
+
+| Flag | Meaning |
+|---|---|
+| `--region IN` | ISO country code or `anywhere` (default) |
+| `--days N` / `--start` / `--end` | Shown period, as for ads-transparency |
+| `--status all\|active\|inactive` | Which Creatives to list by running status (default `all`) |
+| `--variations` | One row per Variation of a DCO Creative, not just the first |
+| `--eu-reach` | EU reach, payer and beneficiary. Costs one extra request per Creative |
+| `--ocr` | Read the text in each Creative's downloaded images |
+| `--stage list\|fetch\|export` | Run one stage only |
+| `--wait-on-block`, `--proxy URL`, `-p`, `--out DIR` | As for ads-transparency |
+
+Caveats:
+
+- Inactive Creatives outside the EU are only partly listed by Meta, so don't read stopped counts as complete.
+- There is no Inventory estimate (the count is only in the Ad Library HTML), so completeness comes from the listing reaching its last page. Exit code `3` means it did not.
+- Meta's query IDs are hard-coded. A "GraphQL document not found" error means Meta changed them: update `SEARCH_DOC_ID` / `DETAIL_DOC_ID` in `src/adrenalin/tools/meta_ad_library/client.py`.
+- Meta requests use the same headless Chrome as ads-transparency. A redirect to a login or checkpoint page is treated as a block, never as a challenge to solve.
+
+Output goes to `out/meta-ad-library/<page-slug>/runs/<REGION>_<start>_<end>/ads.csv`, with `summary.json` and `state.sqlite3` beside it.
 
 ## Output
 
