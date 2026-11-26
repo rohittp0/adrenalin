@@ -368,3 +368,35 @@ def test_max_ahead_can_be_decided_per_claim(tmp_path):
     _run(q, [Stage("A", a, throttle_on=("B",), max_ahead=lambda: limit["n"]), Stage("B", b)])
     assert len(q.items("B", "done")) == 10 and max(seen) <= 1
     q.close()
+
+
+class _Fatal(Exception):
+    pass
+
+
+def test_fatal_error_stops_all_stages(tmp_path):
+    # A fatal worker error (e.g. a changed API query) can't be fixed by retrying other items: every stage stops,
+    # the item is released (not failed) and the error is reported.
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    for i in range(5):
+        q.put("A", str(i), {})
+    for i in range(50):
+        q.put("C", str(i), {})
+    c_started = threading.Event()
+
+    def a(item, queue):
+        c_started.wait(timeout=5)
+        raise _Fatal("query gone")
+
+    def c(item, queue):
+        c_started.set()
+        time.sleep(0.01)
+
+    baseline = threading.active_count()
+    result = Pipeline(q, [Stage("A", a), Stage("C", c)], poll=0.01, fatal=(_Fatal,)).run()
+    assert threading.active_count() == baseline
+    assert result.errors == ["A: _Fatal: query gone"]
+    assert result.failed == {} and q.count("A", "failed") == 0
+    assert q.count("A", "pending") == 5  # the item that raised is released
+    assert q.backlog("C") > 0  # the unrelated stage stopped too
+    q.close()

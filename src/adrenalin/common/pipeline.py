@@ -202,7 +202,9 @@ class RunResult:
 
 class Pipeline:
     def __init__(self, queue: WorkQueue, stages: Sequence[Stage], *, poll: float = 0.2,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic, fatal: tuple[type[Exception], ...] = ()):
+        """`fatal`: worker exception types that no retry of another item can get past (e.g. a request the
+        service no longer accepts). One releases its item, stops every stage and goes to `RunResult.errors`."""
         names = [s.name for s in stages]
         if len(set(names)) != len(names):
             raise ValueError(f"stage names must be unique: {names}")
@@ -212,6 +214,7 @@ class Pipeline:
                 raise ValueError(f"stage {s.name!r} throttles on unknown stage(s) {unknown}")
         self.queue, self.stages, self.poll = queue, list(stages), poll
         self.clock = clock
+        self.fatal = tuple(fatal)
 
     def run(self) -> RunResult:
         q, poll = self.queue, self.poll
@@ -285,6 +288,15 @@ class Pipeline:
                     log.warning("%s: blocked (%s); stopping stage", name, exc)
                     stopped[name].set()
                     halt_producers(name)
+                    return
+                except self.fatal as exc:
+                    q.release(name, item.key)
+                    msg = f"{name}: {type(exc).__name__}: {exc}"
+                    log.error("%s", msg)
+                    with state_lock:
+                        result.errors.append(msg)
+                    for event in stopped.values():
+                        event.set()
                     return
                 except Exception as exc:  # noqa: BLE001 - any worker error fails only its item
                     msg = f"{type(exc).__name__}: {exc}"
