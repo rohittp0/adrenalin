@@ -32,3 +32,13 @@ def test_queue_progress_follows_the_queue_and_writes_above_bars(tmp_path):
     assert "warning: hello" in text and "stage a" in text and "3/5" in text
     assert p._thread is None
     q.close()
+
+
+def test_run_progress_starts_and_closes_or_does_nothing(tmp_path):
+    from adrenalin.common.progress import run_progress
+    q = WorkQueue(tmp_path / "q.sqlite3")
+    with run_progress(q, [stage_bar("A")], enabled=False) as p:
+        assert p is None
+    with run_progress(q, [stage_bar("A")], enabled=True) as p:
+        assert isinstance(p, QueueProgress) and p._thread is not None
+    assert p._thread is None and p._tqdm == []

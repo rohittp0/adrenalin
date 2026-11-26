@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TextIO
 
@@ -96,3 +97,16 @@ class QueueProgress:
 
     def __exit__(self, *exc) -> None:
         self.close()
+
+
+@contextmanager
+def run_progress(q: WorkQueue, bars: Sequence[Bar], enabled: bool) -> Iterator[QueueProgress | None]:
+    """Start `QueueProgress` on `q` for the block and close it afterwards; yields None when disabled."""
+    if not enabled:
+        yield None
+        return
+    progress = QueueProgress(bars).start(q)
+    try:
+        yield progress
+    finally:
+        progress.close()
