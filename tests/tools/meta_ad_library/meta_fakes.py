@@ -3,7 +3,6 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 
-import pytest
 import requests
 
 from adrenalin.common.http import Cooldown, PacedSession

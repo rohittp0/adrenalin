@@ -14,7 +14,7 @@ from adrenalin.tools.meta_ad_library.api import (
 )
 from adrenalin.tools.meta_ad_library.parse import parse_detail, parse_search_page
 
-from meta_fakes import FakeMeta, PAGE_ID, load, page
+from meta_fakes import FakeMeta, response, PAGE_ID, load, page
 
 DCO_ID = "1535930091652737"
 TWO_PAGES = {None: page("first_page.json", "C2"), "C2": page("search_page.json")}
@@ -81,7 +81,7 @@ def test_eu_reach_columns(tmp_path, make_session):
         "" if detail.uk_total is None else str(detail.uk_total), detail.payer, detail.beneficiary)
 
 
-def test_ocr_text_only_with_ocr(tmp_path, make_session):
+def test_ocr_text_survives_a_rerun_without_ocr(tmp_path, make_session):
     from adrenalin.common.ocr import OcrLine, OcrResult
 
     reader = lambda path: OcrResult([OcrLine("Book now", 0.9, (0, 0, 1, 0.1))], "fake")  # noqa: E731
@@ -90,7 +90,9 @@ def test_ocr_text_only_with_ocr(tmp_path, make_session):
                  poll=0.005)
     assert any(r["image_text"] == "Book now" for r in read(res))
     res = scrape(MetaOptions(PAGE_ID, out=tmp_path / "out", stage="export"), session=make_session(fake))
-    assert all(r["image_text"] == "" for r in read(res))
+    assert any(r["image_text"] == "Book now" for r in read(res))
+    res = scrape(MetaOptions(PAGE_ID, out=tmp_path / "out"), session=make_session(fake), poll=0.005)
+    assert any(r["image_text"] == "Book now" for r in read(res))  # a rerun without --ocr keeps the text
 
 
 def test_incomplete_listing(tmp_path, make_session):
@@ -163,3 +165,30 @@ def test_page_arg_rejects_profile_url(text):
 def test_bad_period_is_rejected(tmp_path, make_session):
     with pytest.raises(ValueError, match="after"):
         run(tmp_path, make_session, start=date(2026, 11, 2), end=date(2026, 11, 1))
+
+
+def test_narrow_run_still_names_the_page_from_a_broad_lookup(tmp_path, make_session):
+    empty = json.loads(page("search_page.json"))
+    empty["data"]["ad_library_main"]["search_results_connection"]["edges"] = []
+    seen = []
+
+    class Narrow(FakeMeta):
+        def __call__(self, method, url, data=None, **kw):
+            v = json.loads(data["variables"]) if data else {}
+            if "countries" in v:
+                seen.append((v["countries"], v["activeStatus"]))
+                if v["activeStatus"] != "all":
+                    return response(json.dumps(empty))
+            return super().__call__(method, url, data=data, **kw)
+
+    fake = Narrow({None: page("search_page.json")})
+    res = scrape(MetaOptions(PAGE_ID, out=tmp_path / "out", region="IN", status="inactive"),
+                 session=make_session(fake), poll=0.005)
+    assert res.rows == 0 and res.csv_path.parents[2].name == "makemytrip"
+    assert seen[0] == (["ALL"], "all")
+
+
+@pytest.mark.parametrize("kw", [{"region": "XX"}, {"stage": "bogus"}])
+def test_unknown_region_and_stage_are_rejected(tmp_path, make_session, kw):
+    with pytest.raises(ValueError):
+        run(tmp_path, make_session, **kw)

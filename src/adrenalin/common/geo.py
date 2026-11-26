@@ -17,3 +17,8 @@ def geo_id_to_region(geo_id: int) -> str | None:
         return None
     country = pycountry.countries.get(numeric=f"{geo_id - 2000:03d}")
     return country.alpha_2 if country else None
+
+
+def region_label(region: str) -> str:
+    """`anywhere`, or the upper-case ISO code: a Region's name in run folders and CSV rows."""
+    return "anywhere" if region.lower() == "anywhere" else region.upper()

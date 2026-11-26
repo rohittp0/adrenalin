@@ -11,7 +11,9 @@ from pathlib import Path
 from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.http import PacedSession, run_session
 from adrenalin.common.ocr import recognize
-from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic, write_json_atomic
+from adrenalin.common.geo import region_label, region_to_geo_id
+from adrenalin.common.output import (
+    cache_dir, cached_entity_name, entity_dir, previous_stage_seconds, write_csv_atomic, write_json_atomic)
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue
 from adrenalin.common.progress import run_progress, stage_bar
 from adrenalin.common.runlog import run_log
@@ -96,39 +98,29 @@ def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool =
 def _query(options: MetaOptions) -> MetaQuery:
     if options.start and options.end and options.start > options.end:
         raise ValueError(f"start {options.start} is after end {options.end}")
+    region_to_geo_id(options.region)  # ValueError for an unknown Region
+    if options.stage not in (None, "list", "fetch", "export"):
+        raise ValueError(f"stage must be list, fetch or export, not {options.stage!r}")
     if options.status not in ("all", "active", "inactive"):
         raise ValueError(f"status must be all, active or inactive, not {options.status!r}")
     return MetaQuery(options.page_id, country_code(options.region), options.status, options.start, options.end)
 
 
-def _page_name(client: MetaClient, query: MetaQuery, out: Path) -> str:
-    """The Page's name for the entity folder: cached in `meta_pages.json`, else from the first listed Creative
-    (the Page's ID when it has none, or no name)."""
-    path = cache_dir(out) / "meta_pages.json"
-    try:
-        known = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        known = {}
-    if not isinstance(known, dict):
-        known = {}
-    name = known.get(query.page_id)
-    if isinstance(name, str) and name:
-        return name
-    try:
-        page = client.search(query, None)
-    except DocNotFound as e:
-        raise ValueError(DOC_NOT_FOUND) from e
-    name = next((c.page_name for c in page.creatives if c.page_name), "")
-    if not name:
-        return query.page_id
-    known[query.page_id] = name
-    write_json_atomic(path, known)
-    return name
+def _page_name(client: MetaClient, page_id: str, out: Path) -> str:
+    """The Page's name for the entity folder: cached in `meta_pages.json`, else from the first Creative of an
+    unfiltered listing (so a narrow run still names the Page), else the Page's ID."""
+    def lookup() -> str | None:
+        try:
+            page = client.search(MetaQuery(page_id, "ALL", "all", None, None), None)
+        except DocNotFound as e:
+            raise ValueError(DOC_NOT_FOUND) from e
+        return next((c.page_name for c in page.creatives if c.page_name), None)
+
+    return cached_entity_name(out, "meta_pages.json", page_id, lookup) or page_id
 
 
 def run_dir_name(options: MetaOptions) -> str:
-    region = "anywhere" if options.region.lower() == "anywhere" else options.region.upper()
-    name = f"{region}_{options.status}_{options.start or 'all'}_{options.end or 'all'}"
+    name = f"{region_label(options.region)}_{options.status}_{options.start or 'all'}_{options.end or 'all'}"
     return name + ("_variations" if options.variations else "")
 
 
@@ -141,7 +133,8 @@ def _blank(v) -> object:
 
 
 def _rows(q: WorkQueue, options: MetaOptions) -> list[dict]:
-    texts = {key: (r or {}).get("image_text", "") for key, r in q.results("ocr")} if options.ocr else {}
+    # whatever OCR results the queue holds, also from an earlier run with --ocr
+    texts = {key: (r or {}).get("image_text", "") for key, r in q.results("ocr")}
     rows: dict[str, dict] = {}
     for item in row_items(q):
         if item.key in rows:
@@ -178,15 +171,6 @@ def _listing_complete(q: WorkQueue) -> bool:
         it.status in ("pending", "running", "failed") for it in q.items("list"))
 
 
-def _previous_stage_seconds(path: Path) -> dict:
-    try:
-        old = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    seconds = old.get("stage_seconds") if isinstance(old, dict) else None
-    return seconds if isinstance(seconds, dict) else {}
-
-
 _STAGE_LABELS = {"list": ("list", "page"), "detail": ("detail", "creative"), "fetch": ("fetch", "ad"),
                  "ocr": ("ocr", "ad")}
 
@@ -204,7 +188,7 @@ def scrape(options: MetaOptions, *, session: PacedSession | None = None, ocr=rec
     q: WorkQueue | None = None
     try:
         client = MetaClient(session)
-        ent = entity_dir(options.out, TOOL_NAME, options.page_id, _page_name(client, query, options.out))
+        ent = entity_dir(options.out, TOOL_NAME, options.page_id, _page_name(client, options.page_id, options.out))
         cache = ExtractionCache(cache_dir(options.out) / "extract.sqlite3")
         run = ent / "runs" / run_dir_name(options)
         run.mkdir(parents=True, exist_ok=True)
@@ -237,7 +221,7 @@ def _scrape_run(options: MetaOptions, q: WorkQueue, stages_obj: MetaStages, *, r
     n = write_csv_atomic(csv_path, CSV_FIELDS, rows)
     summary_path = run / "summary.json"
     if not stages:  # nothing ran (`--stage export`): keep the stage times of the run that did the work
-        rr.stage_seconds = _previous_stage_seconds(summary_path)
+        rr.stage_seconds = previous_stage_seconds(summary_path)
     listed = {r["library_id"] for r in rows}
     complete = _listing_complete(q)
     write_json_atomic(summary_path, {

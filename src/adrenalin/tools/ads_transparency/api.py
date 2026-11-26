@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Literal
 
 from adrenalin.common.cache import ExtractionCache
-from adrenalin.common.geo import region_to_geo_id
+from adrenalin.common.geo import region_label, region_to_geo_id
 from adrenalin.common.http import Cooldown, HostChecker, PacedSession, run_session
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
-from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic, write_json_atomic
+from adrenalin.common.output import (
+    cache_dir, cached_entity_name, entity_dir, previous_stage_seconds, write_csv_atomic, write_json_atomic)
 from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue
 from adrenalin.common.progress import Bar, run_progress, stage_bar
 from adrenalin.common.runlog import run_log
@@ -151,21 +152,9 @@ def list_creatives(advertiser_id: str, region: str = "anywhere", start: date | N
 
 
 def _advertiser_name(client: TransparencyClient, query: Query, out: Path) -> str:
-    path = cache_dir(out) / "advertisers.json"
-    try:
-        known = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        known = {}
-    if not isinstance(known, dict):
-        known = {}
-    name = known.get(query.advertiser_id)
-    if isinstance(name, str) and name:
-        return name
-    name = client.advertiser_name(query)
+    name = cached_entity_name(out, "advertisers.json", query.advertiser_id, lambda: client.advertiser_name(query))
     if not name:
         raise ValueError(f"No creatives found for {query.advertiser_id}")
-    known[query.advertiser_id] = name
-    write_json_atomic(path, known)
     return name
 
 
@@ -198,12 +187,8 @@ def _prepare_sampling(q: WorkQueue, options: ScrapeOptions) -> None:
         seed_round(q)
 
 
-def _region_label(region: str) -> str:
-    return "anywhere" if region.lower() == "anywhere" else region.upper()
-
-
 def run_dir_name(options: ScrapeOptions) -> str:
-    name = f"{_region_label(options.region)}_{options.start or 'all'}_{options.end or 'all'}"
+    name = f"{region_label(options.region)}_{options.start or 'all'}_{options.end or 'all'}"
     return name + ("_variations" if options.variations else "")
 
 
@@ -326,7 +311,7 @@ def _rows(q: WorkQueue, options: ScrapeOptions, tally: SampleTally, sampled: boo
     """CSV rows: every Variation that reached fetch, one Variation-1 row per Creative still in (or failed in) detail,
     and one `not_sampled` row per held Creative. Every row of a Creative carries the Creative's weight
     (`SampleTally.weight`, decided by its Variation 1)."""
-    region = _region_label(options.region)
+    region = region_label(options.region)
     listing: dict[str, dict] = {}
     fetched = q.items("fetch")
     # (row key, payload, fetch result, held)
@@ -429,15 +414,6 @@ def _progress_bars(q: WorkQueue, stage_names: list[str]) -> list[Bar]:
             if name == "list" else None
         bars.append(stage_bar(name, label, unit, total))
     return bars
-
-
-def _previous_stage_seconds(path: Path) -> dict:
-    try:
-        old = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    seconds = old.get("stage_seconds") if isinstance(old, dict) else None
-    return seconds if isinstance(seconds, dict) else {}
 
 
 def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult, tally: SampleTally, sampled: bool) -> dict:
@@ -555,7 +531,7 @@ def _scrape_run(options: ScrapeOptions, q: WorkQueue, *, client: TransparencyCli
     n = write_csv_atomic(csv_path, CSV_FIELDS, rows)
     summary_path = run / "summary.json"
     if not stages:  # nothing ran (`--stage export`): keep the stage times of the run that did the work
-        rr.stage_seconds = _previous_stage_seconds(summary_path)
+        rr.stage_seconds = previous_stage_seconds(summary_path)
     summary = build_summary(rows, q, rr, tally, sampled)
     write_json_atomic(summary_path, summary)
     pending_countries = 0

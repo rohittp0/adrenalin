@@ -14,3 +14,8 @@ def test_geo_id_to_region_round_trips():
     assert geo_id_to_region(2840) == "US"
     assert geo_id_to_region(region_to_geo_id("DE")) == "DE"
     assert geo_id_to_region(2999) is None and geo_id_to_region(1999) is None and geo_id_to_region(3000) is None
+
+
+def test_region_label():
+    from adrenalin.common.geo import region_label
+    assert (region_label("ANYWHERE"), region_label("in"), region_label("IN")) == ("anywhere", "IN", "IN")

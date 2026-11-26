@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 import unicodedata
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 
 
@@ -87,3 +87,34 @@ def write_json_atomic(path: Path, data: dict) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def previous_stage_seconds(path: Path) -> dict:
+    """`stage_seconds` of an earlier run's summary.json ({} when missing or malformed)."""
+    try:
+        old = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    seconds = old.get("stage_seconds") if isinstance(old, dict) else None
+    return seconds if isinstance(seconds, dict) else {}
+
+
+def cached_entity_name(out: Path, filename: str, entity_id: str, lookup: Callable[[], str | None]) -> str | None:
+    """An entity's name from `cache_dir(out)/filename` ({id: name}); on a miss `lookup()` runs and a non-empty
+    result is stored. None when there is no name."""
+    path = cache_dir(out) / filename
+    try:
+        known = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        known = {}
+    if not isinstance(known, dict):
+        known = {}
+    name = known.get(entity_id)
+    if isinstance(name, str) and name:
+        return name
+    name = lookup()
+    if not name:
+        return None
+    known[entity_id] = name
+    write_json_atomic(path, known)
+    return name

@@ -83,3 +83,29 @@ def test_write_json_atomic_writes_readable_utf8_json(tmp_path):
     assert "Café" in path.read_text(encoding="utf-8")
     assert json.loads(path.read_text(encoding="utf-8")) == {"name": "Café", "n": 1}
     assert [p.name for p in tmp_path.iterdir()] == ["x.json"]
+
+
+def test_cached_entity_name(tmp_path):
+    from adrenalin.common.output import cached_entity_name
+    calls = []
+
+    def lookup(name):
+        return lambda: calls.append(1) or name
+
+    assert cached_entity_name(tmp_path, "n.json", "1", lookup(None)) is None
+    assert not (tmp_path / ".cache" / "n.json").exists()  # a miss is not cached
+    assert cached_entity_name(tmp_path, "n.json", "1", lookup("Acme")) == "Acme"
+    assert cached_entity_name(tmp_path, "n.json", "1", lookup("Other")) == "Acme"  # hit: no lookup
+    assert len(calls) == 2
+    (tmp_path / ".cache" / "n.json").write_text("[1]")  # malformed cache is ignored
+    assert cached_entity_name(tmp_path, "n.json", "2", lookup("B")) == "B"
+
+
+def test_previous_stage_seconds(tmp_path):
+    from adrenalin.common.output import previous_stage_seconds
+    p = tmp_path / "summary.json"
+    assert previous_stage_seconds(p) == {}
+    p.write_text('{"stage_seconds": {"list": {"busy": 1.0}}}')
+    assert previous_stage_seconds(p) == {"list": {"busy": 1.0}}
+    p.write_text('{"stage_seconds": 3}')
+    assert previous_stage_seconds(p) == {}
