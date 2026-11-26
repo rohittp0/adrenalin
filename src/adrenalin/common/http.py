@@ -188,8 +188,9 @@ class PacedSession:
         self._default = default
         self._suffixes = sorted((k for k in self._hosts if k.startswith(".")), key=len, reverse=True)
         needs_browser = default.browser or any(p.browser for p in self._hosts.values())
-        self._playwright_session = (PlaywrightTransport(solve_captcha=solve_captcha, log=log, cookie_dir=cookie_dir)
-                                    if needs_browser else None)
+        self._playwright_session = (PlaywrightTransport(
+            policies=lambda host: self._policy(self.policy_key(host)),
+            solve_captcha=solve_captcha, log=log, cookie_dir=cookie_dir) if needs_browser else None)
         self._adaptive_state: dict[str, list[float]] = {}
         self._failure_streaks: dict[str, int] = {}
         self._cooldown = cooldown

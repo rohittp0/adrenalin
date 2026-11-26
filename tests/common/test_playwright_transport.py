@@ -1,7 +1,14 @@
 import pytest
 import requests
 
-from adrenalin.common.http import Blocked, Cooldown, HostPolicy, PacedSession
+from adrenalin.common.http import Blocked, Challenge, Cooldown, HostPolicy, PacedSession
+from adrenalin.tools.ads_transparency.hosts import GOOGLE_CHALLENGE
+
+GOOGLE_POLICY = HostPolicy(browser=True, challenge=GOOGLE_CHALLENGE)
+
+
+def google_policies(host):
+    return GOOGLE_POLICY
 
 
 def sorry(resp, read_body):
@@ -52,7 +59,7 @@ def test_transport_owns_one_thread_and_closes_after_error(monkeypatch):
     from threading import get_ident
     from adrenalin.common.playwright_http import PlaywrightTransport
 
-    transport = PlaywrightTransport()
+    transport = PlaywrightTransport(policies=google_policies)
     owners = []
     def request(method, url, kwargs):
         owners.append(get_ident())
@@ -81,7 +88,7 @@ def test_cleanup_stops_browser_even_when_context_close_fails():
     from types import SimpleNamespace
     from adrenalin.common.playwright_http import PlaywrightTransport
 
-    transport = PlaywrightTransport()
+    transport = PlaywrightTransport(policies=google_policies)
     closed = []
     def fail():
         raise RuntimeError('context already gone')
@@ -106,7 +113,7 @@ def test_javascript_fetch_error_classification(message, expected):
 
     def evaluate(*args):
         raise Error(message)
-    transport = PlaywrightTransport()
+    transport = PlaywrightTransport(policies=google_policies)
     transport._playwright = SimpleNamespace(stop=lambda: None)
     transport._browser = SimpleNamespace(close=lambda: None)
     transport._contexts[None] = SimpleNamespace(close=lambda: None)
@@ -125,7 +132,7 @@ def test_javascript_fetch_error_classification(message, expected):
 def test_captcha_handoff_replays_same_request_only_after_return(monkeypatch, solved):
     from types import SimpleNamespace
     from adrenalin.common.playwright_http import PlaywrightTransport
-    transport = PlaywrightTransport(solve_captcha=True)
+    transport = PlaywrightTransport(policies=google_policies, solve_captcha=True)
     blocked = requests.Response()
     blocked.status_code = 429
     blocked.url = 'https://www.google.com/sorry/index'
@@ -163,7 +170,7 @@ def test_captcha_handoff_replays_same_request_only_after_return(monkeypatch, sol
 def test_browser_switch_preserves_proxy_sessions_in_memory():
     from types import SimpleNamespace
     from adrenalin.common.playwright_http import PlaywrightTransport
-    transport = PlaywrightTransport(solve_captcha=True)
+    transport = PlaywrightTransport(policies=google_policies, solve_captcha=True)
     launches, restored, closed = [], [], []
     state = {'cookies': [{'name': 'exemption', 'value': 'test'}], 'origins': []}
     def context(**options):
@@ -194,13 +201,15 @@ def test_exemption_reused_after_restart_with_expiry_and_proxy_isolation(tmp_path
     from adrenalin.common.playwright_http import PlaywrightTransport
     cookie = dict(name='GOOGLE_ABUSE_EXEMPTION', value='test-exemption', domain='.google.com',
                   path='/', expires=time() + 600, httpOnly=True, secure=True, sameSite='None')
-    first = PlaywrightTransport(cookie_dir=tmp_path)
+    first = PlaywrightTransport(policies=google_policies, cookie_dir=tmp_path)
     try:
+        first._challenges[None] = [GOOGLE_CHALLENGE]
         first._save_exemption(None, {'cookies': [cookie, {**cookie, 'name': 'SID'}]})
     finally:
         first.close()
-    second = PlaywrightTransport(cookie_dir=tmp_path)
+    second = PlaywrightTransport(policies=google_policies, cookie_dir=tmp_path)
     try:
+        second._challenges[None] = second._challenges['http://proxy.test'] = [GOOGLE_CHALLENGE]
         assert second._load_exemption(None)['cookies'] == [cookie]
         assert second._load_exemption('http://proxy.test') is None
         assert second._cookie_path(None).stat().st_mode & 0o777 == 0o600
@@ -210,3 +219,68 @@ def test_exemption_reused_after_restart_with_expiry_and_proxy_isolation(tmp_path
         assert second._load_exemption(None) is None
     finally:
         second.close()
+
+
+def test_challenge_rule_comes_from_policy(monkeypatch):
+    from types import SimpleNamespace
+    from adrenalin.common.playwright_http import PlaywrightTransport
+    challenge = Challenge(shown=lambda url: '/blocked/' in url)
+    transport = PlaywrightTransport(policies=lambda host: HostPolicy(browser=True, challenge=challenge),
+                                    solve_captcha=True)
+    blocked = requests.Response()
+    blocked.status_code = 200
+    blocked.url = 'https://site.test/blocked/now'
+    success = requests.Response()
+    success.status_code = 200
+    success.url = 'https://site.test/rpc'
+    calls = []
+    def request(method, url, kwargs):
+        calls.append(url)
+        return blocked if len(calls) == 1 else success
+    page = SimpleNamespace(url=blocked.url, goto=lambda *a, **k: None, bring_to_front=lambda: None,
+                           is_closed=lambda: False, wait_for_load_state=lambda *a: None)
+    def tick(ms):
+        page.url = 'https://site.test/'
+    page.wait_for_timeout = tick
+    monkeypatch.setattr(transport, '_switch_browser', lambda **kw: None)
+    monkeypatch.setattr(transport, '_ensure_context', lambda proxy: None)
+    transport._pages[(None, 'https://site.test')] = page
+    monkeypatch.setattr(transport, '_request', request)
+    try:
+        assert transport.request('GET', 'https://site.test/rpc') is success
+        assert len(calls) == 2
+    finally:
+        transport.close()
+
+
+def test_host_without_challenge_never_hands_off(monkeypatch):
+    from adrenalin.common.playwright_http import PlaywrightTransport
+    transport = PlaywrightTransport(policies=lambda host: HostPolicy(browser=True), solve_captcha=True)
+    sorry_page = requests.Response()
+    sorry_page.status_code = 429
+    sorry_page.url = 'https://site.test/sorry/index'
+    switches = []
+    monkeypatch.setattr(transport, '_request', lambda method, url, kwargs: sorry_page)
+    monkeypatch.setattr(transport, '_switch_browser', lambda **kw: switches.append(kw))
+    try:
+        assert transport.request('GET', 'https://site.test/rpc') is sorry_page
+        assert switches == []
+    finally:
+        transport.close()
+
+
+def test_only_policy_cookies_persist(tmp_path):
+    from time import time
+    from adrenalin.common.playwright_http import PlaywrightTransport
+    challenge = Challenge(shown=lambda url: False, keep_cookies=frozenset({'KEEP'}),
+                          cookie_domains=frozenset({'site.test'}))
+    cookie = dict(name='KEEP', value='v', domain='.site.test', path='/', expires=time() + 600)
+    transport = PlaywrightTransport(policies=lambda host: HostPolicy(challenge=challenge), cookie_dir=tmp_path)
+    try:
+        transport._challenges[None] = [challenge]
+        transport._save_exemption(None, {'cookies': [
+            cookie, {**cookie, 'name': 'OTHER'}, {**cookie, 'expires': time() - 1},
+            {**cookie, 'domain': 'elsewhere.test'}]})
+        assert transport._load_exemption(None)['cookies'] == [cookie]
+    finally:
+        transport.close()

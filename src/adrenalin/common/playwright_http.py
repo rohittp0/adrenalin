@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from threading import Lock, Event
 from time import monotonic, time
+from typing import Callable
 from pathlib import Path
 import hashlib
 import json
@@ -20,7 +21,11 @@ from playwright.sync_api import Error, TimeoutError, sync_playwright
 
 
 class PlaywrightTransport:
-    def __init__(self, *, solve_captcha=False, log=None, cookie_dir=None):
+    def __init__(self, *, policies: Callable[[str], "HostPolicy"], solve_captcha=False, log=None, cookie_dir=None):
+        # policies(host) is the HostPolicy of a request host; its Challenge says what a CAPTCHA page
+        # looks like and which cookies to persist. A host without a Challenge never hands off.
+        self._policies = policies
+        self._challenges = {}  # proxy -> Challenges of the browser hosts used through it
         self._solve_captcha = solve_captcha
         self._log = log or (lambda message: None)
         self._stop = Event()
@@ -41,11 +46,18 @@ class PlaywrightTransport:
         key = hashlib.sha256((proxy or "direct").encode()).hexdigest()
         return self._cookie_dir / f"{key}.json"
 
-    @staticmethod
-    def _exemptions(state):
+    def _challenge(self, url):
+        return self._policies(urlparse(url).hostname or "").challenge
+
+    def _register(self, proxy, challenge):
+        if challenge is not None and all(challenge is not known for known in self._challenges.get(proxy, [])):
+            self._challenges.setdefault(proxy, []).append(challenge)
+
+    def _exemptions(self, proxy, state):
+        challenges = self._challenges.get(proxy, [])
         return [c for c in state.get("cookies", [])
-                if c.get("name") == "GOOGLE_ABUSE_EXEMPTION"
-                and c.get("domain", "").lstrip(".") in {"google.com", "adstransparency.google.com"}
+                if any(c.get("name") in ch.keep_cookies and c.get("domain", "").lstrip(".") in ch.cookie_domains
+                       for ch in challenges)
                 and isinstance(c.get("expires"), (int, float)) and c["expires"] > time()]
 
     def _load_exemption(self, proxy):
@@ -53,21 +65,21 @@ class PlaywrightTransport:
         if path is None:
             return None
         try:
-            cookies = self._exemptions(json.loads(path.read_text()))
+            cookies = self._exemptions(proxy, json.loads(path.read_text()))
             return {"cookies": cookies, "origins": []} if cookies else None
         except (OSError, ValueError, TypeError, AttributeError):
             return None
 
     def _save_exemption(self, proxy, state):
         path = self._cookie_path(proxy)
-        if path is None:
+        if path is None or not self._challenges.get(proxy):
             return
         temporary = None
         try:
             path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             fd, temporary = tempfile.mkstemp(dir=path.parent, prefix=".exemption-")
             with os.fdopen(fd, "w") as output:
-                json.dump({"cookies": self._exemptions(state), "origins": []}, output)
+                json.dump({"cookies": self._exemptions(proxy, state), "origins": []}, output)
             os.replace(temporary, path)  # mkstemp creates an owner-only file
         except OSError:
             self._log("warning: could not save CAPTCHA exemption for reuse")
@@ -94,8 +106,10 @@ class PlaywrightTransport:
         response = self._request(method, url, kwargs)
         if not self._solve_captcha:
             return response
-        blocked = "/sorry/" in response.url or "/sorry/" in response.headers.get("Location", "")
-        if self._solve_captcha and blocked:
+        challenge = self._challenge(url)
+        blocked = challenge is not None and (
+            challenge.shown(response.url) or challenge.shown(response.headers.get("Location", "")))
+        if blocked:
             origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
             proxy = kwargs.get("proxies", {}).get(urlparse(url).scheme)
             key = (proxy, origin)
@@ -105,7 +119,7 @@ class PlaywrightTransport:
             if page is None:
                 page = self._contexts[proxy].new_page()
                 self._pages[key] = page
-            # Navigate to the service root, not a POST RPC redirect URL. Google
+            # Navigate to the service root, not a POST RPC redirect URL. The site
             # supplies the challenge and returns here when the user completes it.
             page.goto(origin, wait_until="domcontentloaded", timeout=30000)
             page.bring_to_front()
@@ -116,7 +130,7 @@ class PlaywrightTransport:
                 if page.is_closed():
                     break
                 current = urlparse(page.url)
-                if f"{current.scheme}://{current.netloc}" == origin and "/sorry/" not in current.path:
+                if f"{current.scheme}://{current.netloc}" == origin and not challenge.shown(current.geturl()):
                     page.wait_for_load_state("domcontentloaded")
                     self._switch_browser(headed=False)
                     self._log("CAPTCHA completed; Chrome window closed. Resuming in the background.")
@@ -169,6 +183,8 @@ class PlaywrightTransport:
                 self._playwright = sync_playwright().start()
             proxies = kwargs.get("proxies", {})
             proxy = proxies.get(urlparse(url).scheme)
+            challenge = self._challenge(url)
+            self._register(proxy, challenge)
             self._ensure_context(proxy)
             origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
             key = (proxy, origin)
@@ -177,7 +193,7 @@ class PlaywrightTransport:
                 page = self._contexts[proxy].new_page()
                 self._pages[key] = page
                 response = page.goto(origin, wait_until="domcontentloaded", timeout=timeout)
-                if response.status != 200 or "/sorry/" in page.url:
+                if response.status != 200 or (challenge is not None and challenge.shown(page.url)):
                     result = requests.Response()
                     result.status_code = response.status
                     result.url = page.url

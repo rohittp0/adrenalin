@@ -45,3 +45,11 @@ Read-only RPCs retry timeouts and connection failures up to three total attempts
 through the normal pacing and cooldown checks. TLS errors are not retried. A browser
 `Failed to fetch` discards the affected page, keeping its context and cookies; the next
 attempt loads the service origin again so a stale page or CAPTCHA can be handled.
+
+## Revision: host rules live in the tool
+
+The `/sorry/` test, the `GOOGLE_ABUSE_EXEMPTION` cookie name and its domains no longer live in
+`common/`. They are `GOOGLE_CHALLENGE` in `tools/ads_transparency/hosts.py`, a `Challenge` on the
+host's `HostPolicy`. `PlaywrightTransport` asks the request host's policy whether a URL is a
+challenge page and which cookies (by name and domain) to persist; a host with no `Challenge` never
+triggers the handoff and persists no cookies. The Google behaviour above is unchanged.
