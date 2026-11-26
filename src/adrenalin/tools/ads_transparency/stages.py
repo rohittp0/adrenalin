@@ -13,8 +13,8 @@ from pathlib import Path
 import requests
 
 from adrenalin.common.cache import ExtractionCache
-from adrenalin.common.http import Blocked, PacedSession
-from adrenalin.common.listing import put_page, record_cursor
+from adrenalin.common.http import Blocked, PacedSession, get_ok
+from adrenalin.common.listing import FirstClaim, put_page, record_cursor, restart_expired_cursor
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import CodexRunner
 from adrenalin.common.output import write_bytes_atomic
@@ -144,7 +144,7 @@ class AdsStages:
         self.ctx = ctx
         self._lock = threading.Lock()
         self._oembed_warned = False
-        self._listed = False  # whether this run's list stage has claimed a page yet
+        self._first_claim = FirstClaim()  # a carried-over cursor can only be on the run's first page
 
     def warn(self, message: str) -> None:
         log.warning("%s", message)
@@ -179,8 +179,7 @@ class AdsStages:
     def list_page(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
         cursor = item.key.removeprefix("page:") or None
-        with self._lock:
-            resumed, self._listed = not self._listed, True
+        resumed = self._first_claim()
         try:
             page = ctx.client.search(ctx.query, cursor)
         except ValueError as e:
@@ -188,10 +187,7 @@ class AdsStages:
             # obtained in this run fails the item normally (retried on the next run).
             if not (cursor and resumed):
                 raise
-            log.info("list: cursor expired, restarting listing (%s)", e)
-            q.set_meta("seen_cursors", "{}")
-            put_page(q, "list", None)
-            return {"restarted": True}
+            return restart_expired_cursor(q, "list", e)
 
         estimate = page.count_high or page.count_low
         p = self._admit_probability(q, estimate, cursor)
@@ -289,12 +285,6 @@ class AdsStages:
 
     # -- fetch --------------------------------------------------------------
 
-    def _get_ok(self, url: str, *, retry_network: int = 0) -> requests.Response:
-        resp = self.ctx.session.get(url, allow_redirects=True, retry_network=retry_network)
-        if resp.status_code != 200:
-            raise requests.HTTPError(f"HTTP {resp.status_code} for {url}", response=resp)
-        return resp
-
     def fetch(self, item: Item, q: WorkQueue) -> dict:
         """Every listed Variation passes through fetch (Export reads its rows from here). Images are downloaded;
         content.js Previews are handed to the script stage."""
@@ -304,7 +294,7 @@ class AdsStages:
             rel = f"images/{image_name(p)}.png"
             path = self.ctx.entity / rel
             if not path.exists():
-                write_bytes_atomic(path, self._get_ok(p.url).content)
+                write_bytes_atomic(path, get_ok(self.ctx.session, p.url).content)
             result["image_file"] = rel
         elif p is not None:
             q.put("script", item.key, item.payload, update_payload=True)
@@ -320,7 +310,7 @@ class AdsStages:
         p = preview_from_dict(item.payload.get("preview"))
         reread = bool(item.payload.get(REREAD))
         try:
-            data = self._get_ok(p.url, retry_network=2).content
+            data = get_ok(self.ctx.session, p.url, retry_network=2).content
         except requests.RequestException as e:
             if not reread or item.attempts + 1 < q.max_attempts:  # `attempts` counts earlier claims
                 raise
@@ -418,7 +408,7 @@ class AdsStages:
                 rel = f"images/{image_name(alt)}.png"
                 path = ctx.entity / rel
                 if not path.exists():
-                    write_bytes_atomic(path, self._get_ok(alt.url).content)
+                    write_bytes_atomic(path, get_ok(self.ctx.session, alt.url).content)
                 copy = self._read_image(path, alt, fmt)
                 if not copy.preview_broken:
                     return copy, _Recovered(n, alt, rel), False, False
@@ -449,7 +439,7 @@ class AdsStages:
         except FileNotFoundError:
             # An in-flight item's file was lost (crash, cleanup): download it again. Stale reads of done rows never
             # get here without their file (see `api._reread_stale_content`).
-            data = self._get_ok(p.url, retry_network=2).content
+            data = get_ok(self.ctx.session, p.url, retry_network=2).content
         return data.decode("utf-8", errors="replace")
 
     def extract_done(self, item: Item, result: dict | None) -> None:

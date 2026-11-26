@@ -3,7 +3,7 @@ import requests
 
 import pytest
 
-from adrenalin.common.http import Blocked, Cooldown, HostPolicy, PacedSession
+from adrenalin.common.http import Blocked, Cooldown, HostPolicy, PacedSession, get_ok
 
 SORRY = "https://www.google.com/sorry/index"
 
@@ -547,3 +547,32 @@ def test_block_reason_is_logged(tmp_path, caplog):
     with pytest.raises(Blocked):
         e.session.get("https://a.com/x")
     assert any("custom reason" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
+
+
+def test_get_ok(tmp_path):
+    e = Env(tmp_path, [resp(200, b"x"), resp(410, url="https://a.com/x?sig=1"), resp(404)])
+    assert get_ok(e.session, "https://a.com/x").content == b"x"
+    assert e.calls[0][2]["allow_redirects"] is True
+    with pytest.raises(requests.HTTPError, match=r"^HTTP 410 for https://a.com/x$"):
+        get_ok(e.session, "https://a.com/x?sig=1", shown_url="https://a.com/x")
+    with pytest.raises(requests.HTTPError, match=r"^HTTP 404 for https://a.com/y\?q=1$"):
+        get_ok(e.session, "https://a.com/y?q=1")
+
+
+def test_block_puts_the_host_in_cooldown(tmp_path):
+    from adrenalin.common.http import AdaptivePace
+
+    e = Env(tmp_path, hosts={"a.com": HostPolicy(AdaptivePace(2.0, 1.0, 30.0))})
+    blocked = e.session.block("a.com", "3 errors in a row")
+    assert isinstance(blocked, Blocked) and blocked.host == "a.com"
+    assert e.cooldown.remaining("a.com", now=e.now) == 900 and e.session.interval("a.com") == 4.0
+    with pytest.raises(Blocked):
+        e.session.get("https://a.com/1")
+    assert e.calls == []
+
+
+def test_block_with_wait_on_block_waits_on_the_next_request(tmp_path):
+    e = Env(tmp_path, wait_on_block=True)
+    assert e.session.block("a.com", "3 errors in a row") is None
+    e.session.get("https://a.com/1")
+    assert e.sleeps and e.sleeps[0] >= 900 and len(e.calls) == 1

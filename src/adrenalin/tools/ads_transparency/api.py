@@ -7,13 +7,14 @@ import math
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date
 from pathlib import Path
 from typing import Literal
 
 from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.geo import region_label, region_to_geo_id
-from adrenalin.common.http import Cooldown, HostChecker, PacedSession, run_session
+from adrenalin.common.http import HostChecker, PacedSession, run_session
+from adrenalin.common.listing import restart_listing
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
 from adrenalin.common.output import (
@@ -238,9 +239,7 @@ def _prepare_queue(q: WorkQueue, options: ScrapeOptions, run: Path) -> None:
         done = q.get_meta("list_done")
         if done and (options.end is None or options.end >= date.fromisoformat(done)):
             log.info("list: window still open, listing again from page 1")
-            q.set_meta("list_done", "")  # an interrupted relist resumes instead of restarting
-            q.set_meta("seen_cursors", "{}")
-            q.requeue("list", ["page:"])
+            restart_listing(q, "list")
     _reread_stale_content(q, run, extract=options.stage in (None, "extract"), script=options.stage in (None, "fetch"))
     if options.stage not in (None, "extract"):
         return
@@ -565,10 +564,6 @@ def _log_summary(r: ScrapeResult, codex: CodexRunner) -> None:
         log.error("%s", e)
     if r.coverage is not None:
         log.info(f"Novelty repetition score {r.coverage:.3f} (not population Coverage)")
-
-
-def blocked_message(until: float) -> str:
-    return f"blocked until {datetime.fromtimestamp(until):%H:%M}"
 
 
 def incomplete_message(r: ScrapeResult) -> str:

@@ -783,7 +783,10 @@ def test_blocked_script_host_stops_listing_but_images_still_finish(tmp_path):
     clock = Clock()
     res = run_scrape(tmp_path, fake, session=make_session(tmp_path, fake, clock))
     assert res.blocked_until is not None
-    assert fake.calls["content_js"] == 1  # nothing more is sent to a host in cooldown
+    # Nothing more is sent to a host in cooldown, but up to 3 script workers (the stage's concurrency) can have
+    # passed the cooldown check before the first block is saved: the fake transport answers outside the pace gate
+    # and the frozen clock lets them all start at once.
+    assert 1 <= fake.calls["content_js"] <= 3
     rows = read_rows(res)
     images = [r for r in rows if r["image_file"]]
     assert images and all(r["extraction_method"] for r in images)  # fetch kept going

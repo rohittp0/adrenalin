@@ -2,7 +2,17 @@ import json
 
 import pytest
 
-from adrenalin.common.listing import PaginationLoop, page_key, put_page, record_cursor
+import threading
+
+from adrenalin.common.listing import (
+    FirstClaim,
+    PaginationLoop,
+    page_key,
+    put_page,
+    record_cursor,
+    restart_expired_cursor,
+    restart_listing,
+)
 from adrenalin.common.pipeline import WorkQueue
 
 
@@ -47,3 +57,38 @@ def test_record_cursor_accepts_the_old_list_format(q):
 
 def test_pagination_loop_is_a_value_error():
     assert issubclass(PaginationLoop, ValueError)
+
+
+def finish_listing(q):
+    put_page(q, "list", None)
+    q.complete("list", q.claim("list").key, {})
+    record_cursor(q, "page:", "CUR1")
+    put_page(q, "list", "CUR1")
+    q.complete("list", q.claim("list").key, {})
+    q.set_meta("list_done", "2026-11-26")
+
+
+def test_restart_listing_walks_from_page_one_again(q):
+    finish_listing(q)
+    restart_listing(q, "list")
+    assert q.get_meta("list_done") == "" and q.get_meta("seen_cursors") == "{}"
+    assert q.item("list", "page:").status == "pending" and q.item("list", "page:CUR1").status == "done"
+    record_cursor(q, "page:", "CUR1")  # the relist meets the same cursor again: not a loop
+
+
+def test_restart_expired_cursor_keeps_list_done(q):
+    finish_listing(q)
+    q.set_meta("list_done", "")  # mid-listing
+    assert restart_expired_cursor(q, "list", ValueError("bad cursor")) == {"restarted": True}
+    assert q.get_meta("seen_cursors") == "{}" and q.item("list", "page:").status == "pending"
+
+
+def test_first_claim_is_true_once_across_threads():
+    first = FirstClaim()
+    seen = []
+    threads = [threading.Thread(target=lambda: seen.append(first())) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(seen) == [False] * 7 + [True] and first() is False

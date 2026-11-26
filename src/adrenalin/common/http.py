@@ -386,6 +386,17 @@ class PacedSession:
                 continue
             return resp
 
+    def block(self, host: str, reason: str) -> Blocked | None:
+        """Put a host in cooldown for a block that no single response shows (e.g. a run of refused requests that
+        each look like an ordinary error), as a block response would: the host slows down and the cooldown is
+        saved. Returns the `Blocked` for the caller to raise, or None with `wait_on_block`: the next request to
+        the host then waits the cooldown out."""
+        host = self.policy_key(host)
+        self._record(host, clean=False, immediate=True, reason=reason)
+        until = self._block(host, 0.0)
+        log.warning("%s: %s; treated as a block", host, reason)
+        return None if self._wait_on_block else Blocked(host, until)
+
     def derive(self, *, wait_on_block: bool | None = None, max_retries: int | None = None) -> PacedSession:
         """A new session sharing this one's cooldown, host policies, proxies, transport, sleep and clock,
         with its own block/retry policy and its own pacing state. Close it separately."""
@@ -409,6 +420,15 @@ class PacedSession:
         self._session.close()
         if self._playwright_session is not None:
             self._playwright_session.close()
+
+
+def get_ok(session: PacedSession, url: str, *, retry_network: int = 0, shown_url: str | None = None) -> requests.Response:
+    """GET following redirects; raise `requests.HTTPError("HTTP <status> for <url>")` unless the status is 200.
+    `shown_url` replaces the URL in that message (e.g. without an expiring signature)."""
+    resp = session.get(url, allow_redirects=True, retry_network=retry_network)
+    if resp.status_code != 200:
+        raise requests.HTTPError(f"HTTP {resp.status_code} for {shown_url or url}", response=resp)
+    return resp
 
 
 def run_session(out: Path, hosts: Mapping[str, HostPolicy], *, default: HostPolicy = HostPolicy(),
