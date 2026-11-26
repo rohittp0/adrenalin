@@ -76,3 +76,30 @@ def test_nested_run_logs_each_get_own_file(tmp_path):
         log.info("outer")
     assert "inner" in (a / "run.log").read_text() and "inner" in (b / "run.log").read_text()
     assert "outer" in (a / "run.log").read_text() and "outer" not in (b / "run.log").read_text()
+
+
+def test_run_log_leaves_root_handlers_at_their_level(tmp_path):
+    seen = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            seen.append(record.getMessage())
+
+    root, lg = logging.getLogger(), logging.getLogger(LOGGER)
+    handler, saved = Collect(), root.level
+    root.addHandler(handler)
+    root.setLevel(logging.WARNING)  # a library caller's basicConfig(level=WARNING)
+    try:
+        assert lg.level == logging.NOTSET and lg.propagate
+        with run_log(tmp_path) as path:
+            log = logging.getLogger("adrenalin.x")
+            log.debug("d")
+            log.info("i")
+            log.warning("w")
+            log.error("e")
+        assert seen == ["w", "e"]
+        assert [line.split(": ", 1)[1] for line in path.read_text().splitlines()] == ["d", "i", "w", "e"]
+        assert lg.level == logging.NOTSET and lg.propagate and len(lg.handlers) == 0
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(saved)

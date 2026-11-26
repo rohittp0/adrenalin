@@ -68,16 +68,38 @@ def console_logging(verbose: bool = False) -> Iterator[None]:
                 _console = None
 
 
+class _Propagate(logging.Handler):
+    """Hands records on to the parent loggers' handlers, as propagation would, from `level` up."""
+
+    def __init__(self, logger: logging.Logger, level: int):
+        super().__init__(level)
+        self._parent = logger.parent
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if self._parent is not None:
+            self._parent.callHandlers(record)
+
+
 @contextmanager
 def run_log(run_dir: Path) -> Iterator[Path]:
-    """Append everything the `adrenalin` logger emits to `run_dir/run.log` for the duration."""
+    """Append everything the `adrenalin` logger emits to `run_dir/run.log` for the duration.
+
+    When the logger has no level of its own, it is lowered to DEBUG for the file, and the parent loggers' handlers
+    (a library caller's `basicConfig`) still get only what they got before: records from the logger's previous
+    effective level up."""
     logger = logging.getLogger(LOGGER)
     path = Path(run_dir) / "run.log"
     handler = logging.FileHandler(path, mode="a", encoding="utf-8")
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-    previous = logger.level
-    if previous == logging.NOTSET:
+    lowered = logger.level == logging.NOTSET
+    forward: logging.Handler | None = None
+    propagate = logger.propagate
+    if lowered:
+        if propagate:
+            forward = _Propagate(logger, logger.getEffectiveLevel())
+            logger.addHandler(forward)
+            logger.propagate = False
         logger.setLevel(logging.DEBUG)
     logger.addHandler(handler)
     try:
@@ -85,5 +107,8 @@ def run_log(run_dir: Path) -> Iterator[Path]:
     finally:
         logger.removeHandler(handler)
         handler.close()
-        if previous == logging.NOTSET:
+        if lowered:
             logger.setLevel(logging.NOTSET)
+            if forward is not None:
+                logger.removeHandler(forward)
+                logger.propagate = propagate

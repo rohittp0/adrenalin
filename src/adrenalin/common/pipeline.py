@@ -196,6 +196,8 @@ class RunResult:
     # all failed items in the queue, including ones exhausted in earlier runs
     failed: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    # the `fatal` exceptions that stopped the run, for callers to tell them apart by type
+    fatal: list[Exception] = field(default_factory=list)
     # per stage: `busy` (time in workers, summed across threads) and `waiting` (throttle and empty-queue waits)
     stage_seconds: dict[str, dict[str, float]] = field(default_factory=dict)
 
@@ -204,7 +206,8 @@ class Pipeline:
     def __init__(self, queue: WorkQueue, stages: Sequence[Stage], *, poll: float = 0.2,
                  clock: Callable[[], float] = time.monotonic, fatal: tuple[type[Exception], ...] = ()):
         """`fatal`: worker exception types that no retry of another item can get past (e.g. a request the
-        service no longer accepts). One releases its item, stops every stage and goes to `RunResult.errors`."""
+        service no longer accepts). One releases its item, stops every stage and goes to `RunResult.errors` and
+        `RunResult.fatal`; it is logged at DEBUG only, since the tool reports it in its own words."""
         names = [s.name for s in stages]
         if len(set(names)) != len(names):
             raise ValueError(f"stage names must be unique: {names}")
@@ -292,9 +295,10 @@ class Pipeline:
                 except self.fatal as exc:
                     q.release(name, item.key)
                     msg = f"{name}: {type(exc).__name__}: {exc}"
-                    log.error("%s", msg)
+                    log.debug("%s", msg)
                     with state_lock:
                         result.errors.append(msg)
+                        result.fatal.append(exc)
                     for event in stopped.values():
                         event.set()
                     return

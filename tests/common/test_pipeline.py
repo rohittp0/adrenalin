@@ -374,7 +374,7 @@ class _Fatal(Exception):
     pass
 
 
-def test_fatal_error_stops_all_stages(tmp_path):
+def test_fatal_error_stops_all_stages(tmp_path, caplog):
     # A fatal worker error (e.g. a changed API query) can't be fixed by retrying other items: every stage stops,
     # the item is released (not failed) and the error is reported.
     q = WorkQueue(tmp_path / "q.sqlite3")
@@ -396,6 +396,8 @@ def test_fatal_error_stops_all_stages(tmp_path):
     result = Pipeline(q, [Stage("A", a), Stage("C", c)], poll=0.01, fatal=(_Fatal,)).run()
     assert threading.active_count() == baseline
     assert result.errors == ["A: _Fatal: query gone"]
+    assert [type(e) for e in result.fatal] == [_Fatal]  # callers tell fatal errors apart by type
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]  # the tool reports it, not the pipeline
     assert result.failed == {} and q.count("A", "failed") == 0
     assert q.count("A", "pending") == 5  # the item that raised is released
     assert q.backlog("C") > 0  # the unrelated stage stopped too
