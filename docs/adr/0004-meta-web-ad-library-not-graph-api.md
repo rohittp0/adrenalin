@@ -4,10 +4,12 @@ Meta's official Ad Library API (`graph.facebook.com/ads_archive`) needs a verifi
 
 ## What the capture probe established (2026-11-26, MakeMyTrip, page 120740541030)
 
-- A POST to `/api/graphql/` with only `lsd`, `doc_id` and `variables` (plus `__a=1`) works from a page on www.facebook.com. The `lsd` token is in the Ad Library HTML. The `doc_id`s are not: they come from JS bundles and change when Meta deploys, so the tool hard-codes them and treats `"The GraphQL document with ID … was not found."` as a distinct error that tells you to update them.
+- A POST to `/api/graphql/` with `doc_id`, `variables` and `__a=1` works through `PacedSession`'s Playwright transport, from a page on the bare `https://www.facebook.com/` origin. The `lsd` token is not checked for logged-out requests: an empty or wrong one returns normal data. A null cursor returns page 1, so the whole listing is GraphQL.
+- The `doc_id`s are not in the HTML: they come from JS bundles and change when Meta deploys. The tool hard-codes them and treats `"The GraphQL document with ID … was not found."` as a distinct error that tells you to update them.
 - Every response is `text/html`, and errors are HTTP 200 with an `errors` array, so success and block detection parse the body and never trust the status or content type.
-- GraphQL pages hold 10 Creatives. The Inventory count (`count`) is only in the Ad Library HTML, which also embeds the first 30 Creatives and their cursor.
-- The listing already carries copy, Cards, DCO Variations, Collation group, dates, platforms and media URLs. Only EU reach needs the per-Creative Detail request.
+- GraphQL pages hold 10 Creatives, and there is no Inventory count in them. The count (`~920 results`) appears only in the Ad Library HTML, and an in-page `fetch` of that HTML gets HTTP 403: it works only as a real navigation. So runs carry no Inventory estimate. Completeness comes from `has_next_page`.
+- The `startDate` variable (`{"min": "YYYY-MM-DD", "max": "YYYY-MM-DD"}`) filters by Shown period: March 2023 returned exactly the one Creative that ran 2023-03-05 to 03-06.
+- The listing already carries copy, Cards, DCO Variations, Collation group, dates, platforms and media URLs. Only EU reach needs the per-Creative Detail request. fbcdn media download with plain `requests`.
 
 ## Considered options
 
@@ -17,4 +19,5 @@ Meta's official Ad Library API (`graph.facebook.com/ads_archive`) needs a verifi
 ## Consequences
 
 - We don't yet know what Meta sends when it refuses a logged-out client under load: the run-to-block probe was declined so that the office IP isn't put at risk. Until a real run hits one, any GraphQL answer that isn't a JSON `data` object, and any redirect off the Ad Library, is treated as a block, and the full response goes to `run.log`.
+- A redirect to `/login` or `/checkpoint` is a block, never a challenge for `--solve-captcha`: solving it would mean logging in, and the scraper would then run under someone's Facebook account. The Meta host gets a `Challenge` only once a real logged-out checkpoint has been seen.
 - When Meta changes the `doc_id`s, runs fail until the constants are updated.
