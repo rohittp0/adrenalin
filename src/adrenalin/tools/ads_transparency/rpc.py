@@ -275,8 +275,8 @@ class TransparencyClient:
                     },
                 )
                 break
-            except requests.Timeout:
-                if attempt == 2:
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                if isinstance(exc, requests.exceptions.SSLError) or attempt == 2:
                     raise
         if resp.status_code != 200:
             # A JSON error body would otherwise parse as an empty last page and truncate the listing.

@@ -207,15 +207,17 @@ def test_preview_ids_reads_account_and_ad_group():
     assert preview_ids("https://tpc.googlesyndication.com/simgad/123") == ("", "")
 
 
+@pytest.mark.parametrize('operation', ['search', 'detail'])
+@pytest.mark.parametrize('error', [requests.Timeout, requests.ConnectionError])
 @pytest.mark.parametrize('failures', [1, 3])
-def test_rpc_timeout_retries_same_cursor_bounded(failures):
+def test_rpc_transient_retries_same_request_bounded(failures, error, operation):
     class Session:
         def __init__(self):
             self.calls = []
         def post(self, url, **kwargs):
             self.calls.append((url, kwargs))
             if len(self.calls) <= failures:
-                raise requests.Timeout('signal timed out')
+                raise error('fetch failed')
             r = requests.Response()
             r.status_code = 200
             r._content = b'{"1": []}'
@@ -223,11 +225,14 @@ def test_rpc_timeout_retries_same_cursor_bounded(failures):
     session = Session()
     client = TransparencyClient(session)
     query = Query('AR123', None, None, None)
+    def invoke():
+        return client.search(query, 'saved-cursor') if operation == 'search' else client.detail('AR123', 'CR123')
     if failures == 3:
-        with pytest.raises(requests.Timeout):
-            client.search(query, 'saved-cursor')
+        with pytest.raises(error):
+            invoke()
     else:
-        assert client.search(query, 'saved-cursor').creatives == []
+        result = invoke()
+        assert result.creatives == [] if operation == 'search' else result == {'1': []}
     assert len(session.calls) == min(failures + 1, 3)
     assert all(call == session.calls[0] for call in session.calls)
 

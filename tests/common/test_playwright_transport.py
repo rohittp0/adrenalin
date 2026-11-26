@@ -107,10 +107,12 @@ def test_javascript_fetch_error_classification(message, expected):
     transport._browser = SimpleNamespace(close=lambda: None)
     transport._contexts[None] = SimpleNamespace(close=lambda: None)
     transport._pages[(None, 'https://example.test')] = SimpleNamespace(
-        expect_response=lambda *args, **kwargs: nullcontext(), evaluate=evaluate)
+        expect_response=lambda *args, **kwargs: nullcontext(), evaluate=evaluate, close=lambda: None)
     try:
         with pytest.raises(expected):
             transport.request('POST', 'https://example.test/rpc', data={'f.req': '{}'})
+        if expected is requests.ConnectionError:
+            assert (None, 'https://example.test') not in transport._pages
     finally:
         transport.close()
 

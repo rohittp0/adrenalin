@@ -40,3 +40,8 @@ No CAPTCHA is solved automatically. The unexpired `GOOGLE_ABUSE_EXEMPTION` cooki
 is persisted in owner-only files under the output cache, separated by proxy, and
 restored on restart. Other cookies and local storage are not persisted. Expiry is
 checked before restore; Google can still reject an exemption, for example after an IP change.
+
+Read-only RPCs retry timeouts and connection failures up to three total attempts,
+through the normal pacing and cooldown checks. TLS errors are not retried. A browser
+`Failed to fetch` discards the affected page, keeping its context and cookies; the next
+attempt loads the service origin again so a stale page or CAPTCHA can be handled.

@@ -5,6 +5,7 @@ thread. Fresh browser contexts are retained per proxy and closed with the
 transport. User browser profiles and cookies are never imported.
 """
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from threading import Lock, Event
 from time import monotonic, time
 from pathlib import Path
@@ -160,6 +161,9 @@ class PlaywrightTransport:
         self._headed = headed
 
     def _request(self, method, url, kwargs):
+        proxy = kwargs.get("proxies", {}).get(urlparse(url).scheme)
+        origin = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        key = (proxy, origin)
         try:
             if self._playwright is None:
                 self._playwright = sync_playwright().start()
@@ -215,6 +219,13 @@ class PlaywrightTransport:
             # which Playwright wraps in Error rather than its TimeoutError class.
             if "TimeoutError: signal timed out" in str(exc):
                 raise requests.Timeout(str(exc)) from exc
+            if "TypeError: Failed to fetch" in str(exc):
+                # Reload the service origin on the next paced RPC attempt. A stale
+                # page or hidden block must not poison every subsequent Creative.
+                page = self._pages.pop(key, None)
+                if page is not None:
+                    with suppress(Error):
+                        page.close()
             raise requests.ConnectionError(str(exc)) from exc
 
     def _dispose(self):
