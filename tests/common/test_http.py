@@ -186,8 +186,8 @@ def _checker_env(tmp_path, outcomes):
         return out if isinstance(out, requests.Response) else resp(out, url=url)
 
     cache = ExtractionCache(tmp_path / "x.sqlite3")
-    session = PacedSession(Cooldown(tmp_path / "cd.sqlite"), {}, transport=transport, sleep=lambda s: None,
-                           max_retries=0)
+    session = PacedSession(Cooldown(tmp_path / "cd.sqlite"), {}, default=HostPolicy(blocked=sorry_block),
+                           transport=transport, sleep=lambda s: None, max_retries=0)
     return HostChecker(session, cache), cache, session, calls
 
 
@@ -216,6 +216,8 @@ def test_host_checker_counts_a_block_page_as_existing(tmp_path):
     check, cache, _, calls = _checker_env(tmp_path, {"google.com": resp(302, headers={"Location": SORRY})})
     try:
         assert check("google.com") and len(calls) == 1
+        # reached via the Blocked branch: a block page did not "answer", so nothing is cached as existing
+        assert cache.get("domain:google.com", "domain") is None
     finally:
         cache.close()
 
