@@ -136,6 +136,9 @@ class PlaywrightTransport:
                     page.wait_for_load_state("domcontentloaded")
                     self._switch_browser(headed=False)
                     log.info("CAPTCHA completed; Chrome window closed. Resuming in the background.")
+                    # Only the replay reaches PacedSession: a solved challenge
+                    # must not slow its adaptive pace or create a host cooldown.
+                    # A replay that is still blocked/rate-limited is handled normally.
                     return self._request(method, url, kwargs)
                 page.wait_for_timeout(500)
             self._pages.pop(key, None)

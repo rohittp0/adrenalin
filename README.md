@@ -41,6 +41,7 @@ uv run adrenalin ads-transparency AR04752318142645010433 --region IN --days 7
 | `--max-ads N` | Stratified target size (default 2,000); minimum representation can exceed it. Novelty mode: approximate copy-read cap |
 | `--all` | Read every Creative's copy, however large the Inventory |
 | `--wait-on-block` | Wait out a Google block instead of exiting |
+| `--phase SECONDS` | Pin listing/country/detail request spacing to any positive finite number of seconds (e.g. `--phase 1.5`), without jitter or adaptation. Overrides the adaptive floor; cooldowns still apply. Omit for adaptive pacing. |
 | `--stage list\|fetch\|extract\|export` | Run one stage only |
 | `--proxy URL` | Proxy, repeatable to rotate |
 | `-p`, `--progress` | Progress bars: creatives done (Google's estimated total until the listing finishes, then exact) with rate and ETA, plus one bar per stage |

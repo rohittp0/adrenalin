@@ -2,7 +2,8 @@ import pytest
 import requests
 
 from adrenalin.common.http import Blocked, Challenge, Cooldown, HostPolicy, PacedSession
-from adrenalin.tools.ads_transparency.hosts import GOOGLE_CHALLENGE
+from adrenalin.tools.ads_transparency.hosts import GOOGLE_CHALLENGE, HOSTS
+from adrenalin.tools.ads_transparency.rpc import DETAIL_URL, HOST
 
 GOOGLE_POLICY = HostPolicy(browser=True, challenge=GOOGLE_CHALLENGE)
 
@@ -165,6 +166,58 @@ def test_captcha_handoff_replays_same_request_only_after_return(monkeypatch, sol
             assert calls[0] == calls[1]
     finally:
         transport.close()
+
+
+@pytest.mark.parametrize('outcome', ['solved', 'unsolved', 'rate_limited_after_solve'])
+def test_captcha_handoff_preserves_adaptive_pace_only_when_successful(tmp_path, monkeypatch, outcome):
+    from types import SimpleNamespace
+
+    now = 0.0
+    def sleep(seconds):
+        nonlocal now
+        now += seconds
+
+    session = PacedSession(Cooldown(tmp_path / 'cooldown.db'), HOSTS, solve_captcha=True,
+                           clock=lambda: now, sleep=sleep, rng=lambda: 0.5, max_retries=0)
+    transport = session._playwright_session
+    success = requests.Response()
+    success.status_code = 200
+    success.url = DETAIL_URL
+    success._content = b'{}'
+    blocked = requests.Response()
+    blocked.status_code = 429
+    blocked.url = 'https://www.google.com/sorry/index'
+    limited = requests.Response()
+    limited.status_code = 429
+    limited.url = DETAIL_URL
+    blocked._content = b'challenge'
+    limited._content = b'rate limited'
+    origin = f'https://{HOST}'
+    page = SimpleNamespace(url=blocked.url, goto=lambda *a, **k: None,
+                           bring_to_front=lambda: None, is_closed=lambda: outcome == 'unsolved',
+                           wait_for_load_state=lambda *a: None)
+    page.wait_for_timeout = lambda ms: setattr(page, 'url', origin)
+    monkeypatch.setattr(transport, '_switch_browser', lambda **kw: None)
+    monkeypatch.setattr(transport, '_ensure_context', lambda proxy: None)
+    monkeypatch.setattr(transport, '_request', lambda *a: success)
+    try:
+        for _ in range(20):
+            session.post(DETAIL_URL)
+        before = session.interval(HOST)
+        assert before == pytest.approx(2.7)
+        transport._pages[(None, origin)] = page
+        replies = iter([blocked, limited if outcome == 'rate_limited_after_solve' else success])
+        monkeypatch.setattr(transport, '_request', lambda *a: next(replies))
+        if outcome == 'solved':
+            assert session.post(DETAIL_URL) is success
+            assert session.interval(HOST) == before
+            assert session._cooldown.remaining(HOST, now=now) == 0
+        else:
+            with pytest.raises(Blocked):
+                session.post(DETAIL_URL)
+            assert session.interval(HOST) == before * 2
+    finally:
+        session.close()
 
 
 def test_browser_switch_preserves_proxy_sessions_in_memory():

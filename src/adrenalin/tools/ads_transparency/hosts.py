@@ -6,7 +6,9 @@ import requests
 from adrenalin.common.http import AdaptivePace, Challenge, HostPolicy
 from adrenalin.tools.ads_transparency.rpc import HOST
 
-RPC_INTERVAL = (6.0, 2.0)
+# Listing and country/detail lookups share feedback on this host. Keep at least
+# 1.2 s between starts, including jitter.
+RPC_PACE = AdaptivePace(3.0, 1.2, 30.0)
 # content.js previously blocked at 0.5 s: accelerate cautiously and back off on errors.
 SCRIPT_HOST = "displayads-formats.googleusercontent.com"
 SCRIPT_PACE = AdaptivePace(2.5, 1.5, 15.0, clean_streak=30)
@@ -33,7 +35,7 @@ GOOGLE_CHALLENGE = Challenge(
 )
 
 HOSTS: dict[str, HostPolicy] = {
-    HOST: HostPolicy(RPC_INTERVAL, browser=True, blocked=google_block, challenge=GOOGLE_CHALLENGE),
+    HOST: HostPolicy(RPC_PACE, browser=True, blocked=google_block, challenge=GOOGLE_CHALLENGE),
     SCRIPT_HOST: HostPolicy(SCRIPT_PACE, blocked=google_block),
     IMAGE_HOST: HostPolicy(IMAGE_PACE, blocked=google_block),
 }

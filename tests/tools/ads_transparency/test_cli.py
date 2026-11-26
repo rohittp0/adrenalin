@@ -50,6 +50,30 @@ def test_cli_progress_flag(monkeypatch):
     assert seen[0].progress
 
 
+@pytest.mark.parametrize("phase", ["0.2", "1.5", "8"])
+def test_cli_phase_reaches_session_factory(monkeypatch, tmp_path, phase):
+    seen = []
+    def factory(*args, **kwargs):
+        seen.append(kwargs["phase"])
+        raise ValueError("stop before network")
+    monkeypatch.setattr(api, "make_session", factory)
+    assert main(["ads-transparency", "AR1", "--phase", phase, "--out", str(tmp_path)]) == 1
+    assert seen == [float(phase)]
+
+
+@pytest.mark.parametrize("phase", ["0", "-1", "nan", "inf", "-inf"])
+def test_phase_rejects_invalid_values(monkeypatch, tmp_path, phase):
+    seen = capture(monkeypatch)
+    with pytest.raises(SystemExit) as error:
+        main(["ads-transparency", "AR1", f"--phase={phase}"])
+    assert error.value.code == 2
+    assert not seen
+    with pytest.raises(ValueError, match="positive finite"):
+        api.ScrapeOptions("AR1", phase=float(phase))
+    with pytest.raises(ValueError, match="positive finite"):
+        api.make_session(tmp_path, phase=float(phase))
+
+
 def test_cli_rejects_days_with_start():
     with pytest.raises(SystemExit) as e:
         main(["ads-transparency", "AR1", "--days", "7", "--start", "2026-11-01"])

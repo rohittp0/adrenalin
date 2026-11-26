@@ -6,7 +6,7 @@ import logging
 import math
 from collections import Counter
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date
 from pathlib import Path
 from typing import Literal
@@ -33,6 +33,7 @@ from adrenalin.tools.ads_transparency.copy import (  # noqa: F401
 )
 from adrenalin.tools.ads_transparency.hosts import DEFAULT, HOSTS
 from adrenalin.tools.ads_transparency.rpc import (
+    HOST,
     ListedCreative,
     Query,
     TransparencyClient,
@@ -97,8 +98,10 @@ class ScrapeOptions:
     coverage: float = 0.95
     max_ads: int | None = None
     countries: bool = True  # Shown countries of the weighted Copy sample (`--no-countries` skips them)
+    phase: float | None = None  # fixed RPC spacing in seconds; None keeps adaptive pacing
 
     def __post_init__(self) -> None:
+        _validate_phase(self.phase)
         if self.sampling_mode not in {"stratified", "novelty"}:
             raise ValueError("sampling_mode must be stratified or novelty")
         if not 0 < self.coverage < 1:
@@ -125,9 +128,16 @@ class ScrapeResult:
     countries_pending: int = 0  # Copy-sample Creatives whose Shown countries are not fetched yet
 
 
+def _validate_phase(phase: float | None) -> None:
+    if phase is not None and (not math.isfinite(phase) or phase <= 0):
+        raise ValueError("phase must be a positive finite number of seconds")
+
+
 def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False, *,
-                 solve_captcha: bool = False) -> PacedSession:
-    return run_session(out, HOSTS, default=DEFAULT, proxies=proxies, wait_on_block=wait_on_block,
+                 solve_captcha: bool = False, phase: float | None = None) -> PacedSession:
+    _validate_phase(phase)
+    hosts = HOSTS if phase is None else {**HOSTS, HOST: replace(HOSTS[HOST], pace=(phase, 0.0))}
+    return run_session(out, hosts, default=DEFAULT, proxies=proxies, wait_on_block=wait_on_block,
                        solve_captcha=solve_captcha)
 
 
@@ -470,7 +480,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
     own_session = session is None
     if own_session:
         session = make_session(options.out, options.proxies, options.wait_on_block,
-                               solve_captcha=options.solve_captcha)
+                               solve_captcha=options.solve_captcha, phase=options.phase)
     # oEmbed and the OCR domain check are optional: they must never wait out a block or back off,
     # whatever --wait-on-block says.
     oembed = session.derive(wait_on_block=False, max_retries=0)

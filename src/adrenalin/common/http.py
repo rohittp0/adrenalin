@@ -129,7 +129,8 @@ def _retry_after_seconds(value: str, now: float) -> float:
 class AdaptivePace:
     """A host's pace that adapts: `speedup` x after `clean_streak` clean responses in a row (down to
     `floor`). A 429 or block slows immediately; `failure_streak` consecutive network/5xx
-    failures slow by `slowdown` (up to `ceiling`). Intervals are in seconds."""
+    failures slow by `slowdown` (up to `ceiling`). Jitter never reduces request-start
+    spacing below `floor`. Intervals are in seconds."""
     start: float
     floor: float
     ceiling: float
@@ -302,6 +303,8 @@ class PacedSession:
             last = self._last.get(host)
             if last is not None:
                 delay = base - jitter + 2 * jitter * self._rng()
+                if adaptive is not None:
+                    delay = max(adaptive[0].floor, delay)
                 wait = last + delay - self._clock()
                 if wait > 0:
                     self._sleep(wait)

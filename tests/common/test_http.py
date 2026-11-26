@@ -336,6 +336,18 @@ def test_adaptive_speeds_up_after_clean_streak(tmp_path):
     assert e.session.interval("img.com") == pytest.approx(0.2)
 
 
+@pytest.mark.parametrize("rng", [0.0, 0.5, 1.0])
+def test_adaptive_jitter_respects_floor_through_acceleration(tmp_path, rng):
+    e = Env(tmp_path, hosts={"rpc.test": HostPolicy(AdaptivePace(3.0, 1.2, 30.0))},
+            rng=lambda: rng)
+    starts = []
+    for _ in range(200):
+        e.session.post("https://rpc.test/detail")
+        starts.append(e.now)
+    assert e.session.interval("rpc.test") == 1.2
+    assert all(b - a >= 1.2 - 1e-9 for a, b in zip(starts, starts[1:]))
+
+
 def test_adaptive_slows_immediately_on_429_but_requires_three_5xx(tmp_path):
     e = _adaptive_env(tmp_path, start=0.5)
     for expected in (0.5, 0.5, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 4.0):

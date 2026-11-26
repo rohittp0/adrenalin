@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 
 from adrenalin.common.cli import add_period_arguments, add_run_arguments, finish, resolve_period, run_cli
 from adrenalin.common.ocr import OcrUnavailable
@@ -30,6 +31,8 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
     p.add_argument("--no-countries", action="store_false", dest="countries",
                    help="skip Shown countries (one extra request per Creative in the Copy sample)")
     p.add_argument("--stage", choices=("list", "fetch", "extract", "export"), help="run one stage only")
+    p.add_argument("--phase", type=float, metavar="SECONDS",
+                   help="pin listing/country/detail request spacing to positive SECONDS; disables adaptation and jitter")
     add_period_arguments(p)
     add_run_arguments(p)
     p.set_defaults(_parser=p)
@@ -38,6 +41,8 @@ def add_arguments(p: argparse.ArgumentParser) -> None:
 def run(args: argparse.Namespace) -> int:
     parser: argparse.ArgumentParser = args._parser
     start, end = resolve_period(args, parser)
+    if args.phase is not None and (not math.isfinite(args.phase) or args.phase <= 0):
+        parser.error("--phase must be a positive finite number of seconds")
     if args.vision_limit < 0:
         parser.error("--vision-limit must be 0 or more")
     if not 0 < args.coverage < 1:
@@ -52,7 +57,7 @@ def run(args: argparse.Namespace) -> int:
         solve_captcha=args.solve_captcha,
         out=args.out, proxies=tuple(args.proxies), progress=args.progress,
         sampling_mode=args.sampling, read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
-        countries=args.countries,
+        countries=args.countries, phase=args.phase,
     )
 
     def body() -> int:

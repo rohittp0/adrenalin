@@ -10,6 +10,31 @@ Scraping tools run as independent stages (List → Fetch → Extract → Export)
 - A blocked stage also stops every stage that throttles on it. Otherwise the upstream stage is no longer held back by a backlog that cannot drain, and races ahead into a block of its own. The first live run (Rio, 2026-11-19) did exactly that: the List stage was blocked about 85 s after the content.js host. Stages that don't wait on the blocked one keep going.
 - Downloads from hosts that are blocked separately get separate stages (Fetch for `simgad` images, Script for `content.js`), so a block on one host doesn't stop the other's downloads. This holds for downloads done again too: a content.js read by an older parser whose script was deleted goes back through Script, never downloaded inside Extract, which every stage throttles on.
 
+## RPC throughput
+
+Listing and country/detail lookups share an adaptive host pace, replacing the
+original fixed 6-second base. It starts at 3 seconds, reduces the interval by 10%
+after 20 clean responses, and stops accelerating at a user-selected 1.2-second
+base. A CAPTCHA successfully solved during
+the browser handoff preserves the current pace: only the replayed response reaches
+the pacing controller. An unresolved CAPTCHA/block or a 429 (including one after
+solving) doubles the interval immediately; three consecutive network/5xx failures also
+double it, up to 30 seconds. Existing Retry-After, cooldown, CAPTCHA handling and
+pipeline backpressure remain in force. Adaptive jitter is ±30% of the base,
+clamped so request starts remain at least 1.2 seconds apart. The shared pacing
+controller likewise respects each adaptive host's configured floor after jitter.
+Pace changes are logged; each new session starts at 3 seconds again, while
+persisted host cooldown deadlines survive restarts. Live throughput and Google's
+tolerance of the lower interval have not yet been measured.
+
+`--phase SECONDS` overrides the RPC policy with constant request-start spacing:
+any positive finite number of seconds, with no jitter or adaptive adjustment.
+It overrides the adaptive floor too. Cooldowns, Retry-After and CAPTCHA handling
+still apply, and latency or downstream backpressure can make spacing longer.
+The override is per session and does not change image or Script pacing. The Python
+API exposes it as `ScrapeOptions.phase` and `make_session(phase=...)`; callers
+supplying their own session control that session's pacing themselves.
+
 ## Script throughput
 
 The Script stage has three workers to overlap slow responses while request starts
