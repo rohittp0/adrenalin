@@ -12,7 +12,6 @@ from adrenalin.tools.meta_ad_library.api import (
     parse_page_arg,
     scrape,
 )
-from adrenalin.tools.meta_ad_library.stages import creative_from_dict  # noqa: F401
 from adrenalin.tools.meta_ad_library.parse import parse_detail, parse_search_page
 
 from meta_fakes import FakeMeta, PAGE_ID, load, page
