@@ -1,3 +1,4 @@
+import logging
 import requests
 
 import pytest
@@ -265,50 +266,54 @@ def test_host_checker_only_dns_failure_means_missing(tmp_path):
         cache.close()
 
 
-def test_host_checker_tries_the_other_www_form_and_logs_misses_once(tmp_path):
+def test_host_checker_tries_the_other_www_form_and_logs_misses_once(tmp_path, caplog):
     from adrenalin.common.http import HostChecker
 
     outcomes = {"www.bare-only.com": _dns_error("www.bare-only.com"), "bare-only.com": 200,
                 "www-only.com": _dns_error("www-only.com"), "www.www-only.com": 200,
                 "www.gone.com": _dns_error("www.gone.com"), "gone.com": _dns_error("gone.com")}
     check, cache, session, calls = _checker_env(tmp_path, outcomes)
-    logs = []
-    check = HostChecker(session, cache, log=logs.append)
+    check = HostChecker(session, cache)
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
     try:
         assert check("www.bare-only.com") and check("www-only.com")
         assert not check("www.gone.com") and not check("gone.com") and not check("www.gone.com")
-        assert len(logs) == 1 and "gone.com" in logs[0]
+        misses = [r for r in caplog.records if "does not resolve" in r.getMessage()]
+        assert len(misses) == 1 and "gone.com" in misses[0].getMessage() and misses[0].levelname == "WARNING"
         assert [u for _, u, _ in calls].count("https://gone.com/") == 1  # each name requested once per run
     finally:
         cache.close()
 
 
-def test_block_logs_what_the_response_looked_like(tmp_path):
-    logs = []
+def test_block_logs_what_the_response_looked_like(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
     page = resp(200, b"<html>please solve the recaptcha</html>", url="https://cdn.com/x.js", ctype="text/html")
-    e = Env(tmp_path, [page], log=logs.append)
+    e = Env(tmp_path, [page])
     with pytest.raises(Blocked) as exc:
         e.session.get("https://cdn.com/x.js")
-    assert len(logs) == 1 and logs[0].startswith("warning: cdn.com sent a block page")
-    assert "HTTP 200" in logs[0] and "text/html" in logs[0] and "recaptcha" in logs[0]
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and warnings[0].getMessage().startswith("cdn.com sent a block page")
+    detail = [r.getMessage() for r in caplog.records if r.levelname == "DEBUG"]
+    assert len(detail) == 1 and "HTTP 200" in detail[0] and "text/html" in detail[0] and "recaptcha" in detail[0]
     assert "cdn.com blocked until" in str(exc.value)
 
 
-def test_429_exhaustion_logs_the_last_response(tmp_path):
-    logs = []
-    e = Env(tmp_path, [resp(429)] * 4, log=logs.append)
+def test_429_exhaustion_logs_the_last_response(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
+    e = Env(tmp_path, [resp(429)] * 4)
     with pytest.raises(Blocked):
         e.session.get("https://a.com/x")
+    logs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
     assert len(logs) == 4 and "rate-limits after 3 backoffs" in logs[-1] and "HTTP 429" in logs[-1]
     assert all("pausing all requests" in message for message in logs[:3])
 
 
-def test_derived_session_keeps_the_log(tmp_path):
-    logs = []
-    e = Env(tmp_path, [resp(302, headers={"Location": SORRY})], log=logs.append)
+def test_derived_session_logs_too(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
+    e = Env(tmp_path, [resp(302, headers={"Location": SORRY})])
     with pytest.raises(Blocked):
         e.session.derive(max_retries=0).get("https://a.com/x")
-    assert "Location=" + SORRY in logs[0]
+    assert any("Location=" + SORRY in r.getMessage() for r in caplog.records)
 
 
 from adrenalin.common.http import AdaptivePace  # noqa: E402
@@ -442,9 +447,9 @@ def test_pacing_sleep_does_not_block_completed_response(tmp_path):
             pending.result(timeout=1)
 
 
-def test_transient_failure_streak_resets_on_success_and_recovers(tmp_path):
-    logs = []
-    e = _adaptive_env(tmp_path, start=0.5, log=logs.append)
+def test_transient_failure_streak_resets_on_success_and_recovers(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
+    e = _adaptive_env(tmp_path, start=0.5)
     def timeout(*args, **kwargs):
         raise requests.Timeout("read timed out")
     e.session._transport = timeout
@@ -463,7 +468,9 @@ def test_transient_failure_streak_resets_on_success_and_recovers(tmp_path):
     e.session._transport = lambda *a, **kw: resp(503)
     e.session.get("https://img.com/x")
     assert e.session.interval("img.com") == 1.0
-    assert "3 consecutive" in logs[-1] and "HTTP 503" in logs[-1]
+    pacing = [r for r in caplog.records if "pacing base" in r.getMessage()]
+    assert "3 consecutive" in pacing[-1].getMessage() and "HTTP 503" in pacing[-1].getMessage()
+    assert pacing[-1].levelname == "INFO"
     e.session._transport = lambda *a, **kw: resp()
     for _ in range(20):
         e.session.get("https://img.com/x")
@@ -533,10 +540,10 @@ def test_default_policy_never_blocks(tmp_path):
     assert e.session.get("https://a.com/x").status_code == 302
 
 
-def test_block_reason_is_logged(tmp_path):
-    logs = []
-    e = Env(tmp_path, [resp(200)], log=logs.append,
+def test_block_reason_is_logged(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
+    e = Env(tmp_path, [resp(200)],
             default=HostPolicy(blocked=lambda r, b: "custom reason"))
     with pytest.raises(Blocked):
         e.session.get("https://a.com/x")
-    assert any("custom reason" in line for line in logs)
+    assert any("custom reason" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)

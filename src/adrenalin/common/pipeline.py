@@ -1,5 +1,6 @@
 """SQLite-backed work queue and a staged, backpressured thread pipeline (ADR 0001)."""
 import json
+import logging
 import sqlite3
 import sys
 import threading
@@ -9,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from adrenalin.common.http import Blocked
+
+log = logging.getLogger(__name__)
 
 
 def print_to_stderr(msg: str) -> None:
@@ -204,7 +207,6 @@ class RunResult:
 
 class Pipeline:
     def __init__(self, queue: WorkQueue, stages: Sequence[Stage], *, poll: float = 0.2,
-                 log: Callable[[str], None] = print_to_stderr,
                  clock: Callable[[], float] = time.monotonic):
         names = [s.name for s in stages]
         if len(set(names)) != len(names):
@@ -213,7 +215,7 @@ class Pipeline:
             unknown = [n for n in s.throttle_on if n not in names]
             if unknown:
                 raise ValueError(f"stage {s.name!r} throttles on unknown stage(s) {unknown}")
-        self.queue, self.stages, self.poll, self.log = queue, list(stages), poll, log
+        self.queue, self.stages, self.poll = queue, list(stages), poll
         self.clock = clock
 
     def run(self) -> RunResult:
@@ -242,7 +244,7 @@ class Pipeline:
                         if s.name not in halted and waits_on:
                             halted.add(s.name)
                             stopped[s.name].set()
-                            self.log(f"{s.name}: stopping, it waits on blocked stage {waits_on[0]}")
+                            log.warning("%s: stopping, it waits on blocked stage %s", s.name, waits_on[0])
                             changed = True
 
         def throttled(stage: Stage) -> bool:
@@ -285,27 +287,27 @@ class Pipeline:
                     with state_lock:
                         if result.blocked is None:
                             result.blocked = exc
-                    self.log(f"{name}: blocked ({exc}); stopping stage")
+                    log.warning("%s: blocked (%s); stopping stage", name, exc)
                     stopped[name].set()
                     halt_producers(name)
                     return
                 except Exception as exc:  # noqa: BLE001 - any worker error fails only its item
                     msg = f"{type(exc).__name__}: {exc}"
                     q.fail(name, item.key, msg)
-                    self.log(f"{name}: {item.key} failed: {msg}")
+                    log.warning("%s: %s failed: %s", name, item.key, msg)
                 else:
                     if stage.on_done is not None:
                         try:
                             stage.on_done(item, out)
                         except Exception as exc:  # noqa: BLE001 - post-completion hook must not fail the item
-                            self.log(f"{name}: {item.key} on_done failed: {type(exc).__name__}: {exc}")
+                            log.warning("%s: %s on_done failed: %s: %s", name, item.key, type(exc).__name__, exc)
 
         def runner(stage: Stage) -> None:
             try:
                 loop(stage)
             except Exception as exc:  # noqa: BLE001 - infrastructure failure, not a worker failure
                 msg = f"{stage.name}: stage loop crashed: {type(exc).__name__}: {exc}"
-                self.log(msg)
+                log.error(msg)
                 with state_lock:
                     result.errors.append(msg)
                 stopped[stage.name].set()

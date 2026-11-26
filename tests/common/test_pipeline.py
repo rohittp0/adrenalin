@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 
@@ -5,10 +6,6 @@ import pytest
 
 from adrenalin.common.http import Blocked
 from adrenalin.common.pipeline import Pipeline, Stage, WorkQueue
-
-
-def quiet(_msg):
-    pass
 
 
 def test_put_is_idempotent_and_claim_marks_running(tmp_path):
@@ -80,7 +77,7 @@ def test_requeue_and_meta(tmp_path):
 
 def _run(q, stages):
     baseline = threading.active_count()
-    result = Pipeline(q, stages, poll=0.01, log=quiet).run()
+    result = Pipeline(q, stages, poll=0.01).run()
     assert threading.active_count() == baseline
     return result
 
@@ -97,7 +94,7 @@ def test_stage_seconds_reported(tmp_path):
     def b(item, queue):
         now[0] += 3.0
 
-    result = Pipeline(q, [Stage("A", a), Stage("B", b)], poll=0.01, log=quiet, clock=lambda: now[0]).run()
+    result = Pipeline(q, [Stage("A", a), Stage("B", b)], poll=0.01, clock=lambda: now[0]).run()
     assert set(result.stage_seconds) == {"A", "B"}
     assert result.stage_seconds["A"]["busy"] > 0 and result.stage_seconds["B"]["busy"] > 0
     assert all("waiting" in v for v in result.stage_seconds.values())
@@ -247,13 +244,13 @@ def test_blocked_downstream_does_not_hang_throttled_upstream(tmp_path):
     assert q.backlog("A") >= 8
 
 
-def test_blocked_stage_stops_its_producers_transitively_but_not_unrelated_stages(tmp_path):
+def test_blocked_stage_stops_its_producers_transitively_but_not_unrelated_stages(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
     q = WorkQueue(tmp_path / "q.sqlite3")
     for i in range(10):
         q.put("A", str(i), {})
     for i in range(5):
         q.put("C", str(i), {})
-    logs = []
 
     def c(item, queue):
         raise Blocked("h", 1.0)
@@ -266,9 +263,11 @@ def test_blocked_stage_stops_its_producers_transitively_but_not_unrelated_stages
     ]
     for i in range(4):
         q.put("D", str(i), {})
-    result = Pipeline(q, stages, poll=0.01, log=logs.append).run()
+    result = Pipeline(q, stages, poll=0.01).run()
     assert result.blocked is not None
-    assert any(m.startswith("B: stopping") for m in logs) and any(m.startswith("A: stopping") for m in logs)
+    logs = {r.getMessage(): r.levelname for r in caplog.records}
+    assert logs["B: stopping, it waits on blocked stage C"] == "WARNING" and any(m.startswith("A: stopping") for m in logs)
+    assert any(m.startswith("C: blocked") and lv == "WARNING" for m, lv in logs.items())
     assert q.backlog("A") > 0 and q.backlog("C") == 5
     assert len(q.items("D", "done")) == 4  # a stage that doesn't wait on C keeps going
     q.close()
@@ -291,11 +290,12 @@ def test_stage_status_index_and_light_reads(tmp_path):
     q.close()
 
 
-def test_on_done_runs_after_complete_and_its_errors_do_not_fail_the_item(tmp_path):
+def test_on_done_runs_after_complete_and_its_errors_do_not_fail_the_item(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
     q = WorkQueue(tmp_path / "q.sqlite3")
     for k in ("1", "2"):
         q.put("A", k, {})
-    seen, logs = [], []
+    seen = []
 
     def on_done(item, result):
         assert q.count("A", "done") >= 1  # already completed
@@ -303,11 +303,10 @@ def test_on_done_runs_after_complete_and_its_errors_do_not_fail_the_item(tmp_pat
         if item.key == "2":
             raise OSError("cleanup failed")
 
-    res = Pipeline(q, [Stage("A", lambda item, q: {"k": item.key}, on_done=on_done)], poll=0.01,
-                   log=logs.append).run()
+    res = Pipeline(q, [Stage("A", lambda item, q: {"k": item.key}, on_done=on_done)], poll=0.01).run()
     assert sorted(seen) == [("1", {"k": "1"}), ("2", {"k": "2"})]
     assert res.failed == {} and q.count("A", "done") == 2
-    assert any("cleanup failed" in m for m in logs)
+    assert any("cleanup failed" in r.getMessage() and r.levelname == "WARNING" for r in caplog.records)
     q.close()
 
 

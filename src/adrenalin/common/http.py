@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import itertools
+import logging
 import random
 import socket
 import sqlite3
@@ -23,6 +24,8 @@ from urllib3.exceptions import NameResolutionError
 
 from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.output import cache_dir
+
+log = logging.getLogger(__name__)
 
 DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -178,7 +181,6 @@ class PacedSession:
         sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.time,
         rng: Callable[[], float] = random.random,
-        log: Callable[[str], None] | None = None,
         solve_captcha: bool = False,
         cookie_dir: Path | None = None,
     ):
@@ -190,11 +192,10 @@ class PacedSession:
         needs_browser = default.browser or any(p.browser for p in self._hosts.values())
         self._playwright_session = (PlaywrightTransport(
             policies=lambda host: self._policy(self.policy_key(host)),
-            solve_captcha=solve_captcha, log=log, cookie_dir=cookie_dir) if needs_browser else None)
+            solve_captcha=solve_captcha, cookie_dir=cookie_dir) if needs_browser else None)
         self._adaptive_state: dict[str, list[float]] = {}
         self._failure_streaks: dict[str, int] = {}
         self._cooldown = cooldown
-        self._log = log
         self._custom_transport = transport
         self._proxy_list = tuple(proxies)
         self._proxies = itertools.cycle(proxies) if proxies else None
@@ -283,8 +284,8 @@ class PacedSession:
                     state[0], state[1] = max(cfg.floor, state[0] * cfg.speedup), 0
                 reason = "clean responses"
             after = state[0]
-        if after != before and self._log is not None:
-            self._log(f"{host}: pacing base {before:.2f}s -> {after:.2f}s ({reason})")
+        if after != before:
+            log.info("%s: pacing base %.2fs -> %.2fs (%s)", host, before, after, reason)
 
     def _pace(self, host: str) -> None:
         # Serialize request starts without holding the adaptive-state lock during
@@ -320,8 +321,7 @@ class PacedSession:
                 return
             if not self._wait_on_block:
                 raise Blocked(host, until, saved_cooldown=True)
-            if self._log is not None:
-                self._log(f"{host}: waiting for cooldown until {_clock_time(until)}")
+            log.info("%s: waiting for cooldown until %s", host, _clock_time(until))
             self._sleep(remaining)
 
     def _block(self, host: str, retry_after: float) -> float:
@@ -352,7 +352,7 @@ class PacedSession:
                 if transient:
                     self._record(host, clean=False, reason=type(exc).__name__)
                 if method.upper() in {"GET", "HEAD"} and transient and network_retries < retry_network:
-                    self._warn(f"{host}: {type(exc).__name__}; retry {network_retries + 1}/{retry_network}")
+                    log.warning("%s: %s; retry %d/%d", host, type(exc).__name__, network_retries + 1, retry_network)
                     self._sleep(min(2 ** network_retries, 30))
                     network_retries += 1
                     continue
@@ -364,7 +364,8 @@ class PacedSession:
                 self._record(host, clean=False, immediate=True, reason="CAPTCHA/block response")
                 retry_after = _retry_after_seconds(resp.headers.get("Retry-After", ""), self._clock())
                 until = self._block(host, retry_after)
-                self._warn(f"{host} sent a block page: {reason} ({describe_response(resp, read_body)})")
+                log.warning("%s sent a block page: %s", host, reason)
+                log.debug("%s block response: %s", host, describe_response(resp, read_body))
                 if self._wait_on_block and block_waits < self._max_retries:
                     block_waits += 1
                     continue
@@ -375,11 +376,11 @@ class PacedSession:
             if resp.status_code == 429:
                 retry_after = _retry_after_seconds(resp.headers.get("Retry-After", ""), self._clock())
                 if attempt >= self._max_retries:
-                    self._warn(f"{host} still rate-limits after {attempt} backoffs ({describe_response(resp)})")
+                    log.warning("%s still rate-limits after %d backoffs (%s)", host, attempt, describe_response(resp))
                     raise Blocked(host, self._block(host, retry_after))
                 backoff = max(min(60 * 2**attempt, 900), retry_after)
                 self._cooldown.block(f"rate:{host}", backoff, now=self._clock())
-                self._warn(f"{host}: HTTP 429; pausing all requests to this host for at least {backoff:.0f}s")
+                log.warning("%s: HTTP 429; pausing all requests to this host for at least %.0fs", host, backoff)
                 self._sleep(backoff)
                 attempt += 1
                 continue
@@ -394,13 +395,9 @@ class PacedSession:
             wait_on_block=self._wait_on_block if wait_on_block is None else wait_on_block,
             max_retries=self._max_retries if max_retries is None else max_retries,
             block_seconds=self._block_seconds, transport=self._custom_transport,
-            sleep=self._sleep, clock=self._clock, rng=self._rng, log=self._log,
+            sleep=self._sleep, clock=self._clock, rng=self._rng,
             solve_captcha=self._solve_captcha, cookie_dir=self._cookie_dir,
         )
-
-    def _warn(self, message: str) -> None:
-        if self._log is not None:
-            self._log(f"warning: {message}")
 
     def get(self, url: str, **kwargs) -> requests.Response:
         return self.request("GET", url, **kwargs)
@@ -415,11 +412,10 @@ class PacedSession:
 
 
 def run_session(out: Path, hosts: Mapping[str, HostPolicy], *, default: HostPolicy = HostPolicy(),
-                proxies: Sequence[str] = (), wait_on_block: bool = False, solve_captcha: bool = False,
-                log: Callable[[str], None] | None = None) -> PacedSession:
+                proxies: Sequence[str] = (), wait_on_block: bool = False, solve_captcha: bool = False) -> PacedSession:
     """A session for a tool's run: cooldown and CAPTCHA cookies live under the run's cache dir."""
     return PacedSession(Cooldown(cache_dir(out) / "cooldown.sqlite3"), hosts, default=default, proxies=proxies,
-                        wait_on_block=wait_on_block, log=log, solve_captcha=solve_captcha,
+                        wait_on_block=wait_on_block, solve_captcha=solve_captcha,
                         cookie_dir=cache_dir(out) / "captcha")
 
 
@@ -446,12 +442,10 @@ class HostChecker:
     Each name is requested once per checker; names that answered are also remembered in `cache` across runs.
     Misses are not, since a resolver outage would otherwise mark real hosts as missing for good."""
 
-    def __init__(self, session: PacedSession, cache: ExtractionCache | None = None, timeout: float = 5.0,
-                 log: Callable[[str], None] | None = None):
+    def __init__(self, session: PacedSession, cache: ExtractionCache | None = None, timeout: float = 5.0):
         self._s = session
         self._cache = cache
         self._timeout = timeout
-        self._log = log
         self._candidates: set[str] = set()
         self._known: dict[str, bool] = {}
         self._host_locks: dict[str, threading.Lock] = {}
@@ -475,8 +469,7 @@ class HostChecker:
             matches = [c for c in self._candidates if one_edit_apart(bare, c)]
         if len(matches) == 1 and self(matches[0]):
             corrected = ("www." if host.startswith("www.") else "") + matches[0]
-            if self._log:
-                self._log(f"OCR domain corrected: {host} -> {corrected} (known domain)")
+            log.info("OCR domain corrected: %s -> %s (known domain)", host, corrected)
             return corrected
         self(host)  # retain the existing warning for unresolved names
         return ""
@@ -491,8 +484,8 @@ class HostChecker:
         with self._lock:
             first = host.removeprefix("www.") not in self._reported
             self._reported.add(host.removeprefix("www."))
-        if first and self._log is not None:
-            self._log(f"warning: {host} does not resolve (DNS); treated as misread by OCR")
+        if first:
+            log.warning("%s does not resolve (DNS); treated as misread by OCR", host)
         return False
 
     def _exists(self, host: str) -> bool:

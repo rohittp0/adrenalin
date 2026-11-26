@@ -126,7 +126,7 @@ class ScrapeResult:
 def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False,
                  log: Callable[[str], None] | None = print_to_stderr, *, solve_captcha: bool = False) -> PacedSession:
     return run_session(out, HOSTS, default=DEFAULT, proxies=proxies, wait_on_block=wait_on_block,
-                       solve_captcha=solve_captcha, log=log)
+                       solve_captcha=solve_captcha)  # `log` is accepted for callers; common/ logs through `logging`
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:
@@ -534,7 +534,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
 
         ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
                            codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=emit,
-                           oembed=oembed, host_exists=HostChecker(oembed, cache, log=emit),
+                           oembed=oembed, host_exists=HostChecker(oembed, cache),
                            read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads, sampling_mode=options.sampling_mode,
                            countries=options.countries)
         for _, result in q.results("extract"):
@@ -549,7 +549,7 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
         if options.progress and stages:
             progress = QueueProgress(_progress_bars(q, [s.name for s in stages])).start(q)
         try:
-            rr = Pipeline(q, stages, poll=poll, log=emit).run() if stages else RunResult()
+            rr = Pipeline(q, stages, poll=poll).run() if stages else RunResult()
         finally:
             if progress is not None:
                 progress.close()

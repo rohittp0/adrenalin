@@ -1,3 +1,4 @@
+import logging
 import copy
 import csv
 import hashlib
@@ -309,16 +310,16 @@ def test_ocr_domains_checked_once_per_host(tmp_path):
     assert fake.hosts == ["www.lascade.com"]  # an existing host is remembered across runs
 
 
-def test_unresolvable_ocr_domain_sends_row_to_codex(tmp_path):
+def test_unresolvable_ocr_domain_sends_row_to_codex(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
     fake = FakeGoogle()
     fake.missing_hosts = {"lascade.com"}
-    logs = []
     res = scrape(ScrapeOptions(AR, sampling_mode="novelty", out=tmp_path), session=make_session(tmp_path, fake), ocr=fake_ocr,
-                 codex=codex(), log=logs.append, poll=POLL)
+                 codex=codex(), poll=POLL)
     texts = [r for r in read_rows(res) if r["image_file"] and r["format"] == "text"]
     assert texts and {r["extraction_method"] for r in texts} == {"codex"}
     assert sorted(fake.hosts) == ["lascade.com", "www.lascade.com"]  # both forms tried, once each
-    assert sum("lascade.com" in m and "resolve" in m for m in logs) == 1
+    assert sum("lascade.com" in r.getMessage() and "resolve" in r.getMessage() for r in caplog.records) == 1
 
 
 def test_rerun_with_vision_requeues_ocr_rows(tmp_path):
@@ -1700,7 +1701,8 @@ def test_round_judges_only_processed_creatives(tmp_path):
     q.close()
 
 
-def test_cli_prints_incomplete_and_blocked_once(tmp_path, monkeypatch, capsys):
+def test_cli_prints_incomplete_and_blocked_once(tmp_path, monkeypatch, capsys, caplog):
+    caplog.set_level(logging.DEBUG, logger="adrenalin")
     from adrenalin.cli import main
     from adrenalin.tools.ads_transparency import api
 
@@ -1713,7 +1715,8 @@ def test_cli_prints_incomplete_and_blocked_once(tmp_path, monkeypatch, capsys):
     err = capsys.readouterr().err.splitlines()
     assert sum(ln.startswith("INCOMPLETE:") for ln in err) == 1 and err[-1].startswith("INCOMPLETE:")
     assert sum(ln.startswith("blocked until") for ln in err) == 1
-    assert any("list: blocked" in ln for ln in err)  # the stage's own log line is kept
+    # the stage's own log line is kept (now a record from the pipeline's logger)
+    assert any(r.getMessage().startswith("list: blocked") and r.levelname == "WARNING" for r in caplog.records)
 
 
 def test_stage_export_keeps_the_sampling_options_and_stage_times(tmp_path, small_limits):

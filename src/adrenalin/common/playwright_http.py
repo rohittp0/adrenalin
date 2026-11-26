@@ -12,6 +12,7 @@ from typing import Callable
 from pathlib import Path
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from urllib.parse import urlparse, urlencode
@@ -19,15 +20,16 @@ from urllib.parse import urlparse, urlencode
 import requests
 from playwright.sync_api import Error, TimeoutError, sync_playwright
 
+log = logging.getLogger(__name__)
+
 
 class PlaywrightTransport:
-    def __init__(self, *, policies: Callable[[str], "HostPolicy"], solve_captcha=False, log=None, cookie_dir=None):
+    def __init__(self, *, policies: Callable[[str], "HostPolicy"], solve_captcha=False, cookie_dir=None):
         # policies(host) is the HostPolicy of a request host; its Challenge says what a CAPTCHA page
         # looks like and which cookies to persist. A host without a Challenge never hands off.
         self._policies = policies
         self._challenges = {}  # proxy -> Challenges of the browser hosts used through it
         self._solve_captcha = solve_captcha
-        self._log = log or (lambda message: None)
         self._stop = Event()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="playwright-http")
         self._lock = Lock()
@@ -82,7 +84,7 @@ class PlaywrightTransport:
                 json.dump({"cookies": self._exemptions(proxy, state), "origins": []}, output)
             os.replace(temporary, path)  # mkstemp creates an owner-only file
         except OSError:
-            self._log("warning: could not save CAPTCHA exemption for reuse")
+            log.warning("could not save CAPTCHA exemption for reuse")
         finally:
             if temporary and os.path.exists(temporary):
                 os.unlink(temporary)
@@ -123,8 +125,8 @@ class PlaywrightTransport:
             # supplies the challenge and returns here when the user completes it.
             page.goto(origin, wait_until="domcontentloaded", timeout=30000)
             page.bring_to_front()
-            self._log("CAPTCHA: complete the challenge in the scraper's Chrome window. "
-                      "Waiting up to 10 minutes; the request resumes automatically.")
+            log.info("CAPTCHA: complete the challenge in the scraper's Chrome window. "
+                     "Waiting up to 10 minutes; the request resumes automatically.")
             deadline = monotonic() + 600
             while not self._stop.is_set() and monotonic() < deadline:
                 if page.is_closed():
@@ -133,14 +135,14 @@ class PlaywrightTransport:
                 if f"{current.scheme}://{current.netloc}" == origin and not challenge.shown(current.geturl()):
                     page.wait_for_load_state("domcontentloaded")
                     self._switch_browser(headed=False)
-                    self._log("CAPTCHA completed; Chrome window closed. Resuming in the background.")
+                    log.info("CAPTCHA completed; Chrome window closed. Resuming in the background.")
                     return self._request(method, url, kwargs)
                 page.wait_for_timeout(500)
             self._pages.pop(key, None)
             if not page.is_closed():
                 page.close()
             self._switch_browser(headed=False)
-            self._log("CAPTCHA handoff ended without completion; preserving the blocked request.")
+            log.info("CAPTCHA handoff ended without completion; preserving the blocked request.")
         return response
 
     def _ensure_context(self, proxy):
@@ -252,7 +254,7 @@ class PlaywrightTransport:
                         if self._cookie_dir is not None:
                             self._save_exemption(proxy, context.storage_state())
                     except Error:
-                        self._log("warning: browser closed before CAPTCHA exemption could be saved")
+                        log.warning("browser closed before CAPTCHA exemption could be saved")
                     finally:
                         context.close()
             finally:
