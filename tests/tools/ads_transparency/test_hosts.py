@@ -35,7 +35,7 @@ def test_oembed_still_detects_blocks(tmp_path):
     def transport(method, url, **kwargs):
         return resp(302, headers={"Location": "https://www.google.com/sorry/index"}, url=url)
 
-    session = make_session(tmp_path, log=None)
+    session = make_session(tmp_path)
     session._transport = transport
     try:
         with pytest.raises(Blocked):

@@ -5,8 +5,8 @@ import base64
 import dataclasses
 import gzip
 import html
+import logging
 import re
-import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,8 +27,7 @@ _JS_CODE_RE = re.compile(r"[{}\\]|=>|&&|\|\||\bfunction\b|\bvar\b|\.\w+\(|\w\(\w
 _IMAGE_KEYS = ("squareImage", "landscapeImage", "portraitImage")
 
 
-def log(message: str) -> None:
-    print(f"warning: {message}", file=sys.stderr)
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -548,7 +547,7 @@ def _vision(path: Path, key: str, cache: ExtractionCache, codex: CodexRunner | N
 
 def extract_image(
     path: Path, image_id: str, fmt: str, *, cache: ExtractionCache, codex: CodexRunner | None,
-    force_vision: bool, ocr=recognize, warn=log, host_exists: Callable[[str], bool] | None = None,
+    force_vision: bool, ocr=recognize, warn=log.warning, host_exists: Callable[[str], bool] | None = None,
 ) -> AdCopy:
     """Copy of a `simgad` image: OCR + layout rules, Codex when OCR fails or with `force_vision`.
     `host_exists` (optional, network) verifies the domains OCR read. Raises OcrUnavailable when neither

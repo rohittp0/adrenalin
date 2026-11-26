@@ -26,10 +26,9 @@ def test_queue_progress_follows_the_queue_and_writes_above_bars(tmp_path):
     q.put("A", "e", {})
     p.refresh()
     assert [b.n for b in p._tqdm] == [3, 3] and p._tqdm[0].total == 5 and p._tqdm[1].total is None
-    p.write("warning: hello")
     p.close()
     text = out.getvalue()
-    assert "warning: hello" in text and "stage a" in text and "3/5" in text
+    assert "stage a" in text and "3/5" in text
     assert p._thread is None
     q.close()
 

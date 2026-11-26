@@ -14,6 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from adrenalin.common.geo import geo_id_to_region
 from adrenalin.common.http import PacedSession
+from adrenalin.common.listing import PaginationLoop  # noqa: F401  (re-exported)
 
 HOST = "adstransparency.google.com"
 SEARCH_URL = "https://adstransparency.google.com/anji/_/rpc/SearchService/SearchCreatives"
@@ -25,10 +26,6 @@ _IMG_RE = re.compile(r"<img\b[^>]*>", re.I)
 # Geo ID of the viewer context the web UI sends with every request (2356 = India, where these requests were
 # captured). It is not the Region filter (search filter "8"), which comes from `Query.geo_id`.
 VIEWER_GEO_ID = 2356
-
-
-class PaginationLoop(ValueError):
-    pass
 
 
 class RpcError(ValueError):

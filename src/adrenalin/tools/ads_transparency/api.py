@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
-import os
-import re
-import tempfile
 from collections import Counter
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -18,12 +16,13 @@ from adrenalin.common.geo import region_to_geo_id
 from adrenalin.common.http import Cooldown, HostChecker, PacedSession, run_session
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL, CodexRunner
-from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic
-from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue, print_to_stderr
-from adrenalin.common.progress import Bar, QueueProgress, stage_bar
+from adrenalin.common.output import cache_dir, entity_dir, write_csv_atomic, write_json_atomic
+from adrenalin.common.pipeline import Pipeline, RunResult, WorkQueue
+from adrenalin.common.progress import Bar, run_progress, stage_bar
+from adrenalin.common.runlog import run_log
 from adrenalin.tools.ads_transparency import sampling
 from adrenalin.tools.ads_transparency.countries import (
-    COUNTRY_FIELDS, countries_message, countries_pending, country_rows, current_targets)
+    COUNTRY_FIELDS, countries_message, countries_pending, country_rows, current_targets)  # noqa: F401  (countries_message: used by the CLI)
 from adrenalin.tools.ads_transparency.copy import (  # noqa: F401
     COPY_STATUSES,
     copy_status,
@@ -62,6 +61,7 @@ from adrenalin.tools.ads_transparency.stages import (
 )
 
 TOOL_NAME = "ads-transparency"
+log = logging.getLogger(__name__)
 
 CSV_FIELDS: tuple[str, ...] = (
     "transparency_url", "creative_id", "variation", "format", "region", "first_shown", "last_shown",
@@ -123,10 +123,10 @@ class ScrapeResult:
     countries_pending: int = 0  # Copy-sample Creatives whose Shown countries are not fetched yet
 
 
-def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False,
-                 log: Callable[[str], None] | None = print_to_stderr, *, solve_captcha: bool = False) -> PacedSession:
+def make_session(out: Path, proxies: tuple[str, ...] = (), wait_on_block: bool = False, *,
+                 solve_captcha: bool = False) -> PacedSession:
     return run_session(out, HOSTS, default=DEFAULT, proxies=proxies, wait_on_block=wait_on_block,
-                       solve_captcha=solve_captcha)  # `log` is accepted for callers; common/ logs through `logging`
+                       solve_captcha=solve_captcha)
 
 
 def _query(advertiser_id: str, region: str, start: date | None, end: date | None) -> Query:
@@ -150,17 +150,6 @@ def list_creatives(advertiser_id: str, region: str = "anywhere", start: date | N
             s.close()
 
 
-def _write_json_atomic(path: Path, data: dict) -> None:
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-
-
 def _advertiser_name(client: TransparencyClient, query: Query, out: Path) -> str:
     path = cache_dir(out) / "advertisers.json"
     try:
@@ -176,11 +165,11 @@ def _advertiser_name(client: TransparencyClient, query: Query, out: Path) -> str
     if not name:
         raise ValueError(f"No creatives found for {query.advertiser_id}")
     known[query.advertiser_id] = name
-    _write_json_atomic(path, known)
+    write_json_atomic(path, known)
     return name
 
 
-def _prepare_sampling(q: WorkQueue, options: ScrapeOptions, log: Callable[[str], None]) -> None:
+def _prepare_sampling(q: WorkQueue, options: ScrapeOptions) -> None:
     """Refresh the Coverage target and cap from this run's options (`p` is kept; `--stage export` keeps them too,
     since it reads nothing), and on a full run queue a sampling round if held Creatives remain from an earlier,
     finished listing (e.g. a rerun with a higher `--coverage`, or `--all`). The round itself decides whether to
@@ -190,7 +179,7 @@ def _prepare_sampling(q: WorkQueue, options: ScrapeOptions, log: Callable[[str],
     meta = sampling_meta(q)
     if options.sampling_mode == "stratified" and not options.read_all:
         meta.update(mode="stratified", target=None, max_ads=options.max_ads, p=0.0)
-        log(f"sample: representative target {options.max_ads or sampling.DEFAULT_SAMPLE_SIZE:,}, "
+        log.info(f"sample: representative target {options.max_ads or sampling.DEFAULT_SAMPLE_SIZE:,}, "
             "with at least 3 per group; prior reads outside the design remain exploratory.")
     else:
         if meta.get("mode") == "stratified":
@@ -203,7 +192,7 @@ def _prepare_sampling(q: WorkQueue, options: ScrapeOptions, log: Callable[[str],
     if options.sampling_mode == "novelty" and "p" in meta and options.max_ads is not None and not options.read_all and estimate:
         would = sampling.admit_probability(estimate, max_ads=options.max_ads)
         if not math.isclose(would, meta["p"]):
-            log(f"note: the head start was set by this run folder's first run (p={meta['p']:.4g}); --max-ads "
+            log.info(f"note: the head start was set by this run folder's first run (p={meta['p']:.4g}); --max-ads "
                 f"{options.max_ads:,} only caps the reads that follow it")
     if options.stage is None and q.get_meta("list_done") and (q.count(HELD, "pending") or options.sampling_mode == "stratified"):
         seed_round(q)
@@ -257,13 +246,13 @@ def _reread_stale_content(q: WorkQueue, run: Path, *, extract: bool, script: boo
         requeue_keeping_result(q, on_disk)
 
 
-def _prepare_queue(q: WorkQueue, options: ScrapeOptions, run: Path, log: Callable[[str], None]) -> None:
+def _prepare_queue(q: WorkQueue, options: ScrapeOptions, run: Path) -> None:
     # Requeues only when the stage that redoes the work runs: a requeue clears the item's result,
     # so e.g. `--stage export` must not blank copy it cannot re-extract.
     if not q.put("list", "page:", {"cursor": ""}) and options.stage in (None, "list"):
         done = q.get_meta("list_done")
         if done and (options.end is None or options.end >= date.fromisoformat(done)):
-            log("list: window still open, listing again from page 1")
+            log.info("list: window still open, listing again from page 1")
             q.set_meta("list_done", "")  # an interrupted relist resumes instead of restarting
             q.set_meta("seen_cursors", "{}")
             q.requeue("list", ["page:"])
@@ -499,19 +488,13 @@ def build_summary(rows: list[dict], q: WorkQueue, rr: RunResult, tally: SampleTa
 
 
 def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=recognize,
-           codex: CodexRunner | None = None, log: Callable[[str], None] = print_to_stderr,
-           poll: float = 0.2) -> ScrapeResult:
-    """Run (or resume) one scrape and export its CSV. Raises on setup errors; reports run outcomes."""
+           codex: CodexRunner | None = None, poll: float = 0.2) -> ScrapeResult:
+    """Run (or resume) one scrape and export its CSV. Raises on setup errors; reports run outcomes.
+    Messages go to the `adrenalin` logger (and `run.log` in the run folder)."""
     query = _query(options.advertiser_id, options.region, options.start, options.end)
-    progress: QueueProgress | None = None
-
-    def emit(message: str) -> None:
-        """`log`, or above the progress bars while they show."""
-        (progress.write if progress is not None else log)(message)
-
     own_session = session is None
     if own_session:
-        session = make_session(options.out, options.proxies, options.wait_on_block, emit,
+        session = make_session(options.out, options.proxies, options.wait_on_block,
                                solve_captcha=options.solve_captcha)
     # oEmbed and the OCR domain check are optional: they must never wait out a block or back off,
     # whatever --wait-on-block says.
@@ -527,60 +510,10 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
             codex = CodexRunner(options.vision_model, options.vision_limit)
         run = ent / "runs" / run_dir_name(options)
         run.mkdir(parents=True, exist_ok=True)
-        q = WorkQueue(run / "state.sqlite3")
-        _remove_done_content(q, run)
-        _prepare_queue(q, options, run, emit)
-        _prepare_sampling(q, options, emit)
-
-        ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
-                           codex=codex, variations=options.variations, vision=options.vision, ocr=ocr, log=emit,
-                           oembed=oembed, host_exists=HostChecker(oembed, cache),
-                           read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads, sampling_mode=options.sampling_mode,
-                           countries=options.countries)
-        for _, result in q.results("extract"):
-            if result.get("website"):
-                ctx.host_exists.remember(result["website"])
-        ads = AdsStages(ctx)
-        if options.stage in (None, "list"):
-            ads.queue_countries(q)  # targets chosen by earlier runs, and backfill of runs from before Shown countries
-        if options.stage in (None, "extract"):
-            ads.retry_titles(q)  # transient oEmbed failures of earlier runs
-        stages = ads.stages(q, options.stage)
-        if options.progress and stages:
-            progress = QueueProgress(_progress_bars(q, [s.name for s in stages])).start(q)
-        try:
-            rr = Pipeline(q, stages, poll=poll).run() if stages else RunResult()
-        finally:
-            if progress is not None:
-                progress.close()
-                progress = None
-
-        csv_path = run / "ads.csv"
-        tally = sample_groups(q, options.variations, query, ctx.today())
-        sampled = is_sampled(q)
-        rows = _rows(q, options, tally, sampled)
-        n = write_csv_atomic(csv_path, CSV_FIELDS, rows)
-        summary_path = run / "summary.json"
-        if not stages:  # nothing ran (`--stage export`): keep the stage times of the run that did the work
-            rr.stage_seconds = _previous_stage_seconds(summary_path)
-        summary = build_summary(rows, q, rr, tally, sampled)
-        _write_json_atomic(summary_path, summary)
-        pending_countries = 0
-        if options.countries:
-            targets = current_targets(q, tally, options.variations, options.max_ads)
-            write_csv_atomic(run / "countries.csv", COUNTRY_FIELDS, country_rows(q, tally, sampled, targets))
-            pending_countries = countries_pending(q, targets)
-        failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
-        if summary["representative_sample"] is not None:
-            representative = summary["representative_sample"]
-            emit(f"Representative sample: {representative['processed']:,}/{representative['selected']:,} processed; "
-                 f"{representative['exploratory_processed']:,} additional exploratory reads retained")
-        result = ScrapeResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, codex.skipped,
-                              list(rr.errors), summary["listing_complete"], summary["listed"],
-                              summary["google_estimate"], summary["coverage"], summary_path,
-                              countries_pending=pending_countries)
-        _log_summary(result, codex, emit)
-        return result
+        with run_log(run):
+            q = WorkQueue(run / "state.sqlite3")
+            return _scrape_run(options, q, client=client, session=session, oembed=oembed, query=query, ent=ent,
+                               run=run, cache=cache, ocr=ocr, codex=codex, poll=poll)
     finally:
         if q is not None:
             q.close()
@@ -591,23 +524,71 @@ def scrape(options: ScrapeOptions, *, session: PacedSession | None = None, ocr=r
             session.close()
 
 
-def _log_summary(r: ScrapeResult, codex: CodexRunner, log: Callable[[str], None]) -> None:
-    log(f"exported {r.rows} rows to {r.csv_path}")
+def _scrape_run(options: ScrapeOptions, q: WorkQueue, *, client: TransparencyClient, session: PacedSession,
+                oembed: PacedSession, query: Query, ent: Path, run: Path, cache: ExtractionCache, ocr,
+                codex: CodexRunner, poll: float) -> ScrapeResult:
+    _remove_done_content(q, run)
+    _prepare_queue(q, options, run)
+    _prepare_sampling(q, options)
+
+    ctx = StageContext(client=client, session=session, query=query, entity=ent, run=run, cache=cache,
+                       codex=codex, variations=options.variations, vision=options.vision, ocr=ocr,
+                       oembed=oembed, host_exists=HostChecker(oembed, cache),
+                       read_all=options.read_all, coverage=options.coverage, max_ads=options.max_ads,
+                       sampling_mode=options.sampling_mode, countries=options.countries)
+    for _, result in q.results("extract"):
+        if result.get("website"):
+            ctx.host_exists.remember(result["website"])
+    ads = AdsStages(ctx)
+    if options.stage in (None, "list"):
+        ads.queue_countries(q)  # targets chosen by earlier runs, and backfill of runs from before Shown countries
+    if options.stage in (None, "extract"):
+        ads.retry_titles(q)  # transient oEmbed failures of earlier runs
+    stages = ads.stages(q, options.stage)
+    with run_progress(q, _progress_bars(q, [s.name for s in stages]), options.progress and bool(stages)):
+        rr = Pipeline(q, stages, poll=poll).run() if stages else RunResult()
+
+    csv_path = run / "ads.csv"
+    tally = sample_groups(q, options.variations, query, ctx.today())
+    sampled = is_sampled(q)
+    rows = _rows(q, options, tally, sampled)
+    n = write_csv_atomic(csv_path, CSV_FIELDS, rows)
+    summary_path = run / "summary.json"
+    if not stages:  # nothing ran (`--stage export`): keep the stage times of the run that did the work
+        rr.stage_seconds = _previous_stage_seconds(summary_path)
+    summary = build_summary(rows, q, rr, tally, sampled)
+    write_json_atomic(summary_path, summary)
+    pending_countries = 0
+    if options.countries:
+        targets = current_targets(q, tally, options.variations, options.max_ads)
+        write_csv_atomic(run / "countries.csv", COUNTRY_FIELDS, country_rows(q, tally, sampled, targets))
+        pending_countries = countries_pending(q, targets)
+    failed = {s: k for s in STAGE_NAMES if (k := q.count(s, "failed"))}
+    if summary["representative_sample"] is not None:
+        representative = summary["representative_sample"]
+        log.info(f"Representative sample: {representative['processed']:,}/{representative['selected']:,} processed; "
+                 f"{representative['exploratory_processed']:,} additional exploratory reads retained")
+    result = ScrapeResult(csv_path, n, rr.blocked.until if rr.blocked else None, failed, codex.skipped,
+                          list(rr.errors), summary["listing_complete"], summary["listed"],
+                          summary["google_estimate"], summary["coverage"], summary_path,
+                          countries_pending=pending_countries)
+    _log_summary(result, codex)
+    return result
+
+
+def _log_summary(r: ScrapeResult, codex: CodexRunner) -> None:
+    """The run's closing lines. The outcome lines (blocked until, INCOMPLETE, Shown countries pending) are not
+    logged: the CLI prints them from the `ScrapeResult`, and library callers read the result."""
+    log.info(f"exported {r.rows} rows to {r.csv_path}")
     if r.vision_skipped:
-        log(f"warning: vision limit ({codex.limit}) reached; {r.vision_skipped} image(s) kept their OCR copy "
-            "and will be sent to Codex on the next run")
+        log.warning(f"vision limit ({codex.limit}) reached; {r.vision_skipped} image(s) kept their OCR copy "
+                    "and will be sent to Codex on the next run")
     if r.failed:
-        log("failed items: " + ", ".join(f"{s}: {n}" for s, n in r.failed.items()))
+        log.info("failed items: " + ", ".join(f"{s}: {n}" for s, n in r.failed.items()))
     for e in r.errors:
-        log(f"error: {e}")
-    if r.blocked_until is not None:
-        log(blocked_message(r.blocked_until))
+        log.error("%s", e)
     if r.coverage is not None:
-        log(f"Novelty repetition score {r.coverage:.3f} (not population Coverage)")
-    if r.countries_pending:
-        log(countries_message(r.countries_pending))
-    if not r.listing_complete:
-        log(incomplete_message(r))  # last: the outcome that matters most
+        log.info(f"Novelty repetition score {r.coverage:.3f} (not population Coverage)")
 
 
 def blocked_message(until: float) -> str:
@@ -617,15 +598,3 @@ def blocked_message(until: float) -> str:
 def incomplete_message(r: ScrapeResult) -> str:
     of = f" of ~{r.estimate:,}" if r.estimate else ""
     return f"INCOMPLETE: listed {r.listed:,}{of} Creatives; rerun the same command to continue"
-
-
-def is_outcome_line(message: str) -> bool:
-    """Whether `message` is one of the run-outcome lines `scrape` logs last (blocked until, INCOMPLETE, Shown
-    countries pending). The CLI prints those itself, from the `ScrapeResult`, so it leaves them out of the log."""
-    return (message.startswith("INCOMPLETE: ") or message == countries_message(_leading_count(message))
-            or re.fullmatch(r"blocked until \d\d:\d\d", message) is not None)
-
-
-def _leading_count(message: str) -> int:
-    m = re.match(r"([\d,]+) ", message)
-    return int(m.group(1).replace(",", "")) if m else -1

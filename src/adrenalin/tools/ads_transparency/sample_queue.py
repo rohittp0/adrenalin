@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import secrets
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 
@@ -16,6 +16,8 @@ from adrenalin.common.pipeline import Item, WorkQueue
 from adrenalin.tools.ads_transparency import sampling
 from adrenalin.tools.ads_transparency.copy import MIN_CONFIDENCE, copy_status, shown_copy
 from adrenalin.tools.ads_transparency.rpc import Query, preview_ids
+
+log = logging.getLogger(__name__)
 
 HELD = "held"
 ROUND_BATCH = 50  # held Creatives a sampling round admits by novelty, once every group has its minimum
@@ -236,7 +238,7 @@ def _unjudged(payload: dict) -> list[list[str]]:
     return [last] if payload.get("novelty") and last else []
 
 
-def stratified_round(q: WorkQueue, s: RoundSettings, log: Callable[[str], None]) -> dict:
+def stratified_round(q: WorkQueue, s: RoundSettings) -> dict:
     meta = sampling_meta(q)
     seed = meta.setdefault("seed", secrets.token_hex(16))
     grouped: dict[str, dict[str, str]] = {}
@@ -260,12 +262,12 @@ def stratified_round(q: WorkQueue, s: RoundSettings, log: Callable[[str], None])
                       "inventory": sum(sizes.values())}
     q.set_meta("sampling", json.dumps(meta))  # persist design before admitting work
     q.move(HELD, target, chosen)
-    log(f"sample: stratified design selects {len(selected):,} of {sum(sizes.values()):,} Creatives "
+    log.info(f"sample: stratified design selects {len(selected):,} of {sum(sizes.values()):,} Creatives "
         f"across {len(sizes):,} groups; {len(chosen):,} additional reads. No Coverage stopping target.")
     return {"admitted": len(chosen), "selected": len(selected), "mode": "stratified"}
 
 
-def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], None]) -> dict:
+def run_round(q: WorkQueue, item: Item, s: RoundSettings) -> dict:
     """One sampling round (the `sample` stage's worker). It runs once the listing is done and the admitted Creatives
     have been read (all of them, or all but the last novelty round: see `round_lead`). Once every group has its
     minimum it stops at the Coverage target, at `max_ads`, when Coverage can't be estimated, or when a novelty round
@@ -275,7 +277,7 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
         # The listing failed this run, so the Inventory is incomplete: list_page queues a round when it finishes.
         return {"deferred": True}
     if s.sampling_mode == "stratified" and not s.read_all:
-        return stratified_round(q, s, log)
+        return stratified_round(q, s)
     tally = sample_groups(q, s.variations, s.query, s.today)
     groups = tally.groups
     read = sum(g.admitted for g in groups.values())
@@ -291,25 +293,25 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
         # round admit everything; the failed item is retried on the next run.
         quotas_met = all(g.admitted >= min(sampling.MIN_PER_BUCKET, g.inventory) for g in groups.values())
         if sampling.should_stop(cov, read, s.coverage, s.max_ads, quotas_met):
-            _log_stop(log, cov, s.coverage, read, inventory)
+            _log_stop(cov, s.coverage, read, inventory)
             return stopped
         if quotas_met and cov is None and len(tally.processed) >= min(sampling.HEAD_START, inventory):
             # Without countable Messages Coverage is never estimated, and reading on would read everything.
-            log(f"sample: Coverage unknown: no readable Messages after {len(tally.processed):,} Creatives; stopping")
+            log.info(f"sample: Coverage unknown: no readable Messages after {len(tally.processed):,} Creatives; stopping")
             return stopped
         verdict, carry = _judge(q, _unjudged(item.payload), tally) if quotas_met else ("go", [])
         if verdict == "stop":
-            log(f"sample: a round's processed Creatives gave no readable Message (all failed or without copy); "
+            log.info(f"sample: a round's processed Creatives gave no readable Message (all failed or without copy); "
                 f"stopping with Coverage {'unknown' if cov is None else f'{cov:.3f}'}")
             return stopped
         if verdict == "defer":
-            log("sample: a round's Creatives are all still unread (Codex limit or failed reads); no more rounds "
+            log.info("sample: a round's Creatives are all still unread (Codex limit or failed reads); no more rounds "
                 "this run, rerun to continue")
             return {**stopped, "deferred": True}
         if not quotas_met and s.max_ads is not None:
             floor = sum(min(sampling.MIN_PER_BUCKET, g.inventory) for g in groups.values())
             if floor > s.max_ads:
-                log(f"warning: --max-ads {s.max_ads:,} is below the group minimums: every launch period x "
+                log.warning(f"--max-ads {s.max_ads:,} is below the group minimums: every launch period x "
                     f"running/stopped x Ads account group gets up to {sampling.MIN_PER_BUCKET} reads, "
                     f"{floor:,} Creatives in all")
         # Minimums first, alone: novelty is judged only once every group has reads to judge it by.
@@ -320,13 +322,13 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
         plan = sampling.allocate(states, {k: len(g.held) for k, g in groups.items()}, batch)
         chosen = [key for k, n in plan.items() for key in groups[k].held[:n]]
     if not chosen:
-        _log_stop(log, cov, s.coverage, read, inventory)
+        _log_stop(cov, s.coverage, read, inventory)
         return stopped
     q.move(HELD, listing_stage(s.variations), chosen)
     admitted = [k.partition("#")[0] for k in chosen]
     held = sum(len(g.held) for g in groups.values()) - len(chosen)
     shown = "unknown" if cov is None else f"{cov:.3f}"
-    log(f"sample: {item.key.replace(':', ' ')}: read {len(tally.processed):,}, Coverage {shown} "
+    log.info(f"sample: {item.key.replace(':', ' ')}: read {len(tally.processed):,}, Coverage {shown} "
         f"(target {s.coverage}), held {held:,}")
     # The next round goes in while this one still runs, so the stage never looks finished between rounds.
     q.put("sample", f"round:{_rounds(q)}",
@@ -334,7 +336,7 @@ def run_round(q: WorkQueue, item: Item, s: RoundSettings, log: Callable[[str], N
     return {"admitted": len(chosen), "read": read, "coverage": cov}
 
 
-def _log_stop(log: Callable[[str], None], cov: float | None, target: float, read: int, inventory: int) -> None:
+def _log_stop(cov: float | None, target: float, read: int, inventory: int) -> None:
     shown = "unknown" if cov is None else f"{cov:.3f}"
-    log(f"sample: stopping with Coverage {shown} (target {target}); {read:,} of {inventory:,} Creatives in the "
+    log.info(f"sample: stopping with Coverage {shown} (target {target}); {read:,} of {inventory:,} Creatives in the "
         "Copy sample")

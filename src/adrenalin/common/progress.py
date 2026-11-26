@@ -32,8 +32,8 @@ def stage_bar(stage: str, label: str | None = None, unit: str = "it",
 
 
 class QueueProgress:
-    """Draws one tqdm bar per `Bar` while a pipeline runs. Use `write` as the run's log function: messages are
-    printed above the bars instead of breaking them. Rates and ETAs count only work done in this run."""
+    """Draws one tqdm bar per `Bar` while a pipeline runs. Log messages meanwhile are printed above the bars by
+    `common.runlog.console_logging`. Rates and ETAs count only work done in this run."""
 
     def __init__(self, bars: Sequence[Bar], *, interval: float = 0.5, file: TextIO | None = None):
         self.bars = list(bars)
@@ -45,10 +45,6 @@ class QueueProgress:
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self._failed: list[int] = []
-
-    def write(self, message: str) -> None:
-        with self._lock:
-            tqdm.write(message, file=self.file)
 
     def start(self, queue: WorkQueue) -> QueueProgress:
         self._queue = queue

@@ -3,8 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import tempfile
+import logging
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -15,15 +14,16 @@ import requests
 
 from adrenalin.common.cache import ExtractionCache
 from adrenalin.common.http import Blocked, PacedSession
+from adrenalin.common.listing import put_page, record_cursor
 from adrenalin.common.ocr import recognize
 from adrenalin.common.ocr.codex import CodexRunner
+from adrenalin.common.output import write_bytes_atomic
 from adrenalin.common.pipeline import Item, Stage, WorkQueue
 from adrenalin.tools.ads_transparency import sample_queue, sampling
 from adrenalin.tools.ads_transparency.countries import COUNTRIES, queue_countries
 from adrenalin.tools.ads_transparency.copy import CONTENT_JS_VERSION, AdCopy, extract_image, parse_content_preview
 from adrenalin.tools.ads_transparency.rpc import (
     ListedCreative,
-    PaginationLoop,
     Preview,
     Query,
     RpcError,
@@ -38,6 +38,8 @@ from adrenalin.tools.ads_transparency.sample_queue import (
     sampling_meta,
     seed_round,
 )
+
+log = logging.getLogger(__name__)
 
 # fetch downloads images; content.js Previews go on to `script`, which has its own (slower) host, so a
 # block there stops only script downloads. `sample` admits held Creatives into the Copy sample in rounds (ADR 0003);
@@ -100,33 +102,9 @@ def creative_fields(c: ListedCreative) -> dict:
     }
 
 
-def _seen_cursors(raw: str | None) -> dict[str, str]:
-    """The `seen_cursors` meta: {cursor: page key that produced it}. Older runs stored a list of cursors
-    (producer unknown, so any repeat of those is still a loop)."""
-    data = json.loads(raw or "{}")
-    return {c: "" for c in data} if isinstance(data, list) else data
-
-
-def page_key(cursor: str | None) -> str:
-    return f"page:{cursor or ''}"
-
-
 def content_file(key: str) -> str:
     """Run-relative path of a fetched content.js, named per queue item so no two items share a file."""
     return f"{CONTENT_DIR}/{hashlib.sha1(key.encode()).hexdigest()}.js"
-
-
-def write_atomic(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Unique temp name: several creatives can share one simgad image.
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".part")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
 
 
 @dataclass
@@ -148,7 +126,6 @@ class StageContext:
     variations: bool = False
     vision: bool = False
     ocr: Callable = recognize
-    log: Callable[[str], None] = print
     today: Callable[[], date] = date.today
     # oEmbed must never wait or back off: a fail-fast session sharing the cooldown (defaults to `session`)
     oembed: PacedSession | None = None
@@ -170,7 +147,7 @@ class AdsStages:
         self._listed = False  # whether this run's list stage has claimed a page yet
 
     def warn(self, message: str) -> None:
-        self.ctx.log(f"warning: {message}")
+        log.warning("%s", message)
 
     def stages(self, q: WorkQueue, only: str | None = None) -> list[Stage]:
         if only == "export":
@@ -199,12 +176,6 @@ class AdsStages:
 
     # -- list ---------------------------------------------------------------
 
-    @staticmethod
-    def _put_page(q: WorkQueue, cursor: str | None) -> None:
-        key = page_key(cursor)
-        if not q.put("list", key, {"cursor": cursor or ""}):
-            q.requeue("list", [key])  # a relist or restart walks pages that are already done
-
     def list_page(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
         cursor = item.key.removeprefix("page:") or None
@@ -217,9 +188,9 @@ class AdsStages:
             # obtained in this run fails the item normally (retried on the next run).
             if not (cursor and resumed):
                 raise
-            ctx.log(f"list: cursor expired, restarting listing ({e})")
+            log.info("list: cursor expired, restarting listing (%s)", e)
             q.set_meta("seen_cursors", "{}")
-            self._put_page(q, None)
+            put_page(q, "list", None)
             return {"restarted": True}
 
         estimate = page.count_high or page.count_low
@@ -246,12 +217,8 @@ class AdsStages:
         nxt = page.next_cursor
         if nxt:
             # cursor -> the page that produced it; a page rerun after a crash produces the same cursor again
-            seen = _seen_cursors(q.get_meta("seen_cursors"))
-            if seen.get(nxt, item.key) != item.key:
-                raise PaginationLoop(f"cursor repeated: {nxt}")
-            seen[nxt] = item.key
-            q.set_meta("seen_cursors", json.dumps(seen))
-            self._put_page(q, nxt)
+            record_cursor(q, item.key, nxt)
+            put_page(q, "list", nxt)
         else:
             q.set_meta("list_done", ctx.today().isoformat())
             if q.count(HELD, "pending") or (ctx.sampling_mode == "stratified" and not ctx.read_all):
@@ -286,7 +253,7 @@ class AdsStages:
     def sample(self, item: Item, q: WorkQueue) -> dict:
         ctx = self.ctx
         result = sample_queue.run_round(q, item, sample_queue.RoundSettings(
-            ctx.variations, ctx.query, ctx.today(), ctx.read_all, ctx.coverage, ctx.max_ads, ctx.sampling_mode), ctx.log)
+            ctx.variations, ctx.query, ctx.today(), ctx.read_all, ctx.coverage, ctx.max_ads, ctx.sampling_mode))
         self.queue_countries(q)  # a round changes the Copy sample
         return result
 
@@ -337,7 +304,7 @@ class AdsStages:
             rel = f"images/{image_name(p)}.png"
             path = self.ctx.entity / rel
             if not path.exists():
-                write_atomic(path, self._get_ok(p.url).content)
+                write_bytes_atomic(path, self._get_ok(p.url).content)
             result["image_file"] = rel
         elif p is not None:
             q.put("script", item.key, item.payload, update_payload=True)
@@ -361,7 +328,7 @@ class AdsStages:
             return {REREAD_GIVEN_UP: f"{type(e).__name__}: {e}"}
         # The script (often 150-450 KB) goes to a file, never into the queue database.
         rel = content_file(item.key)
-        write_atomic(self.ctx.run / rel, data)
+        write_bytes_atomic(self.ctx.run / rel, data)
         payload = {k: v for k, v in item.payload.items() if k != REREAD}
         q.put("extract", item.key, {**payload, "content_file": rel}, update_payload=True)
         if reread:
@@ -451,7 +418,7 @@ class AdsStages:
                 rel = f"images/{image_name(alt)}.png"
                 path = ctx.entity / rel
                 if not path.exists():
-                    write_atomic(path, self._get_ok(alt.url).content)
+                    write_bytes_atomic(path, self._get_ok(alt.url).content)
                 copy = self._read_image(path, alt, fmt)
                 if not copy.preview_broken:
                     return copy, _Recovered(n, alt, rel), False, False

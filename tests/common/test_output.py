@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from adrenalin.common.output import EntityCollision, entity_dir, slugify, write_csv_atomic, cache_dir
+from adrenalin.common.output import EntityCollision, entity_dir, slugify, write_csv_atomic, cache_dir, write_bytes_atomic, write_json_atomic
 
 
 def test_slugify():
@@ -67,3 +67,19 @@ def test_write_csv_atomic_defuses_spreadsheet_formulas(tmp_path):
     assert got[0] == {"a": "'=HYPERLINK(\"http://x\")", "b": "'+1 555", "c": "'-30% off", "d": "'@SUM(A1)",
                       "e": "'\tTab"}
     assert got[1] == {"a": "Book now - save", "b": "5", "c": "-1.5", "d": "", "e": ""}  # numbers untouched
+
+
+def test_write_bytes_atomic_creates_parents_and_leaves_no_temp_files(tmp_path):
+    path = tmp_path / "a" / "b" / "x.bin"
+    write_bytes_atomic(path, b"one")
+    write_bytes_atomic(path, b"two")
+    assert path.read_bytes() == b"two"
+    assert [p.name for p in path.parent.iterdir()] == ["x.bin"]
+
+
+def test_write_json_atomic_writes_readable_utf8_json(tmp_path):
+    path = tmp_path / "x.json"
+    write_json_atomic(path, {"name": "Café", "n": 1})
+    assert "Café" in path.read_text(encoding="utf-8")
+    assert json.loads(path.read_text(encoding="utf-8")) == {"name": "Café", "n": 1}
+    assert [p.name for p in tmp_path.iterdir()] == ["x.json"]

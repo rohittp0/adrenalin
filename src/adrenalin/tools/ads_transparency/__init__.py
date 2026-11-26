@@ -13,7 +13,7 @@ from adrenalin.common.http import Blocked
 from adrenalin.common.ocr import OcrUnavailable
 from adrenalin.common.ocr.codex import DEFAULT_VISION_MODEL
 from adrenalin.common.output import EntityCollision
-from adrenalin.common.pipeline import print_to_stderr
+from adrenalin.common.runlog import console_logging
 from adrenalin.common.tool import Tool
 from adrenalin.tools.ads_transparency import api
 
@@ -94,12 +94,9 @@ def run(args: argparse.Namespace) -> int:
         sampling_mode=args.sampling, read_all=args.read_all, coverage=args.coverage, max_ads=args.max_ads,
         countries=args.countries,
     )
-    def log(message: str) -> None:
-        if not api.is_outcome_line(message):  # printed below, once, with what to do next
-            print_to_stderr(message)
-
     try:
-        res = api.scrape(options, log=log)
+        with console_logging(verbose=False):
+            res = api.scrape(options)
     except Blocked as e:
         print(f"blocked until {_hhmm(e.until)}; rerun the same command to continue", file=sys.stderr)
         return 2

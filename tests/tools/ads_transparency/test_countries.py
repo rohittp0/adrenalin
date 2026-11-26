@@ -4,7 +4,6 @@ import hashlib
 from datetime import date
 
 from adrenalin.common.pipeline import WorkQueue
-from adrenalin.tools.ads_transparency.api import is_outcome_line
 from adrenalin.tools.ads_transparency.countries import COUNTRIES, COUNTRY_FIELDS, country_targets
 from adrenalin.tools.ads_transparency.sample_queue import SampleTally
 
@@ -135,11 +134,6 @@ def test_stage_export_writes_countries_without_requests(tmp_path):
 def test_no_countries_writes_no_countries_csv(tmp_path):
     res = run_scrape(tmp_path, FakeGoogle(), sampling_mode="stratified", max_ads=10, countries=False)
     assert not (res.csv_path.parent / "countries.csv").exists()
-
-
-def test_pending_countries_line_is_an_outcome_line():
-    assert is_outcome_line("1,234 Creatives still need Shown countries; rerun the same command to continue")
-    assert not is_outcome_line("1,234 Creatives still need Shown countries")
 
 
 # -- final review fixes --------------------------------------------------------
