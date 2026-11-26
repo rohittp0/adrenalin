@@ -2,8 +2,8 @@
 
 One queue item per row: the key is the Creative's Library ID, or `<library_id>:<n>` with `variations` (n is the
 1-based Variation). Every row passes through `fetch`, media or not, so Export reads its rows from `row_items`
-(the `fetch` items, plus rows held in `EXPIRED` during an unfinished relist): the payload holds the Creative and its Variation (`row_from_payload`) plus `eu_reach` when the detail stage
-ran; the result holds `image_files`, paths relative to the entity folder. `ocr` items add `image_text`.
+(the `fetch` items, plus rows held in `EXPIRED` during an unfinished relist): the payload holds the Creative and
+its Variation (`row_from_payload`) plus `eu_reach` when the detail stage ran; the result holds `image_files`, paths relative to the entity folder. `ocr` items add `image_text`.
 """
 from __future__ import annotations
 
@@ -34,8 +34,9 @@ FATAL = (DocNotFound,)
 # A queue stage no worker claims: rows whose media URLs expired (fbcdn URLs are signed and expire), held out of
 # `fetch` until the relist gives them fresh URLs, so no worker downloads the expired ones again meanwhile.
 EXPIRED = "expired_media"
-# fetch payload flag: a relist did not list the Creative again, so its URLs can't be refreshed; it never
-# triggers another relist
+# payload flag: the row's media expired and a relist has already tried to refresh its URLs (fresh ones, or none
+# when the Creative was not listed again). A row with it never triggers another relist, so media that keep
+# failing cost one relist, not one per run. An ordinary listing of the row writes a payload without it.
 RELISTED = "relisted"
 OCR_METHOD = "ocr"  # ExtractionCache method of `fbimg:<file stem>` entries
 _EXPIRED_STATUSES = ("HTTP 403", "HTTP 410")
@@ -121,16 +122,18 @@ class MetaContext:
     session: PacedSession  # downloads media
     query: MetaQuery
     entity: Path  # media files go under `entity/images/`, shared by all runs of the Page
-    run: Path
     cache: ExtractionCache
     variations: bool = False  # one row per Variation, else Variation 1 only
-    eu_reach: bool = False  # the detail stage: one request per Creative
+    eu_reach: bool = False  # the detail stage: one request per Creative, shared by its Variations
     ocr: bool = False  # the ocr stage reads text in the media files
     today: Callable[[], date] = date.today
     recognize: Callable[[Path], OcrResult] = recognize
 
 
 class MetaStages:
+    """The stages of one run. Build a fresh one for every run: `list_page` treats the first page it claims as
+    carried over from an earlier run (whose cursor may have expired)."""
+
     def __init__(self, ctx: MetaContext):
         self.ctx = ctx
         self._lock = threading.Lock()
@@ -155,7 +158,7 @@ class MetaStages:
 
         Expired media: when the listing is done and rows failed with HTTP 403/410, their URLs expired. They move
         to `EXPIRED` and the listing starts again from page 1; the relist puts them back in `fetch` with fresh
-        URLs. Needs the list stage, so `only="fetch"` leaves them for a later run.
+        URLs, flagged `RELISTED`. Needs the list stage, so `only="fetch"` leaves them for a later run.
         With `ocr`, done rows that have no ocr item yet (an earlier run without `ocr`) get one."""
         if only == "export":
             return
@@ -218,7 +221,12 @@ class MetaStages:
 
     def _queue_row(self, q: WorkQueue, key: str, payload: dict) -> None:
         """Queue a listed row to `detail` (with `eu_reach`) or `fetch`. A relist refreshes the payload of a queued
-        row (fbcdn URLs expire); a row whose detail is done is refreshed in `fetch` directly, keeping its EU reach."""
+        row (fbcdn URLs expire); a row whose detail is done is refreshed in `fetch` directly, keeping its EU reach.
+        A row held in `EXPIRED` gets its fresh URLs flagged `RELISTED`; its held copy is dropped once the fresh row
+        is in `fetch` (here, or by `detail` when detail has not run for it yet)."""
+        held = q.has(EXPIRED, key)
+        if held:
+            payload = {**payload, RELISTED: True}
         if self.ctx.eu_reach:
             d = q.item("detail", key)
             if d is None or d.status != "done":
@@ -226,13 +234,15 @@ class MetaStages:
                 return
             payload = {**payload, "eu_reach": (d.result or {}).get("eu_reach")}
         q.put("fetch", key, payload, update_payload=True)
-        if q.has(EXPIRED, key):
+        if held:
             q.move(EXPIRED, "fetch", [key])  # fetch keeps the fresh item just put; the expired one is dropped
 
     def _return_unlisted(self, q: WorkQueue) -> None:
         """At the end of a listing, rows still in `EXPIRED` were not listed again: back to `fetch` (they stay
-        rows of the export), flagged so they never trigger another relist."""
-        held = q.items(EXPIRED)
+        rows of the export), flagged so they never trigger another relist. A held row waiting for `detail` was
+        listed again: `detail` puts its fresh row in `fetch`, so its held copy stays until then."""
+        held = [it for it in q.items(EXPIRED)
+                if (d := q.item("detail", it.key)) is None or d.status == "done"]
         if not held:
             return
         log.info("list: %d row(s) with expired media were not listed again; their media stay missing", len(held))
@@ -243,11 +253,30 @@ class MetaStages:
     # -- detail ---------------------------------------------------------------
 
     def detail(self, item: Item, q: WorkQueue) -> dict:
-        """The Creative's EU reach (a dict of `EuReach`, or None), stored and passed on to `fetch`."""
-        reach = self.ctx.client.detail(self.ctx.query, item.payload["creative"]["library_id"])
-        data = asdict(reach) if reach is not None else None
+        """The Creative's EU reach (a dict of `EuReach`, or None), stored and passed on to `fetch`. One request per
+        Creative: with `variations`, a sibling row's done result is reused."""
+        library_id = item.payload["creative"]["library_id"]
+        found, data = self._sibling_reach(q, library_id, item.key)
+        if not found:
+            reach = self.ctx.client.detail(self.ctx.query, library_id)
+            data = asdict(reach) if reach is not None else None
         q.put("fetch", item.key, {**item.payload, "eu_reach": data}, update_payload=True)
+        if q.has(EXPIRED, item.key):
+            q.move(EXPIRED, "fetch", [item.key])  # the row was held for a relist: drop its expired copy
         return {"eu_reach": data}
+
+    @staticmethod
+    def _sibling_reach(q: WorkQueue, library_id: str, key: str) -> tuple[bool, dict | None]:
+        """(found, EU reach) from a done detail item of another Variation of the same Creative. The list stage
+        queues all Variations of a Creative together, so they are `<library_id>:1..n` without gaps."""
+        if key == library_id:
+            return False, None  # without `variations` a Creative has one row
+        n = 1
+        while (d := q.item("detail", row_key(library_id, n, True))) is not None:
+            if d.key != key and d.status == "done" and "eu_reach" in (d.result or {}):
+                return True, d.result["eu_reach"]
+            n += 1
+        return False, None
 
     # -- fetch ----------------------------------------------------------------
 

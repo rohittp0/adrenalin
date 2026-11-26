@@ -78,11 +78,13 @@ class FakeMeta:
         self.media_status: dict[str, int] = {}  # full URL -> status (default 200)
         self.media: list[str] = []
         self.cursors: list[str | None] = []
+        self.details: list[str] = []  # Library IDs of detail requests
 
     def __call__(self, method, url, data=None, headers=None, **kw):
         if url == GRAPHQL_URL:
             v = json.loads(data["variables"])
             if data["doc_id"] != SEARCH_DOC_ID:
+                self.details.append(v["adArchiveID"])
                 return response(self.detail)
             self.cursors.append(v["cursor"])
             return response(self.pages[v["cursor"]])
@@ -114,8 +116,7 @@ class Env:
 
         self.ctx = MetaContext(
             client=MetaClient(self.session, today=lambda: TODAY), session=self.session,
-            query=MetaQuery(PAGE_ID, "IN", "all", None, None), entity=self.entity, run=self.run_dir,
-            cache=self.cache, today=lambda: TODAY, recognize=recognize, **flags)
+            query=MetaQuery(PAGE_ID, "IN", "all", None, None), entity=self.entity, cache=self.cache, today=lambda: TODAY, recognize=recognize, **flags)
         self.q = WorkQueue(self.run_dir / "state.sqlite3")
 
     def stages(self) -> MetaStages:
@@ -408,3 +409,65 @@ def test_ocr_turned_on_later_reads_done_rows(env):
     e.ctx.ocr = True
     e.run(only="fetch")
     assert e.q.item("ocr", DCO_ID).status == "done"
+
+
+# -- fix round 1 ----------------------------------------------------------------
+
+
+def test_variations_share_one_detail_request(env):
+    e = env({None: page("search_page.json")}, variations=True, eu_reach=True)
+    assert e.run().failed == {}
+    assert e.fake.details.count(DCO_ID) == 1  # 2 Variations, 1 detail POST
+    reach = e.q.item("fetch", f"{DCO_ID}:1").payload["eu_reach"]
+    assert reach is not None and e.q.item("fetch", f"{DCO_ID}:2").payload["eu_reach"] == reach
+    assert len(e.fake.details) == len(set(e.fake.details))
+
+
+def fresh(url: str) -> str:
+    return url.replace("_nc_cat=", "_nc_cat=9")
+
+
+def test_refreshed_url_still_failing_does_not_relist_again(env):
+    old = page("search_page.json")
+    e = env({None: old})
+    urls = dco().variations[0].image_urls
+    e.fake.media_status = {u: 403 for u in urls} | {fresh(u): 403 for u in urls}
+    e.run()
+    e.reopen()
+    e.fake.pages[None] = fresh(old)
+    e.run()  # relists: the refreshed URL fails too
+    item = e.q.item("fetch", DCO_ID)
+    assert item.status == "failed" and "HTTP 403" in item.error
+    _, v, _ = row_from_payload(item.payload)
+    assert all("_nc_cat=9" in u for u in v.image_urls)
+    e.reopen()
+    e.fake.cursors.clear()
+    e.run()
+    assert e.fake.cursors == [] and e.q.item("list", "page:").status == "done"  # no second relist
+
+
+def test_eu_reach_added_later_keeps_held_rows_out_of_fetch(env):
+    # A run folder made without --eu-reach: a held row is routed to detail by the relist. If the listing ends
+    # before detail reaches it, the held copy (old URLs) must not go back to fetch.
+    old = page("search_page.json")
+    e = env({None: old})
+    urls = dco().variations[0].image_urls
+    e.fake.media_status = {u: 403 for u in urls}
+    e.run()
+    tried = sum(u in urls for u in e.fake.media)
+    e.reopen()
+    e.fake.pages[None] = fresh(old)
+    e.ctx.eu_reach = True
+    st = e.stages()
+    st.prepare(e.q)
+    item = e.q.claim("list")
+    e.q.complete("list", item.key, st.list_page(item, e.q))  # the last page: the listing ends here
+    assert e.q.item("detail", DCO_ID).status == "pending"
+    assert e.q.item(EXPIRED, DCO_ID) is not None and e.q.item("fetch", DCO_ID) is None
+    assert any(i.key == DCO_ID for i in row_items(e.q))
+    assert Pipeline(e.q, st.stages(e.q), poll=POLL, fatal=FATAL).run().failed == {}
+    item = e.q.item("fetch", DCO_ID)
+    _, v, _ = row_from_payload(item.payload)
+    assert item.status == "done" and all("_nc_cat=9" in u for u in v.image_urls)
+    assert item.payload["eu_reach"] is not None
+    assert e.q.items(EXPIRED) == [] and sum(u in urls for u in e.fake.media) == tried
